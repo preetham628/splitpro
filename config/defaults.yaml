@@ -1,0 +1,13 @@
+llm:
+  provider: openai            # "openai" or "bedrock"
+  model: gpt-4o-mini          # set to null to use provider default
+  temperature: 0.2
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "*"
+
+agent:
+  max_iterations: 10

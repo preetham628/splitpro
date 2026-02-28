@@ -12,6 +12,7 @@ Usage:
 import argparse
 from dotenv import load_dotenv
 from agents.chat_agent import ChatAgent
+from config import LLMConfig, load_config
 
 load_dotenv()
 
@@ -31,14 +32,25 @@ Commands:
 
 def main():
     parser = argparse.ArgumentParser(description="SplitPro CLI")
-    parser.add_argument("--provider", default=None, help="LLM provider: openai or bedrock")
-    parser.add_argument("--model", default=None, help="Model name/ID override")
+    parser.add_argument("--provider", default=None, help="LLM provider: openai or bedrock (overrides config)")
+    parser.add_argument("--model", default=None, help="Model name/ID override (overrides config)")
+    parser.add_argument("--config", default="config/defaults.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
+    app_config = load_config(args.config)
+
+    # CLI flags override config file values
+    llm_config = LLMConfig(
+        provider=args.provider or app_config.llm.provider,
+        model=args.model or app_config.llm.model,
+        temperature=app_config.llm.temperature,
+    )
+
     print(WELCOME)
+    print(f"Using provider: {llm_config.provider}\n")
 
     try:
-        agent = ChatAgent(provider=args.provider, model=args.model)
+        agent = ChatAgent(llm_config=llm_config, agent_config=app_config.agent)
     except (ValueError, ImportError) as e:
         print(f"Error: {e}")
         return

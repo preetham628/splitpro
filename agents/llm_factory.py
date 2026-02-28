@@ -1,66 +1,60 @@
 """
-LLM factory — returns a LangChain-compatible chat model for the given provider.
+LLM factory — returns a LangChain-compatible chat model from an LLMConfig.
 
 Supported providers:
-  openai   — requires OPENAI_API_KEY
-  bedrock  — requires AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-             or an IAM role) and langchain-aws installed
-
-Set LLM_PROVIDER env var to switch the default, or pass provider explicitly.
+  openai   — requires OPENAI_API_KEY env var
+  bedrock  — requires AWS credentials and langchain-aws installed
 """
 
 from __future__ import annotations
 
 import os
+
 from langchain_core.language_models import BaseChatModel
 
-# Default models per provider
-_DEFAULTS = {
+from config import LLMConfig
+
+_PROVIDER_DEFAULTS = {
     "openai": "gpt-4o-mini",
     "bedrock": "anthropic.claude-3-5-sonnet-20241022-v2:0",
 }
 
 
-def create_llm(provider: str | None = None, model: str | None = None) -> BaseChatModel:
+def create_llm(config: LLMConfig) -> BaseChatModel:
     """
-    Create and return a chat model for the given provider.
+    Create and return a LangChain chat model from an LLMConfig.
 
     Args:
-        provider: "openai" or "bedrock". Falls back to LLM_PROVIDER env var,
-                  then defaults to "openai".
-        model:    Model name/ID override. Falls back to provider-specific env var,
-                  then a sensible default.
+        config: LLMConfig instance with provider, model, and temperature.
 
     Returns:
-        A LangChain BaseChatModel that supports .bind_tools().
+        A BaseChatModel that supports .bind_tools().
     """
-    provider = provider or os.getenv("LLM_PROVIDER", "openai")
+    provider = config.provider
+    model = config.model or _PROVIDER_DEFAULTS.get(provider)
+    temperature = config.temperature
 
     if provider == "openai":
-        return _openai(model)
+        return _openai(model, temperature)
     elif provider == "bedrock":
-        return _bedrock(model)
+        return _bedrock(model, temperature)
     else:
         raise ValueError(
             f"Unsupported provider: '{provider}'. Choose 'openai' or 'bedrock'."
         )
 
 
-def _openai(model: str | None) -> BaseChatModel:
+def _openai(model: str, temperature: float) -> BaseChatModel:
     from langchain_openai import ChatOpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set.")
 
-    return ChatOpenAI(
-        model=model or os.getenv("OPENAI_MODEL", _DEFAULTS["openai"]),
-        temperature=0.2,
-        api_key=api_key,
-    )
+    return ChatOpenAI(model=model, temperature=temperature, api_key=api_key)
 
 
-def _bedrock(model: str | None) -> BaseChatModel:
+def _bedrock(model: str, temperature: float) -> BaseChatModel:
     try:
         from langchain_aws import ChatBedrock
     except ImportError:
@@ -70,7 +64,7 @@ def _bedrock(model: str | None) -> BaseChatModel:
         )
 
     return ChatBedrock(
-        model_id=model or os.getenv("BEDROCK_MODEL", _DEFAULTS["bedrock"]),
+        model_id=model,
         region_name=os.getenv("AWS_REGION", "us-east-1"),
-        model_kwargs={"temperature": 0.2},
+        model_kwargs={"temperature": temperature},
     )

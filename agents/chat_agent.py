@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
 from agents.llm_factory import create_llm
+from config import AgentConfig, LLMConfig
 from core.session_state import LineItem, ParsedBill, SessionState
 from core.settlement import Settlement
 
@@ -272,16 +273,16 @@ def _build_tools(state: SessionState) -> list:
 class ChatAgent:
     """Conversational bill-splitting agent powered by LangChain tool calling."""
 
-    MAX_ITERATIONS = 10
+    def __init__(self, llm_config: LLMConfig = None, agent_config: AgentConfig = None):
+        self._max_iterations = (agent_config or AgentConfig()).max_iterations
 
-    def __init__(self, provider: str | None = None, model: str | None = None):
         self.state = SessionState()
         self.message_history: list[Any] = []
 
         self._tools = _build_tools(self.state)
         self.tool_map = {t.name: t for t in self._tools}
 
-        llm = create_llm(provider=provider, model=model)
+        llm = create_llm(llm_config or LLMConfig())
         self.llm_with_tools = llm.bind_tools(self._tools)
 
     def _system_message(self) -> SystemMessage:
@@ -292,7 +293,7 @@ class ChatAgent:
         """Process one user turn, executing tools as needed, and return the final response."""
         self.message_history.append(HumanMessage(content=user_message))
 
-        for _ in range(self.MAX_ITERATIONS):
+        for _ in range(self._max_iterations):
             messages = [self._system_message()] + self.message_history
             ai_response = self.llm_with_tools.invoke(messages)
 

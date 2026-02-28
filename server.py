@@ -4,7 +4,6 @@ Run with: uvicorn server:app --reload
 """
 
 from typing import Optional
-
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -13,15 +12,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agents.chat_agent import ChatAgent
+from config import LLMConfig, load_config
 from core.session_state import SessionState
 
 load_dotenv()
+
+app_config = load_config()
 
 app = FastAPI(title="SplitPro API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=app_config.server.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -33,8 +35,8 @@ sessions: dict[str, ChatAgent] = {}
 # ---------- Request / Response models ----------
 
 class SessionRequest(BaseModel):
-    provider: str = "openai"        # "openai" or "bedrock"
-    model: Optional[str] = None     # override default model for the provider
+    provider: Optional[str] = None   # overrides config; "openai" or "bedrock"
+    model: Optional[str] = None      # overrides config model
 
 
 class ChatRequest(BaseModel):
@@ -90,10 +92,22 @@ def _get_agent(session_id: str) -> ChatAgent:
 
 @app.post("/sessions", status_code=201)
 def create_session(req: SessionRequest = SessionRequest()):
-    """Start a new bill-splitting session. Returns a session_id."""
+    """
+    Start a new bill-splitting session.
+    Provider and model default to values in config/defaults.yaml.
+    Pass provider/model in the request body to override per-session.
+    """
+    llm_config = LLMConfig(
+        provider=req.provider or app_config.llm.provider,
+        model=req.model or app_config.llm.model,
+        temperature=app_config.llm.temperature,
+    )
     session_id = str(uuid4())
-    sessions[session_id] = ChatAgent(provider=req.provider, model=req.model)
-    return {"session_id": session_id, "provider": req.provider}
+    sessions[session_id] = ChatAgent(
+        llm_config=llm_config,
+        agent_config=app_config.agent,
+    )
+    return {"session_id": session_id, "provider": llm_config.provider}
 
 
 @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
@@ -123,4 +137,4 @@ def delete_session(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "config": {"provider": app_config.llm.provider}}
