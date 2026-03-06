@@ -12,7 +12,7 @@ Usage:
 import argparse
 from dotenv import load_dotenv
 from agents.chat_agent import ChatAgent
-from config import LLMConfig, load_config
+from config import ChatAgentConfig, load_config
 
 load_dotenv()
 
@@ -40,17 +40,18 @@ def main():
     app_config = load_config(args.config)
 
     # CLI flags override config file values
-    llm_config = LLMConfig(
-        provider=args.provider or app_config.llm.provider,
-        model=args.model or app_config.llm.model,
-        temperature=app_config.llm.temperature,
+    chat_config = ChatAgentConfig(
+        provider=args.provider or app_config.chat_agent.provider,
+        model=args.model or app_config.chat_agent.model,
+        temperature=app_config.chat_agent.temperature,
+        max_iterations=app_config.chat_agent.max_iterations,
     )
 
     print(WELCOME)
-    print(f"Using provider: {llm_config.provider}\n")
+    print(f"Using provider: {chat_config.provider}\n")
 
     try:
-        agent = ChatAgent(llm_config=llm_config, agent_config=app_config.agent)
+        agent = ChatAgent(config=chat_config)
     except (ValueError, ImportError) as e:
         print(f"Error: {e}")
         return

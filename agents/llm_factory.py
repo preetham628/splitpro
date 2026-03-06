@@ -1,9 +1,12 @@
 """
-LLM factory — returns a LangChain-compatible chat model from an LLMConfig.
+LLM factory — returns a LangChain-compatible chat model from a tool config.
+
+Accepts any config object that has: provider (str), model (Optional[str]),
+temperature (float). Both ChatAgentConfig and ImageAnalyzerConfig qualify.
 
 Supported providers:
-  openai   — requires OPENAI_API_KEY env var
-  bedrock  — requires AWS credentials and langchain-aws installed
+  openai     — requires OPENAI_API_KEY env var
+  anthropic  — requires ANTHROPIC_API_KEY env var
 """
 
 from __future__ import annotations
@@ -12,35 +15,48 @@ import os
 
 from langchain_core.language_models import BaseChatModel
 
-from config import LLMConfig
-
-_PROVIDER_DEFAULTS = {
+# Default models used when config.model is None
+_CHAT_DEFAULTS = {
     "openai": "gpt-4o-mini",
-    "bedrock": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "anthropic": "claude-haiku-4-5-20251001",
+}
+
+_VISION_DEFAULTS = {
+    "openai": "gpt-4o",
+    "anthropic": "claude-sonnet-4-6",
 }
 
 
-def create_llm(config: LLMConfig) -> BaseChatModel:
+def create_llm(config) -> BaseChatModel:
     """
-    Create and return a LangChain chat model from an LLMConfig.
-
-    Args:
-        config: LLMConfig instance with provider, model, and temperature.
-
-    Returns:
-        A BaseChatModel that supports .bind_tools().
+    Create a chat LLM from a tool config (ChatAgentConfig or similar).
+    Uses config.model if set, otherwise falls back to _CHAT_DEFAULTS.
     """
     provider = config.provider
-    model = config.model or _PROVIDER_DEFAULTS.get(provider)
+    model = config.model or _CHAT_DEFAULTS.get(provider)
     temperature = config.temperature
+    return _build(provider, model, temperature)
 
+
+def create_vision_llm(config) -> BaseChatModel:
+    """
+    Create a vision-capable LLM from a tool config (ImageAnalyzerConfig or similar).
+    Uses config.model if set, otherwise falls back to _VISION_DEFAULTS.
+    """
+    provider = config.provider
+    model = config.model or _VISION_DEFAULTS.get(provider)
+    temperature = config.temperature
+    return _build(provider, model, temperature)
+
+
+def _build(provider: str, model: str, temperature: float) -> BaseChatModel:
     if provider == "openai":
         return _openai(model, temperature)
-    elif provider == "bedrock":
-        return _bedrock(model, temperature)
+    elif provider == "anthropic":
+        return _anthropic(model, temperature)
     else:
         raise ValueError(
-            f"Unsupported provider: '{provider}'. Choose 'openai' or 'bedrock'."
+            f"Unsupported provider: '{provider}'. Choose 'openai' or 'anthropic'."
         )
 
 
@@ -54,17 +70,11 @@ def _openai(model: str, temperature: float) -> BaseChatModel:
     return ChatOpenAI(model=model, temperature=temperature, api_key=api_key)
 
 
-def _bedrock(model: str, temperature: float) -> BaseChatModel:
-    try:
-        from langchain_aws import ChatBedrock
-    except ImportError:
-        raise ImportError(
-            "langchain-aws is required for Bedrock support. "
-            "Install it with: pip install langchain-aws"
-        )
+def _anthropic(model: str, temperature: float) -> BaseChatModel:
+    from langchain_anthropic import ChatAnthropic
 
-    return ChatBedrock(
-        model_id=model,
-        region_name=os.getenv("AWS_REGION", "us-east-1"),
-        model_kwargs={"temperature": temperature},
-    )
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is not set.")
+
+    return ChatAnthropic(model=model, temperature=temperature, api_key=api_key)

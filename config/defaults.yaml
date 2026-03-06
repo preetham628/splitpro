@@ -1,13 +1,16 @@
-llm:
-  provider: openai            # "openai" or "bedrock"
-  model: gpt-4o-mini          # set to null to use provider default
+chat_agent:
+  provider: anthropic
+  model: claude-haiku-4-5-20251001    # fast + cheap for conversational turns
   temperature: 0.2
+  max_iterations: 10
+
+image_analyzer:
+  provider: anthropic
+  model: claude-sonnet-4-6         # best vision model; handles dense receipt layouts
+  temperature: 0.1      # low = deterministic OCR extraction
 
 server:
   host: "0.0.0.0"
   port: 8000
   cors_origins:
     - "*"
-
-agent:
-  max_iterations: 10
