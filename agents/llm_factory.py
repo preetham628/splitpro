@@ -7,6 +7,7 @@ temperature (float). Both ChatAgentConfig and ImageAnalyzerConfig qualify.
 Supported providers:
   openai     — requires OPENAI_API_KEY env var
   anthropic  — requires ANTHROPIC_API_KEY env var
+  google     — requires GOOGLE_API_KEY env var
 """
 
 from __future__ import annotations
@@ -19,11 +20,13 @@ from langchain_core.language_models import BaseChatModel
 _CHAT_DEFAULTS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
+    "google": "gemini-2.0-flash-lite",
 }
 
 _VISION_DEFAULTS = {
     "openai": "gpt-4o",
     "anthropic": "claude-sonnet-4-6",
+    "google": "gemini-2.0-flash",
 }
 
 
@@ -54,9 +57,11 @@ def _build(provider: str, model: str, temperature: float) -> BaseChatModel:
         return _openai(model, temperature)
     elif provider == "anthropic":
         return _anthropic(model, temperature)
+    elif provider == "google":
+        return _google(model, temperature)
     else:
         raise ValueError(
-            f"Unsupported provider: '{provider}'. Choose 'openai' or 'anthropic'."
+            f"Unsupported provider: '{provider}'. Choose 'openai', 'anthropic', or 'google'."
         )
 
 
@@ -78,3 +83,13 @@ def _anthropic(model: str, temperature: float) -> BaseChatModel:
         raise ValueError("ANTHROPIC_API_KEY is not set.")
 
     return ChatAnthropic(model=model, temperature=temperature, api_key=api_key)
+
+
+def _google(model: str, temperature: float) -> BaseChatModel:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set.")
+
+    return ChatGoogleGenerativeAI(model=model, temperature=temperature, google_api_key=api_key)
