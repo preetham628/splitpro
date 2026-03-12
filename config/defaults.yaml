@@ -5,8 +5,8 @@ chat_agent:
   max_iterations: 10
 
 image_analyzer:
-  provider: anthropic
-  model: claude-sonnet-4-6         # best vision model; handles dense receipt layouts
+  provider: google
+  model: gemini-2.5-flash
   temperature: 0.1      # low = deterministic OCR extraction
 
 server:

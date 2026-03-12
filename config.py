@@ -35,7 +35,7 @@ class ChatAgentConfig:
 @dataclass
 class ImageAnalyzerConfig:
     """Config for the image analysis tool (must point to a vision-capable model)."""
-    provider: str = "anthropic"
+    provider: str = "google"
     model: Optional[str] = None    # None → llm_factory picks provider vision default
     temperature: float = 0.1       # lower = more deterministic OCR extraction
 
