@@ -6,8 +6,7 @@ via its add_bill tool. If not, returns a user-facing explanation of what was det
 
 Supported providers and their vision models:
   openai  → gpt-4o (default vision model)
-  bedrock → anthropic.claude-3-5-sonnet-20241022-v2:0 (best vision model on Bedrock;
-            handles receipt OCR, table layouts, and handwritten text well)
+  google  → gemini-2.0-flash (free tier, 250 req/day)
 """
 
 from __future__ import annotations
@@ -83,7 +82,7 @@ class ImageAnalyzer:
 
     def _build_message(self, b64: str, media_type: str) -> HumanMessage:
         """Build a provider-appropriate multimodal message."""
-        if self._provider == "openai":
+        if self._provider in ("openai", "google"):
             return HumanMessage(content=[
                 {
                     "type": "image_url",
@@ -92,7 +91,7 @@ class ImageAnalyzer:
                 {"type": "text", "text": _ANALYSIS_PROMPT},
             ])
         else:
-            # Bedrock (Claude via Converse API)
+            # Anthropic (Claude via Converse API)
             return HumanMessage(content=[
                 {
                     "type": "image",
