@@ -8,9 +8,15 @@ class LineItem:
     """A single line item parsed from a bill."""
     name: str
     price: float
+    qty: int = 1                                             # number of units ordered
     assigned_to: List[str] = field(default_factory=list)
     shared: bool = False      # True = split equally among assigned_to
     unassigned: bool = False  # True = intentionally split among all participants
+    qty_allocations: Dict[str, float] = field(default_factory=dict)  # person -> fractional units
+
+    @property
+    def unit_price(self) -> float:
+        return self.price / self.qty if self.qty > 0 else self.price
 
 
 @dataclass
@@ -77,13 +83,17 @@ class SessionState:
                     f"subtotal=${b.subtotal():.2f} | tax=${b.tax:.2f} | tip=${b.tip:.2f}"
                 )
                 for item in b.items:
+                    qty_str = f" x{item.qty}" if item.qty > 1 else ""
                     if item.assigned_to:
                         assignment = ", ".join(item.assigned_to)
                         tag = " (shared)" if item.shared else ""
                     else:
                         assignment = "UNASSIGNED"
                         tag = ""
-                    lines.append(f"    - {item.name}: ${item.price:.2f} -> {assignment}{tag}")
+                    lines.append(f"    - {item.name}{qty_str}: ${item.price:.2f} -> {assignment}{tag}")
+                    if item.qty_allocations:
+                        for person, pqty in item.qty_allocations.items():
+                            lines.append(f"      {person}: {pqty} unit(s) = ${item.unit_price * pqty:.2f}")
 
                 pending = b.unassigned_items()
                 if pending:

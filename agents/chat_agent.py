@@ -29,6 +29,8 @@ The user can add more bills at any point. Always be ready to call add_bill again
 ## Rules
 - Call tools proactively the moment you have the information. Do NOT say "let me know when ready."
 - When assigning items, if the user says "Alice and Bob shared the pasta", use assigned_to=["Alice","Bob"] and shared=true.
+- When a bill item has qty > 1 and the user specifies how many units each person had (e.g., "Alice had 1 out of 4 burgers"), use qty_per_person={{"Alice": 1}} in the assignment. Unspecified units are split equally among the remaining assigned_to.
+- Fractional units are allowed (e.g., "Alice had 25% of one burger" with item qty=4 → qty_per_person={{"Alice": 0.25}}).
 - Fuzzy-match item names: if the user says "the chicken thing", match to the closest item name.
 - Tax and tip are NOT assigned via assign_items — they are handled proportionally by calculate_split automatically.
 - For lump-sum bills with no line items, add one item called "Total" with the full amount and mark it as shared.
@@ -58,14 +60,15 @@ def _build_tools(state: SessionState) -> list:
         Args:
             raw_text: The exact text the user pasted.
             description: A short human-readable label, e.g. "Dinner at Spice Garden".
-            items: List of line items. Each must have "name" (str) and "price" (float).
+            items: List of line items. Each must have "name" (str) and "price" (float, total for all units).
+                   Optionally include "qty" (int, default 1) for items ordered in multiple units.
                    Do NOT include tax or tip lines here — pass them separately.
             tax: Tax amount from the bill. Use 0.0 if none.
             tip: Tip or service charge from the bill. Use 0.0 if none.
         """
         bill_id = state.next_bill_id()
         parsed_items = [
-            LineItem(name=it["name"], price=float(it["price"]))
+            LineItem(name=it["name"], price=float(it["price"]), qty=int(it.get("qty", 1)))
             for it in items
         ]
         bill = ParsedBill(
@@ -105,8 +108,12 @@ def _build_tools(state: SessionState) -> list:
             bill_id: The bill identifier, e.g. "bill_1".
             assignments: List of assignment objects. Each must have:
                 - item_name (str): Item name as it appears in the bill.
-                - assigned_to (list[str]): Participant names who had this item.
+                - assigned_to (list[str]): Participant names who had this item (equal split of full qty).
                 - shared (bool): True if cost splits equally among assigned_to.
+                - qty_per_person (dict, optional): Maps participant name -> number of units they consumed
+                  (can be fractional, e.g. 0.25 for a quarter unit). Use this for qty-based splits.
+                  Unallocated qty is split equally among the remaining assigned_to.
+                  Example: item qty=4, qty_per_person={"Alice": 1, "Bob": 3} => Alice pays 1/4, Bob pays 3/4.
         """
         bill = state.get_bill(bill_id)
         if bill is None:
@@ -117,6 +124,7 @@ def _build_tools(state: SessionState) -> list:
             item_name = a.get("item_name", "")
             assigned_to = [n.strip().title() for n in a.get("assigned_to", [])]
             shared = bool(a.get("shared", len(assigned_to) > 1))
+            qty_per_person_raw: dict = a.get("qty_per_person", {})
 
             # Exact match first, then partial
             item = next((i for i in bill.items if i.name.lower() == item_name.lower()), None)
@@ -127,20 +135,56 @@ def _build_tools(state: SessionState) -> list:
                 results.append(f"'{item_name}' not found. Available: {all_names}")
                 continue
 
-            # Validate participants
-            unknown = [p for p in assigned_to if p not in state.participants]
-            if unknown:
-                results.append(
-                    f"Unknown participant(s) {unknown} for '{item.name}'. "
-                    f"Known: {state.participants}"
-                )
-                continue
+            if qty_per_person_raw:
+                # Qty-based assignment
+                qty_per_person = {n.strip().title(): float(q) for n, q in qty_per_person_raw.items()}
+                unknown = [p for p in qty_per_person if p not in state.participants]
+                if unknown:
+                    results.append(
+                        f"Unknown participant(s) {unknown} for '{item.name}'. "
+                        f"Known: {state.participants}"
+                    )
+                    continue
 
-            item.assigned_to = assigned_to
-            item.shared = shared
-            item.unassigned = False
-            tag = " (shared)" if shared else ""
-            results.append(f"'{item.name}' -> {', '.join(assigned_to)}{tag}")
+                allocated_qty = sum(qty_per_person.values())
+                if allocated_qty > item.qty + 1e-9:
+                    results.append(
+                        f"'{item.name}': allocated qty {allocated_qty} exceeds item qty {item.qty}."
+                    )
+                    continue
+
+                item.qty_allocations = qty_per_person
+                # assigned_to = explicitly listed people + those in qty_per_person
+                all_assigned = list(qty_per_person.keys())
+                for p in assigned_to:
+                    if p not in all_assigned:
+                        all_assigned.append(p)
+                item.assigned_to = all_assigned
+                item.shared = False
+                item.unassigned = False
+
+                remaining_qty = item.qty - allocated_qty
+                detail = ", ".join(f"{p}:{q}u" for p, q in qty_per_person.items())
+                if remaining_qty > 1e-9:
+                    remainder_people = [p for p in assigned_to if p not in qty_per_person]
+                    detail += f" | {remaining_qty:.2f} units split among {remainder_people or 'all'}"
+                results.append(f"'{item.name}' (qty-based) -> {detail}")
+            else:
+                # Standard equal-split assignment
+                unknown = [p for p in assigned_to if p not in state.participants]
+                if unknown:
+                    results.append(
+                        f"Unknown participant(s) {unknown} for '{item.name}'. "
+                        f"Known: {state.participants}"
+                    )
+                    continue
+
+                item.assigned_to = assigned_to
+                item.shared = shared
+                item.unassigned = False
+                item.qty_allocations = {}
+                tag = " (shared)" if shared else ""
+                results.append(f"'{item.name}' -> {', '.join(assigned_to)}{tag}")
 
         remaining = bill.unassigned_items()
         summary = "; ".join(results)
@@ -229,13 +273,30 @@ def _build_tools(state: SessionState) -> list:
             person_subtotal: dict[str, float] = defaultdict(float)
 
             for item in bill.items:
-                # Fall back to all participants if still unassigned
-                recipients = item.assigned_to if item.assigned_to else state.participants
-                if not item.assigned_to:
-                    warnings.append(f"'{item.name}' in {bill.bill_id} had no assignment — split equally.")
-                share = item.price / len(recipients)
-                for person in recipients:
-                    person_subtotal[person] += share
+                if item.qty_allocations:
+                    # Qty-based: pay unit_price * units consumed
+                    unit_price = item.unit_price
+                    allocated_qty = sum(item.qty_allocations.values())
+                    for person, pqty in item.qty_allocations.items():
+                        person_subtotal[person] += unit_price * pqty
+
+                    # Unallocated remainder goes equally to assigned_to minus those with explicit qtys
+                    remaining_qty = item.qty - allocated_qty
+                    if remaining_qty > 1e-9:
+                        remainder_people = [p for p in item.assigned_to if p not in item.qty_allocations]
+                        if not remainder_people:
+                            remainder_people = state.participants
+                        share = unit_price * remaining_qty / len(remainder_people)
+                        for person in remainder_people:
+                            person_subtotal[person] += share
+                else:
+                    # Fall back to all participants if still unassigned
+                    recipients = item.assigned_to if item.assigned_to else state.participants
+                    if not item.assigned_to:
+                        warnings.append(f"'{item.name}' in {bill.bill_id} had no assignment — split equally.")
+                    share = item.price / len(recipients)
+                    for person in recipients:
+                        person_subtotal[person] += share
 
             # Proportionally distribute tax + tip
             bill_subtotal = sum(person_subtotal.values())
