@@ -1,4 +1,5 @@
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -64,6 +65,40 @@ class SessionState:
         return all(
             b.paid_by is not None and len(b.unassigned_items()) == 0
             for b in self.bills
+        )
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionState":
+        bills = []
+        for b in d.get("bills", []):
+            items = [
+                LineItem(
+                    name=i["name"],
+                    price=i["price"],
+                    qty=i.get("qty", 1),
+                    assigned_to=i.get("assigned_to", []),
+                    shared=i.get("shared", False),
+                    unassigned=i.get("unassigned", False),
+                    qty_allocations=i.get("qty_allocations", {}),
+                )
+                for i in b.get("items", [])
+            ]
+            bills.append(ParsedBill(
+                bill_id=b["bill_id"],
+                raw_text=b.get("raw_text", ""),
+                description=b.get("description", ""),
+                items=items,
+                tax=b.get("tax", 0.0),
+                tip=b.get("tip", 0.0),
+                paid_by=b.get("paid_by"),
+            ))
+        return cls(
+            participants=d.get("participants", []),
+            bills=bills,
+            finalized=d.get("finalized", False),
         )
 
     def state_summary(self) -> str:

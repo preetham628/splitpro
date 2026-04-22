@@ -52,6 +52,21 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
+# Auth config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuthConfig:
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+    jwt_secret: str = "CHANGE_ME_IN_PRODUCTION"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 10080   # 7 days
+    db_path: str = "splitpro.db"
+
+
+# ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
 
@@ -60,6 +75,7 @@ class AppConfig:
     chat_agent: ChatAgentConfig = field(default_factory=ChatAgentConfig)
     image_analyzer: ImageAnalyzerConfig = field(default_factory=ImageAnalyzerConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -81,4 +97,5 @@ def load_config(path: str = "config/defaults.yaml") -> AppConfig:
         chat_agent=ChatAgentConfig(**data.get("chat_agent", {})),
         image_analyzer=ImageAnalyzerConfig(**data.get("image_analyzer", {})),
         server=ServerConfig(**data.get("server", {})),
+        auth=AuthConfig(**data.get("auth", {})),
     )

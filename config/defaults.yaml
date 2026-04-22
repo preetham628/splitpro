@@ -14,3 +14,7 @@ server:
   port: 8000
   cors_origins:
     - "*"
+
+auth:
+  google_redirect_uri: "http://localhost:8000/auth/google/callback"
+  db_path: "splitpro.db"
