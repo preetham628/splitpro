@@ -3,6 +3,8 @@ SplitPro FastAPI Server
 Run with: uvicorn server:app --reload
 """
 
+import json
+from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import uuid4
 
@@ -12,7 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agents.chat_agent import ChatAgent
+import database
+from agents.chat_agent import ChatAgent, derive_display_messages
 from agents.image_analyzer import ImageAnalyzer
 from config import ChatAgentConfig, load_config
 from core.session_state import SessionState
@@ -22,7 +25,14 @@ load_dotenv()
 
 app_config = load_config()
 
-app = FastAPI(title="SplitPro API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    database.init_db()
+    yield
+
+
+app = FastAPI(title="SplitPro API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,15 +41,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory session store: session_id -> ChatAgent
-sessions: dict[str, ChatAgent] = {}
+# In-memory agent cache: chat_id -> ChatAgent (loaded from DB on cache miss)
+agent_cache: dict[str, ChatAgent] = {}
 
 
 # ---------- Request / Response models ----------
 
-class SessionRequest(BaseModel):
-    provider: Optional[str] = None    # overrides config; "openai" or "bedrock"
-    model: Optional[str] = None       # overrides config chat model
+class CreateChatRequest(BaseModel):
+    name: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+class RenameChatRequest(BaseModel):
+    name: str
 
 
 class ChatRequest(BaseModel):
@@ -53,8 +68,16 @@ class ChatResponse(BaseModel):
 
 # ---------- Helpers ----------
 
+def _build_config(provider: Optional[str] = None, model: Optional[str] = None) -> ChatAgentConfig:
+    return ChatAgentConfig(
+        provider=provider or app_config.chat_agent.provider,
+        model=model or app_config.chat_agent.model,
+        temperature=app_config.chat_agent.temperature,
+        max_iterations=app_config.chat_agent.max_iterations,
+    )
+
+
 def _serialize_state(state: SessionState) -> dict:
-    """Convert SessionState to a JSON-serializable dict for the UI."""
     return {
         "participants": state.participants,
         "bills": [
@@ -86,7 +109,6 @@ def _serialize_state(state: SessionState) -> dict:
 
 
 def _compute_settlement(state: SessionState) -> list:
-    """Recompute simplified settlement transactions for the UI state panel."""
     from collections import defaultdict
     global_balances: dict = defaultdict(float)
     for bill in state.bills:
@@ -110,90 +132,118 @@ def _compute_settlement(state: SessionState) -> list:
     return Settlement.generate_settlements(dict(global_balances))
 
 
-def _get_agent(session_id: str) -> ChatAgent:
-    agent = sessions.get(session_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+def _get_or_load_agent(chat_id: str) -> ChatAgent:
+    if chat_id in agent_cache:
+        return agent_cache[chat_id]
+    row = database.get_chat(chat_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Chat '{chat_id}' not found")
+    config = _build_config(provider=row["provider"], model=row["model"])
+    agent = ChatAgent.from_dict(
+        {"state": json.loads(row["state_json"]), "history": json.loads(row["history_json"])},
+        config=config,
+    )
+    agent_cache[chat_id] = agent
     return agent
 
 
-# ---------- Endpoints ----------
-
-@app.post("/sessions", status_code=201)
-def create_session(req: SessionRequest = SessionRequest()):
-    """
-    Start a new bill-splitting session.
-    Provider and model default to values in config/defaults.yaml.
-    Pass provider/model in the request body to override per-session.
-    """
-    chat_config = ChatAgentConfig(
-        provider=req.provider or app_config.chat_agent.provider,
-        model=req.model or app_config.chat_agent.model,
-        temperature=app_config.chat_agent.temperature,
-        max_iterations=app_config.chat_agent.max_iterations,
+def _persist_agent(chat_id: str, agent: ChatAgent) -> None:
+    d = agent.to_dict()
+    database.update_chat(
+        chat_id,
+        state_json=json.dumps(d["state"]),
+        history_json=json.dumps(d["history"]),
     )
-    session_id = str(uuid4())
-    sessions[session_id] = ChatAgent(config=chat_config)
-    return {"session_id": session_id, "provider": chat_config.provider}
 
 
-@app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
-def chat(session_id: str, req: ChatRequest):
+# ---------- Chat endpoints ----------
+
+@app.get("/chats")
+def list_chats():
+    """List all chats ordered by most recently updated."""
+    return database.list_chats()
+
+
+@app.post("/chats", status_code=201)
+def create_chat(req: CreateChatRequest = CreateChatRequest()):
     """
-    Send a message to the agent.
-    Returns the agent's response and the current session state.
+    Create a new chat session.
+    Sends the opening greeting server-side and persists it immediately.
     """
-    agent = _get_agent(session_id)
+    chat_id = str(uuid4())
+    config = _build_config(provider=req.provider, model=req.model)
+    agent = ChatAgent(config=config)
+
+    agent.chat("Hello, I'm ready to help split some bills.")
+
+    d = agent.to_dict()
+    name = req.name or "New Chat"
+    database.create_chat(
+        chat_id=chat_id,
+        name=name,
+        provider=config.provider,
+        model=config.model,
+        state_json=json.dumps(d["state"]),
+        history_json=json.dumps(d["history"]),
+    )
+    agent_cache[chat_id] = agent
+
+    row = database.get_chat(chat_id)
+    return {
+        "id": chat_id,
+        "name": name,
+        "provider": config.provider,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "messages": derive_display_messages(agent.message_history),
+        "state": _serialize_state(agent.state),
+    }
+
+
+@app.get("/chats/{chat_id}")
+def get_chat(chat_id: str):
+    """Load a chat's full message history and state for UI restoration."""
+    agent = _get_or_load_agent(chat_id)
+    row = database.get_chat(chat_id)
+    return {
+        "id": chat_id,
+        "name": row["name"],
+        "provider": row["provider"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "messages": derive_display_messages(agent.message_history),
+        "state": _serialize_state(agent.state),
+    }
+
+
+@app.post("/chats/{chat_id}/chat", response_model=ChatResponse)
+def chat(chat_id: str, req: ChatRequest):
+    """Send a message to the agent and persist the updated state."""
+    agent = _get_or_load_agent(chat_id)
     response = agent.chat(req.message)
+    _persist_agent(chat_id, agent)
     return ChatResponse(response=response, state=_serialize_state(agent.state))
 
 
-@app.get("/sessions/{session_id}/state")
-def get_state(session_id: str):
-    """Get the current session state (bills, participants, assignments)."""
-    agent = _get_agent(session_id)
-    return _serialize_state(agent.state)
-
-
-@app.delete("/sessions/{session_id}")
-def delete_session(session_id: str):
-    """End a session and free its memory."""
-    sessions.pop(session_id, None)
-    return {"ok": True}
-
-
-@app.post("/sessions/{session_id}/image", response_model=ChatResponse)
-async def upload_image(session_id: str, file: UploadFile = File(...)):
+@app.post("/chats/{chat_id}/image", response_model=ChatResponse)
+async def upload_image(chat_id: str, file: UploadFile = File(...)):
     """
-    Upload a bill image for the agent to analyze.
-
-    - If the image is a receipt/bill, the agent extracts items and adds them
-      to the session automatically, then asks about participants or assignments.
-    - If the image is not a bill, the agent explains what it sees and asks
-      the user to upload a receipt instead.
-
-    Accepted formats: JPEG, PNG, WEBP, GIF (max ~5MB recommended).
+    Upload a bill image. The vision model extracts contents and feeds
+    them to the agent automatically.
     """
-    agent = _get_agent(session_id)
+    agent = _get_or_load_agent(chat_id)
 
-    # Validate file type
     content_type = file.content_type or "image/jpeg"
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
 
     image_bytes = await file.read()
-
-    # Analyze the image with the vision model
     analyzer = ImageAnalyzer(app_config.image_analyzer)
     result = analyzer.analyze(image_bytes, media_type=content_type)
 
     if result.is_bill:
-        # Feed the extracted bill text into the chat agent so it calls add_bill naturally
-        agent_message = (
-            f"I've scanned a receipt image. Here are the contents:\n\n{result.bill_text}"
-        )
+        agent_message = f"I've scanned a receipt image. Here are the contents:\n\n{result.bill_text}"
     else:
-        # Not a bill — tell the agent what was seen so it can respond in context
         agent_message = (
             f"The user uploaded an image. It is NOT a bill or receipt. "
             f"Description: {result.description}. "
@@ -201,7 +251,36 @@ async def upload_image(session_id: str, file: UploadFile = File(...)):
         )
 
     response = agent.chat(agent_message)
+    _persist_agent(chat_id, agent)
     return ChatResponse(response=response, state=_serialize_state(agent.state))
+
+
+@app.get("/chats/{chat_id}/state")
+def get_state(chat_id: str):
+    """Get the current session state (bills, participants, assignments)."""
+    agent = _get_or_load_agent(chat_id)
+    return _serialize_state(agent.state)
+
+
+@app.patch("/chats/{chat_id}")
+def rename_chat(chat_id: str, req: RenameChatRequest):
+    """Rename a chat."""
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Name must not be empty.")
+    row = database.get_chat(chat_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Chat '{chat_id}' not found")
+    database.rename_chat(chat_id, name)
+    return {"id": chat_id, "name": name}
+
+
+@app.delete("/chats/{chat_id}")
+def delete_chat(chat_id: str):
+    """Delete a chat and remove it from the in-memory cache."""
+    agent_cache.pop(chat_id, None)
+    database.delete_chat(chat_id)
+    return {"ok": True}
 
 
 @app.get("/health")

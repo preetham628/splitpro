@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
 from agents.llm_factory import create_llm
@@ -40,6 +40,82 @@ The user can add more bills at any point. Always be ready to call add_bill again
 ## Current Session State
 {state_summary}
 """
+
+
+_RECEIPT_PREFIX = "I've scanned a receipt image."
+_NON_BILL_PREFIX = "The user uploaded an image. It is NOT a bill"
+
+
+def _serialize_history(history: list) -> list[dict]:
+    out = []
+    for msg in history:
+        if isinstance(msg, HumanMessage):
+            out.append({"type": "human", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            out.append({
+                "type": "ai",
+                "content": msg.content,
+                "tool_calls": msg.tool_calls or [],
+                "additional_kwargs": msg.additional_kwargs or {},
+            })
+        elif isinstance(msg, ToolMessage):
+            out.append({
+                "type": "tool",
+                "content": msg.content,
+                "tool_call_id": msg.tool_call_id,
+            })
+    return out
+
+
+def _deserialize_history(data: list[dict]) -> list:
+    out = []
+    for d in data:
+        t = d.get("type")
+        if t == "human":
+            out.append(HumanMessage(content=d["content"]))
+        elif t == "ai":
+            out.append(AIMessage(
+                content=d.get("content", ""),
+                tool_calls=d.get("tool_calls", []),
+                additional_kwargs=d.get("additional_kwargs", {}),
+            ))
+        elif t == "tool":
+            out.append(ToolMessage(
+                content=d["content"],
+                tool_call_id=d["tool_call_id"],
+            ))
+    return out
+
+
+def _extract_text(content) -> str:
+    """Normalize AIMessage content — can be a str or a list of content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        ).strip()
+    return ""
+
+
+def derive_display_messages(history: list) -> list[dict]:
+    """Convert internal LangChain message history to frontend-renderable bubbles."""
+    out = []
+    for msg in history:
+        if isinstance(msg, HumanMessage):
+            content = msg.content if isinstance(msg.content, str) else ""
+            if content.startswith(_RECEIPT_PREFIX):
+                out.append({"role": "user", "content": "[Receipt image uploaded]"})
+            elif content.startswith(_NON_BILL_PREFIX):
+                out.append({"role": "user", "content": "[Image uploaded — not a receipt]"})
+            else:
+                out.append({"role": "user", "content": content})
+        elif isinstance(msg, AIMessage):
+            text = _extract_text(msg.content)
+            if text:
+                out.append({"role": "agent", "content": text})
+    return out
 
 
 def _build_tools(state: SessionState) -> list:
@@ -346,6 +422,24 @@ class ChatAgent:
 
         llm = create_llm(cfg)
         self.llm_with_tools = llm.bind_tools(self._tools)
+
+    def to_dict(self) -> dict:
+        return {
+            "state": self.state.to_dict(),
+            "history": _serialize_history(self.message_history),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, config: ChatAgentConfig) -> "ChatAgent":
+        agent = cls(config=config)
+        # Replace the blank state with the restored one and rebuild tool closures
+        agent.state = SessionState.from_dict(data.get("state", {}))
+        agent._tools = _build_tools(agent.state)
+        agent.tool_map = {t.name: t for t in agent._tools}
+        llm = create_llm(config)
+        agent.llm_with_tools = llm.bind_tools(agent._tools)
+        agent.message_history = _deserialize_history(data.get("history", []))
+        return agent
 
     def _system_message(self) -> SystemMessage:
         content = SYSTEM_PROMPT_TEMPLATE.format(state_summary=self.state.state_summary())

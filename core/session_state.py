@@ -18,6 +18,29 @@ class LineItem:
     def unit_price(self) -> float:
         return self.price / self.qty if self.qty > 0 else self.price
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "price": self.price,
+            "qty": self.qty,
+            "assigned_to": self.assigned_to,
+            "shared": self.shared,
+            "unassigned": self.unassigned,
+            "qty_allocations": self.qty_allocations,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LineItem":
+        return cls(
+            name=d["name"],
+            price=d["price"],
+            qty=d.get("qty", 1),
+            assigned_to=d.get("assigned_to", []),
+            shared=d.get("shared", False),
+            unassigned=d.get("unassigned", False),
+            qty_allocations=d.get("qty_allocations", {}),
+        )
+
 
 @dataclass
 class ParsedBill:
@@ -40,6 +63,30 @@ class ParsedBill:
     def unassigned_items(self) -> List[LineItem]:
         return [i for i in self.items if not i.assigned_to and not i.unassigned]
 
+    def to_dict(self) -> dict:
+        return {
+            "bill_id": self.bill_id,
+            "raw_text": self.raw_text,
+            "description": self.description,
+            "items": [i.to_dict() for i in self.items],
+            "tax": self.tax,
+            "tip": self.tip,
+            "paid_by": self.paid_by,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ParsedBill":
+        bill = cls(
+            bill_id=d["bill_id"],
+            raw_text=d.get("raw_text", ""),
+            description=d["description"],
+            tax=d.get("tax", 0.0),
+            tip=d.get("tip", 0.0),
+            paid_by=d.get("paid_by"),
+        )
+        bill.items = [LineItem.from_dict(i) for i in d.get("items", [])]
+        return bill
+
 
 @dataclass
 class SessionState:
@@ -56,6 +103,22 @@ class SessionState:
             if b.bill_id == bill_id:
                 return b
         return None
+
+    def to_dict(self) -> dict:
+        return {
+            "participants": self.participants,
+            "bills": [b.to_dict() for b in self.bills],
+            "finalized": self.finalized,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionState":
+        s = cls(
+            participants=d.get("participants", []),
+            finalized=d.get("finalized", False),
+        )
+        s.bills = [ParsedBill.from_dict(b) for b in d.get("bills", [])]
+        return s
 
     def all_bills_ready(self) -> bool:
         """True when every bill has a payer and no unassigned items."""

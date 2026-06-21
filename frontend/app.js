@@ -1,10 +1,10 @@
-// ── Config ──────────────────────────────────────────────────────────────────
-// Use relative URLs since the frontend is served from the same FastAPI origin.
+// ── Config ───────────────────────────────────────────────────────────────────
 const API = '';
 
 // ── State ────────────────────────────────────────────────────────────────────
-let sessionId = null;
-let isLoading = false;
+let currentChatId = null;
+let isLoading     = false;
+let chatList      = [];   // [{id, name, provider, created_at, updated_at}]
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -13,23 +13,18 @@ const sendBtn       = document.getElementById('send-btn');
 const fileInput     = document.getElementById('file-input');
 const providerBadge = document.getElementById('provider-badge');
 const stateContent  = document.getElementById('state-content');
+const chatListEl    = document.getElementById('chat-list');
+const newChatBtn    = document.getElementById('new-chat-btn');
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
   try {
-    const res  = await fetch(`${API}/sessions`, { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    });
-    const data = await res.json();
-    sessionId = data.session_id;
-    providerBadge.textContent = data.provider || 'openai';
-
-    // Clear the "Connecting…" placeholder
-    messagesEl.innerHTML = '';
-
-    // Ask the agent to open the conversation
-    await sendToAgent("Hello, I'm ready to help split some bills.");
+    await loadChatList();
+    if (chatList.length === 0) {
+      await createNewChat();
+    } else {
+      await switchToChat(chatList[0].id);
+    }
   } catch (err) {
     messagesEl.innerHTML = `<p style="color:red;padding:20px">
       Could not connect to the API. Make sure the server is running on port 8000.<br>
@@ -37,21 +32,124 @@ async function init() {
   }
 }
 
+// ── Chat list ─────────────────────────────────────────────────────────────────
+async function loadChatList() {
+  const res = await fetch(`${API}/chats`);
+  chatList = await res.json();
+  renderChatList();
+}
+
+function renderChatList() {
+  if (chatList.length === 0) {
+    chatListEl.innerHTML = '<p style="font-size:12px;color:var(--muted);padding:10px 10px">No chats yet</p>';
+    return;
+  }
+  chatListEl.innerHTML = chatList.map(c => `
+    <div class="chat-item ${c.id === currentChatId ? 'active' : ''}" data-id="${escapeAttr(c.id)}">
+      <span class="chat-item-name">${escapeHtml(c.name)}</span>
+      <button class="chat-delete-btn" data-id="${escapeAttr(c.id)}" title="Delete">×</button>
+    </div>
+  `).join('');
+
+  chatListEl.querySelectorAll('.chat-item').forEach(el => {
+    el.addEventListener('click', e => {
+      if (e.target.classList.contains('chat-delete-btn')) return;
+      switchToChat(el.dataset.id);
+    });
+  });
+  chatListEl.querySelectorAll('.chat-delete-btn').forEach(btn => {
+    btn.addEventListener('click', () => deleteChat(btn.dataset.id));
+  });
+}
+
+// ── Create / switch / delete ───────────────────────────────────────────────────
+async function createNewChat() {
+  setLoading(true);
+  try {
+    const res = await fetch(`${API}/chats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    currentChatId = data.id;
+    providerBadge.textContent = data.provider || 'openai';
+
+    chatList.unshift({
+      id: data.id, name: data.name, provider: data.provider,
+      created_at: data.created_at, updated_at: data.updated_at,
+    });
+    renderChatList();
+
+    messagesEl.innerHTML = '';
+    (data.messages || []).forEach(msg => {
+      try { appendBubble(msg.role, msg.content); }
+      catch (e) { console.warn('Failed to render message:', msg, e); }
+    });
+    renderState(data.state);
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function switchToChat(id) {
+  if (id === currentChatId || isLoading) return;
+  setLoading(true);
+  try {
+    const res = await fetch(`${API}/chats/${id}`);
+    if (!res.ok) { await loadChatList(); return; }
+    const data = await res.json();
+
+    currentChatId = data.id;
+    providerBadge.textContent = data.provider || 'openai';
+
+    messagesEl.innerHTML = '';
+    (data.messages || []).forEach(msg => {
+      try { appendBubble(msg.role, msg.content); }
+      catch (e) { console.warn('Failed to render message:', msg, e); }
+    });
+    renderState(data.state);
+    renderChatList();
+    scrollToBottom();
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function deleteChat(id) {
+  await fetch(`${API}/chats/${id}`, { method: 'DELETE' });
+  chatList = chatList.filter(c => c.id !== id);
+
+  if (currentChatId === id) {
+    currentChatId = null;
+    messagesEl.innerHTML = '';
+    stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+    if (chatList.length > 0) {
+      await switchToChat(chatList[0].id);
+    } else {
+      await createNewChat();
+    }
+  } else {
+    renderChatList();
+  }
+}
+
 // ── Send helpers ──────────────────────────────────────────────────────────────
 async function sendToAgent(text) {
-  if (!sessionId || isLoading) return;
+  if (!currentChatId || isLoading) return;
   setLoading(true);
   const typing = appendTyping();
   try {
-    const res  = await fetch(`${API}/sessions/${sessionId}/chat`, {
-      method:  'POST',
+    const res = await fetch(`${API}/chats/${currentChatId}/chat`, {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text }),
     });
     const data = await res.json();
     typing.remove();
     appendBubble('agent', data.response);
     renderState(data.state);
+    bumpChatToTop(currentChatId);
   } catch (err) {
     typing.remove();
     appendBubble('agent', `⚠️ Error: ${err.message}`);
@@ -61,33 +159,42 @@ async function sendToAgent(text) {
 }
 
 async function sendImageToAgent(file) {
-  if (!sessionId || isLoading) return;
+  if (!currentChatId || isLoading) return;
   setLoading(true);
 
-  // Show user bubble with image preview
   const reader = new FileReader();
-  reader.onload = e => {
-    appendBubble('user', '', e.target.result);
-  };
+  reader.onload = e => appendBubble('user', '', e.target.result);
   reader.readAsDataURL(file);
 
   const typing = appendTyping();
   try {
     const form = new FormData();
     form.append('file', file);
-    const res  = await fetch(`${API}/sessions/${sessionId}/image`, {
+    const res = await fetch(`${API}/chats/${currentChatId}/image`, {
       method: 'POST',
-      body:   form,
+      body: form,
     });
     const data = await res.json();
     typing.remove();
     appendBubble('agent', data.response);
     renderState(data.state);
+    bumpChatToTop(currentChatId);
   } catch (err) {
     typing.remove();
     appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
+  }
+}
+
+// Move the active chat to the top of the list after a new message
+function bumpChatToTop(id) {
+  const idx = chatList.findIndex(c => c.id === id);
+  if (idx > 0) {
+    const [chat] = chatList.splice(idx, 1);
+    chat.updated_at = new Date().toISOString();
+    chatList.unshift(chat);
+    renderChatList();
   }
 }
 
@@ -111,7 +218,6 @@ function appendBubble(role, text, imageDataUrl = null) {
   }
 
   if (text) {
-    // Render markdown for agent messages, plain text for user
     const content = document.createElement('div');
     content.innerHTML = role === 'agent'
       ? marked.parse(text)
@@ -150,8 +256,12 @@ function scrollToBottom() {
 }
 
 function escapeHtml(str) {
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-            .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function escapeAttr(str) {
+  return str.replace(/"/g, '&quot;');
 }
 
 // ── State panel renderer ──────────────────────────────────────────────────────
@@ -160,7 +270,6 @@ function renderState(state) {
 
   let html = '';
 
-  // Participants
   html += '<div class="section-label">Participants</div>';
   if (state.participants && state.participants.length) {
     html += '<div class="pills">';
@@ -172,7 +281,6 @@ function renderState(state) {
     html += '<p class="muted">Not set yet</p>';
   }
 
-  // Bills
   if (state.bills && state.bills.length) {
     html += '<div class="section-label" style="margin-top:16px">Bills</div>';
     state.bills.forEach(bill => {
@@ -205,7 +313,6 @@ function renderState(state) {
     });
   }
 
-  // Settlement (when finalized)
   if (state.finalized && state.settlement && state.settlement.length) {
     html += `<div class="settlement-card">
       <h3>✅ Settlement</h3>`;
@@ -221,6 +328,8 @@ function renderState(state) {
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────
+newChatBtn.addEventListener('click', createNewChat);
+
 sendBtn.addEventListener('click', handleSend);
 
 inputEl.addEventListener('keydown', e => {
@@ -230,7 +339,6 @@ inputEl.addEventListener('keydown', e => {
   }
 });
 
-// Auto-resize textarea
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto';
   inputEl.style.height = `${Math.min(inputEl.scrollHeight, 160)}px`;
@@ -240,7 +348,7 @@ fileInput.addEventListener('change', () => {
   const file = fileInput.files[0];
   if (file) {
     sendImageToAgent(file);
-    fileInput.value = '';   // reset so same file can be re-selected
+    fileInput.value = '';
   }
 });
 
