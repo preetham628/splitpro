@@ -11,10 +11,9 @@ image_analyzer:
 
 server:
   host: "0.0.0.0"
-  port: 8000
+  port: 8001
   cors_origins:
     - "*"
 
 auth:
-  google_redirect_uri: "http://localhost:8000/auth/google/callback"
   db_path: "splitpro.db"

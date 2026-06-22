@@ -19,7 +19,7 @@ _jwt_algorithm: str = "HS256"
 _jwt_expire_minutes: int = 10080  # 7 days
 _google_client_id: str = ""
 _google_client_secret: str = ""
-_google_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+_google_redirect_uri: str = "http://localhost:8001/auth/google/callback"
 
 
 def configure(

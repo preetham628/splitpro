@@ -9,7 +9,7 @@ Tables:
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 _db_path: str = "splitpro.db"
@@ -123,7 +123,7 @@ def save_session(
     name: Optional[str] = None,
 ) -> None:
     """Write-through save after each chat/image turn."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         if name is not None:
             conn.execute("""
