@@ -4,10 +4,11 @@ Run with: uvicorn server:app --reload
 """
 
 import json
-import os
 import secrets
 from typing import Optional
 from uuid import uuid4
+
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
@@ -29,17 +30,22 @@ load_dotenv()
 
 app_config = load_config()
 
-# Wire auth module with config + env overrides
 auth_module.configure(
-    jwt_secret=os.getenv("JWT_SECRET", app_config.auth.jwt_secret),
+    jwt_secret=app_config.auth.jwt_secret,
     jwt_algorithm=app_config.auth.jwt_algorithm,
     jwt_expire_minutes=app_config.auth.jwt_expire_minutes,
-    google_client_id=os.getenv("GOOGLE_CLIENT_ID", app_config.auth.google_client_id),
-    google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", app_config.auth.google_client_secret),
+    google_client_id=app_config.auth.google_client_id,
+    google_client_secret=app_config.auth.google_client_secret,
     google_redirect_uri=app_config.auth.google_redirect_uri,
 )
 
-app = FastAPI(title="SplitPro API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.init_db(app_config.auth.db_path)
+    yield
+
+
+app = FastAPI(title="SplitPro API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,11 +57,6 @@ app.add_middleware(
 
 # In-memory session cache: session_id -> ChatAgent (write-through with SQLite)
 sessions: dict[str, ChatAgent] = {}
-
-
-@app.on_event("startup")
-async def startup():
-    db.init_db(app_config.auth.db_path)
 
 
 # ---------- Request / Response models ----------

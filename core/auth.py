@@ -2,9 +2,7 @@
 Google OAuth + JWT helpers for SplitPro.
 """
 
-import os
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -16,7 +14,7 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_INFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
-_jwt_secret: str = "CHANGE_ME_IN_PRODUCTION"
+_jwt_secret: Optional[str] = None
 _jwt_algorithm: str = "HS256"
 _jwt_expire_minutes: int = 10080  # 7 days
 _google_client_id: str = ""
@@ -35,11 +33,19 @@ def configure(
     """Called once at startup from server.py with values from AppConfig + env vars."""
     global _jwt_secret, _jwt_algorithm, _jwt_expire_minutes
     global _google_client_id, _google_client_secret, _google_redirect_uri
+
+    if not jwt_secret:
+        raise ValueError("JWT_SECRET env var must be set to a secure random value.")
+    if not google_client_id:
+        raise ValueError("GOOGLE_CLIENT_ID env var is required for OAuth.")
+    if not google_client_secret:
+        raise ValueError("GOOGLE_CLIENT_SECRET env var is required for OAuth.")
+
     _jwt_secret = jwt_secret
     _jwt_algorithm = jwt_algorithm
     _jwt_expire_minutes = jwt_expire_minutes
-    _google_client_id = google_client_id or os.getenv("GOOGLE_CLIENT_ID", "")
-    _google_client_secret = google_client_secret or os.getenv("GOOGLE_CLIENT_SECRET", "")
+    _google_client_id = google_client_id
+    _google_client_secret = google_client_secret
     _google_redirect_uri = google_redirect_uri
 
 
@@ -83,12 +89,16 @@ def get_google_user_info(access_token: str) -> dict:
 # ---------- JWT ----------
 
 def create_jwt(user_id: int) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=_jwt_expire_minutes)
+    if not _jwt_secret:
+        raise RuntimeError("Auth not configured — call configure() at startup.")
+    expire = datetime.now(timezone.utc) + timedelta(minutes=_jwt_expire_minutes)
     payload = {"sub": str(user_id), "exp": expire}
     return jwt.encode(payload, _jwt_secret, algorithm=_jwt_algorithm)
 
 
 def verify_jwt(token: str) -> Optional[dict]:
+    if not _jwt_secret:
+        return None
     try:
         return jwt.decode(token, _jwt_secret, algorithms=[_jwt_algorithm])
     except JWTError:
