@@ -47,8 +47,23 @@ class ImageAnalyzerConfig:
 @dataclass
 class ServerConfig:
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8001
     cors_origins: List[str] = field(default_factory=lambda: ["*"])
+
+
+# ---------------------------------------------------------------------------
+# Auth config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuthConfig:
+    google_client_id: str = field(default_factory=lambda: os.getenv("GOOGLE_CLIENT_ID", ""))
+    google_client_secret: str = field(default_factory=lambda: os.getenv("GOOGLE_CLIENT_SECRET", ""))
+    google_redirect_uri: str = field(default_factory=lambda: os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback"))
+    jwt_secret: str = field(default_factory=lambda: os.getenv("JWT_SECRET", ""))
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 10080   # 7 days
+    db_path: str = "splitpro.db"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +75,7 @@ class AppConfig:
     chat_agent: ChatAgentConfig = field(default_factory=ChatAgentConfig)
     image_analyzer: ImageAnalyzerConfig = field(default_factory=ImageAnalyzerConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -81,4 +97,5 @@ def load_config(path: str = "config/defaults.yaml") -> AppConfig:
         chat_agent=ChatAgentConfig(**data.get("chat_agent", {})),
         image_analyzer=ImageAnalyzerConfig(**data.get("image_analyzer", {})),
         server=ServerConfig(**data.get("server", {})),
+        auth=AuthConfig(**data.get("auth", {})),
     )

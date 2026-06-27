@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, messages_to_dict, messages_from_dict
 from langchain_core.tools import tool
 
 from agents.llm_factory import create_llm
@@ -383,3 +383,23 @@ class ChatAgent:
                 )
 
         return "I'm having trouble processing that. Could you try rephrasing?"
+
+    def to_dict(self) -> dict:
+        """Serialize agent state for DB storage."""
+        return {
+            "message_history": messages_to_dict(self.message_history),
+            "session_state": self.state.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict, config: "ChatAgentConfig" = None) -> "ChatAgent":
+        """Restore a ChatAgent from a previously serialized dict."""
+        agent = cls(config=config)
+        agent.message_history = messages_from_dict(d.get("message_history", []))
+        state_dict = d.get("session_state", {})
+        if state_dict:
+            agent.state = SessionState.from_dict(state_dict)
+            # Rebuild tools so they close over the restored state instance
+            agent._tools = _build_tools(agent.state)
+            agent.tool_map = {t.name: t for t in agent._tools}
+        return agent
