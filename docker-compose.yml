@@ -1,0 +1,26 @@
+services:
+  splitpro:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: splitpro:local
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Keep the SQLite file inside the mounted volume below, regardless of
+      # what DB_PATH (if anything) is set to in .env.
+      DB_PATH: data/splitpro.db
+    volumes:
+      - splitpro_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  splitpro_data:

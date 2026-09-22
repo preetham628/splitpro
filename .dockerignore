@@ -6,4 +6,7 @@ __pycache__
 venv
 .git
 .gitignore
+*.db
+*.db-shm
+*.db-wal
 *.md
