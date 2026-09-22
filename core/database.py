@@ -7,6 +7,7 @@ Tables:
 """
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -19,6 +20,10 @@ def init_db(db_path: str = "splitpro.db") -> None:
     """Create tables if they don't exist. Call once at server startup."""
     global _db_path
     _db_path = db_path
+
+    dirname = os.path.dirname(db_path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
 
     with _connect() as conn:
         conn.executescript("""

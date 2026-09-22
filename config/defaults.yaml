@@ -15,5 +15,6 @@ server:
   cors_origins:
     - "*"
 
-auth:
-  db_path: "splitpro.db"
+# auth.db_path is intentionally omitted here — it defaults to the DB_PATH env
+# var (or "splitpro.db") in config.py. Setting it here would override that
+# env var, which breaks Docker/compose volume-based persistence.
