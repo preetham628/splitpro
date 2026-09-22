@@ -62,7 +62,8 @@ splitpro/
 │
 ├── .env.example              # Template for the .env file described below
 ├── Dockerfile
-├── pyproject.toml
+├── docker-compose.yml        # Local build + run, with volume-backed SQLite persistence
+├── requirements.txt
 └── .gitignore
 ```
 
@@ -73,7 +74,9 @@ splitpro/
 ### 1. Install dependencies
 
 ```bash
-pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
 Requires Python 3.9+.
@@ -141,10 +144,11 @@ image_analyzer:
 server:
   cors_origins:
     - "*"
-
-auth:
-  db_path: "splitpro.db"
 ```
+
+> `auth.db_path` (the SQLite file location) is deliberately *not* set here — it's controlled by
+> the `DB_PATH` env var instead (defaults to `splitpro.db` if unset), so Docker/compose can point
+> it at a mounted volume without editing this file. See [Docker](#docker) below.
 
 ---
 
@@ -174,6 +178,30 @@ CLI commands during a session:
 
 ## Docker
 
+### docker compose (recommended)
+
+Builds the image, wires up your `.env`, and persists the SQLite database in a named volume so
+it survives container restarts/rebuilds.
+
+```bash
+cp .env.example .env   # fill it in first — see "Configure environment variables" above
+docker compose up -d --build
+```
+
+Open `http://localhost:8000`. Useful follow-ups:
+
+```bash
+docker compose ps        # includes container health (from GET /health)
+docker compose logs -f   # tail logs
+docker compose down      # stop, keep the splitpro_data volume (DB persists)
+docker compose down -v   # stop AND delete the volume (DB is wiped)
+```
+
+`docker-compose.yml` pins `DB_PATH=data/splitpro.db` and mounts a named volume at `/app/data`,
+so the database survives `docker compose down` / `up` and image rebuilds — only `-v` deletes it.
+
+### Plain `docker run` (manual, no compose)
+
 ```bash
 docker build -t splitpro .
 docker run -p 8000:8000 \
@@ -182,8 +210,13 @@ docker run -p 8000:8000 \
   -e JWT_SECRET=your_jwt_secret \
   -e GOOGLE_CLIENT_ID=your_client_id \
   -e GOOGLE_CLIENT_SECRET=your_client_secret \
+  -e DB_PATH=data/splitpro.db \
+  -v splitpro_data:/app/data \
   splitpro
 ```
+
+Without `-v splitpro_data:/app/data`, the SQLite database lives only inside the container's
+writable layer and is lost when the container is removed.
 
 ---
 

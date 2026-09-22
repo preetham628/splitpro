@@ -200,7 +200,7 @@
   <ol>
     <li><strong>In the <code>ChatAgent</code> object itself</strong> — <code>message_history</code> (LangChain messages) and <code>state</code> (<code>SessionState</code>).</li>
     <li><strong>An in-memory cache in <code>server.py</code></strong> — <code>sessions: dict[str, ChatAgent]</code>, scoped to the running process.</li>
-    <li><strong>SQLite (<code>splitpro.db</code>)</strong> — the <code>chat_sessions</code> table stores <code>message_history</code> and <code>session_state</code> as JSON text blobs, source of truth across restarts.</li>
+    <li><strong>SQLite</strong> — the <code>chat_sessions</code> table stores <code>message_history</code> and <code>session_state</code> as JSON text blobs, source of truth across restarts. File location is <code>DB_PATH</code> (env var, default <code>splitpro.db</code> relative to the working directory) — <code>init_db()</code> creates any missing parent directory automatically.</li>
   </ol>
 
   <div class="kv">
@@ -223,9 +223,22 @@
     <code>ServerConfig.host</code> / <code>ServerConfig.port</code> (in <code>config/defaults.yaml</code>) are loaded
     but never passed to <code>uvicorn</code> — the app only reads <code>cors_origins</code> from
     <code>ServerConfig</code>. The actual bind address/port come from however <code>uvicorn</code> is invoked
-    (flags, or its own default of <code>127.0.0.1:8000</code>). Editing <code>server.port</code> in the YAML
-    has no effect on which port the server listens on.
+    (flags, or its own default of <code>127.0.0.1:8000</code>; the Dockerfile/compose setup pins it to
+    <code>0.0.0.0:8000</code> explicitly). Editing <code>server.port</code> in the YAML has no effect on
+    which port the server listens on.
   </div>
+
+  <h3>Docker &amp; docker compose</h3>
+  <p>
+    <code>docker-compose.yml</code> builds from the <code>Dockerfile</code>, loads <code>.env</code>, exposes
+    port 8000, and mounts a named volume (<code>splitpro_data</code>) at <code>/app/data</code> with
+    <code>DB_PATH=data/splitpro.db</code> — so the database survives container restarts and rebuilds
+    (only <code>docker compose down -v</code> deletes it). The image runs as a non-root user; both the
+    Dockerfile's <code>HEALTHCHECK</code> and the compose file's <code>healthcheck:</code> poll
+    <code>GET /health</code>. The container still refuses to boot without <code>JWT_SECRET</code>,
+    <code>GOOGLE_CLIENT_ID</code>, and <code>GOOGLE_CLIENT_SECRET</code> in <code>.env</code>, same as
+    running locally.
+  </p>
 
   <hr class="section" />
 
