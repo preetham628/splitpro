@@ -200,13 +200,41 @@
   <ol>
     <li><strong>In the <code>ChatAgent</code> object itself</strong> — <code>message_history</code> (LangChain messages) and <code>state</code> (<code>SessionState</code>).</li>
     <li><strong>An in-memory cache in <code>server.py</code></strong> — <code>sessions: dict[str, ChatAgent]</code>, scoped to the running process.</li>
-    <li><strong>SQLite</strong> — the <code>chat_sessions</code> table stores <code>message_history</code> and <code>session_state</code> as JSON text blobs, source of truth across restarts. File location is <code>DB_PATH</code> (env var, default <code>splitpro.db</code> relative to the working directory) — <code>init_db()</code> creates any missing parent directory automatically.</li>
+    <li><strong>SQLite</strong> — the <code>chat_sessions</code> table stores <code>message_history</code> and <code>session_state</code> as JSON text blobs, source of truth across restarts. File location is <code>DB_PATH</code> (env var) — <code>init_db()</code> creates any missing parent directory automatically.</li>
   </ol>
 
   <div class="kv">
     <dt>Cache hit</dt><dd>Request arrives → session already in the <code>sessions</code> dict → used directly.</dd>
     <dt>Cache miss</dt><dd><code>_get_agent()</code> loads the row from SQLite, rebuilds the agent with <code>ChatAgent.from_dict()</code> (using <code>messages_from_dict</code> for history and <code>SessionState.from_dict</code> for state), and re-caches it.</dd>
     <dt>After every turn</dt><dd><code>_save_agent()</code> serializes the agent back to JSON and writes it to the <code>chat_sessions</code> row (<code>updated_at</code> is bumped). The session is also auto-renamed to the first bill's description the moment a bill is added.</dd>
+  </div>
+
+  <div class="callout danger">
+    <strong>DB_PATH is required, and the file is never auto-created</strong>
+    <code>init_db()</code> (<code>core/database.py</code>) raises <code>ValueError</code> immediately if
+    <code>DB_PATH</code> is unset or empty, and raises <code>FileNotFoundError</code> if it's set but
+    the file doesn't exist yet — neither case falls back to anything. This is deliberate on two
+    counts: <code>DB_PATH</code> is the seam that will later carry a cloud database connection
+    string instead of a local file path, so it shouldn't have an implicit default; and a typo'd
+    path should fail loudly rather than silently standing up a fresh, empty database that looks
+    like data loss the next time you look for your sessions. Both checks run during app startup
+    (the FastAPI <code>lifespan</code> handler), same fail-fast timing as a missing
+    <code>JWT_SECRET</code>.
+  </div>
+
+  <div class="callout">
+    <strong>Provisioning a database</strong>
+    <code>schema.sql</code> (repo root) is the single source of truth for the schema — both it
+    and <code>core/database.py</code> read the same file, nothing to keep in sync by hand.
+    <code>scripts/init_db.sh</code> is the one recommended entry point for creating a fresh
+    database: it resolves <code>DB_PATH</code> the same way the app does (explicit env var, else
+    <code>.env</code>), then runs <code>schema.sql</code> through the <code>sqlite3</code> CLI if
+    it's on <code>PATH</code>, or falls back to the Python <code>sqlite3</code> module
+    (<code>create_db()</code> in <code>core/database.py</code>) if it isn't — which is the case
+    inside the Docker image, since <code>python:3.11-slim</code> doesn't ship the CLI binary. Both
+    paths are idempotent: re-running against an existing file is a safe no-op, never an
+    overwrite. <code>init_db()</code> (server startup) never creates anything itself — it only
+    verifies the file exists and ensures the schema is current on it.
   </div>
 
   <div class="callout warn">
@@ -231,13 +259,22 @@
   <h3>Docker &amp; docker compose</h3>
   <p>
     <code>docker-compose.yml</code> builds from the <code>Dockerfile</code>, loads <code>.env</code>, exposes
-    port 8000, and mounts a named volume (<code>splitpro_data</code>) at <code>/app/data</code> with
-    <code>DB_PATH=data/splitpro.db</code> — so the database survives container restarts and rebuilds
-    (only <code>docker compose down -v</code> deletes it). The image runs as a non-root user; both the
-    Dockerfile's <code>HEALTHCHECK</code> and the compose file's <code>healthcheck:</code> poll
-    <code>GET /health</code>. The container still refuses to boot without <code>JWT_SECRET</code>,
-    <code>GOOGLE_CLIENT_ID</code>, and <code>GOOGLE_CLIENT_SECRET</code> in <code>.env</code>, same as
-    running locally.
+    port 8000, and bind-mounts <code>./$DB_PATH</code> (host) onto <code>/app/$DB_PATH</code>
+    (container) — <code>volumes: - ./${DB_PATH}:/app/${DB_PATH}</code>, using Compose's own
+    variable substitution against the same <code>.env</code>. That's the only mount; there's no
+    named volume. Because it's a real host file rather than a Docker-managed volume, the database
+    is the same file whether you run <code>uvicorn</code> locally or in the container, visible
+    and inspectable directly from the repo root — and it's why <code>DB_PATH</code> must be a
+    relative path: Compose's short volume syntax treats a bare relative name as a named-volume
+    reference unless prefixed with <code>./</code>, and that prefix only makes sense for a
+    relative path. This also means <code>docker compose run --rm splitpro ./scripts/init_db.sh</code>
+    must run <em>before</em> the mount is attempted — Docker creates an empty directory at a
+    bind-mount source that doesn't exist yet, on both the host and the container side, rather
+    than erroring, so provisioning genuinely has to happen first. The image runs as a non-root
+    user; both the Dockerfile's <code>HEALTHCHECK</code> and the compose file's
+    <code>healthcheck:</code> poll <code>GET /health</code>. The container still refuses to boot
+    without <code>JWT_SECRET</code>, <code>GOOGLE_CLIENT_ID</code>, and
+    <code>GOOGLE_CLIENT_SECRET</code> in <code>.env</code>, same as running locally.
   </p>
 
   <hr class="section" />

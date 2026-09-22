@@ -13,11 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Non-root runtime user. /app/data is pre-created and owned by the app user
-# so that a named volume mounted there (see docker-compose.yml) inherits
-# correct ownership on first mount.
-RUN mkdir -p /app/data \
-    && useradd --create-home --uid 1000 splitpro \
+# Non-root runtime user.
+RUN useradd --create-home --uid 1000 splitpro \
     && chown -R splitpro:splitpro /app
 USER splitpro
 

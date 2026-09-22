@@ -59,11 +59,11 @@ class ServerConfig:
 class AuthConfig:
     google_client_id: str = field(default_factory=lambda: os.getenv("GOOGLE_CLIENT_ID", ""))
     google_client_secret: str = field(default_factory=lambda: os.getenv("GOOGLE_CLIENT_SECRET", ""))
-    google_redirect_uri: str = field(default_factory=lambda: os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback"))
+    google_redirect_uri: str = field(default_factory=lambda: os.getenv("GOOGLE_REDIRECT_URI") or "http://localhost:8000/auth/google/callback")
     jwt_secret: str = field(default_factory=lambda: os.getenv("JWT_SECRET", ""))
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 10080   # 7 days
-    db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", "splitpro.db"))
+    db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", ""))
 
 
 # ---------------------------------------------------------------------------

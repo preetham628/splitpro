@@ -4,16 +4,26 @@ services:
       context: .
       dockerfile: Dockerfile
     image: splitpro:local
+    container_name: splitpro
     ports:
       - "8000:8000"
     env_file:
-      - .env
-    environment:
-      # Keep the SQLite file inside the mounted volume below, regardless of
-      # what DB_PATH (if anything) is set to in .env.
-      DB_PATH: data/splitpro.db
+      - .env   # provides DB_PATH (and everything else) inside the container
     volumes:
-      - splitpro_data:/app/data
+      # Bind-mount exactly the file `scripts/init_db.sh` already created at
+      # $DB_PATH on the host — nothing else is mounted. DB_PATH must be a
+      # RELATIVE path (e.g. "splitpro.db", not "/Users/.../splitpro.db"):
+      # Compose's short volume syntax treats a bare relative name as a named
+      # volume reference unless prefixed with "./" (host side, resolved
+      # against this compose file's directory — the repo root). The
+      # container side must be an absolute path, so it's WORKDIR (/app)
+      # joined with DB_PATH — that's also exactly where a relative DB_PATH
+      # resolves to from the app's own cwd at runtime (env_file above sets
+      # the same DB_PATH inside the container), so both sides agree.
+      # Run scripts/init_db.sh BEFORE `docker compose up` — this mount
+      # requires the file to already exist (Compose creates an empty
+      # directory there otherwise, not the file).
+      - ./${DB_PATH}:/app/${DB_PATH}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
@@ -21,6 +31,3 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-
-volumes:
-  splitpro_data:

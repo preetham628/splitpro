@@ -1,5 +1,4 @@
 from __future__ import annotations
-import dataclasses
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -66,9 +65,6 @@ class SessionState:
             b.paid_by is not None and len(b.unassigned_items()) == 0
             for b in self.bills
         )
-
-    def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SessionState":

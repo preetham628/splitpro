@@ -131,9 +131,23 @@ async function loadSession(id) {
   localStorage.setItem('lastSessionId', id);
   setActiveSession(id);
 
-  // Clear chat panel (visual history isn't restored — AI context is in DB)
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">Loading…</p>';
+
+  try {
+    const res = await fetch(`${API}/sessions/${id}/messages`, { credentials: 'include' });
+    if (res.ok) {
+      const messages = await res.json();
+      messages.forEach(m => {
+        const imageDataUrl = m.image_base64
+          ? `data:${m.image_media_type};base64,${m.image_base64}`
+          : null;
+        appendBubble(m.role, m.content, imageDataUrl);
+      });
+    }
+  } catch {
+    // Transcript failed to load — chat panel just starts empty for this session.
+  }
 
   try {
     const res = await fetch(`${API}/sessions/${id}/state`, { credentials: 'include' });
@@ -144,8 +158,6 @@ async function loadSession(id) {
   } catch {
     stateContent.innerHTML = '<p class="muted">No data yet.</p>';
   }
-
-  appendBubble('agent', 'Session loaded. How can I help you continue?');
 }
 
 function setActiveSession(id) {

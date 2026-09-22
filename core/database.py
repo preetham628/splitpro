@@ -1,51 +1,123 @@
 """
 SQLite persistence layer for SplitPro.
 
-Tables:
-  users        — Google OAuth users
-  chat_sessions — Named bill-splitting sessions, state stored as JSON blobs
+Tables (see schema.sql for the authoritative definitions):
+  users                 — Google OAuth users
+  chat_sessions         — Named bill-splitting sessions
+  chat_messages         — UI-facing chat transcript (role, content, optional image)
+  session_participants  — participant names per session
+  bills / bill_items    — parsed bills, normalized (replaces the old session_state JSON blob)
+  settlements           — computed once a session is finalized
+
+Conversation memory for the agent itself (system/tool-call plumbing) lives
+separately in LangGraph's own checkpoint tables — see core/checkpointer.py.
+
+The database file itself is never auto-created by the running app — only
+create_db() (run explicitly, once, via `python -m core.database <path>`)
+creates it. init_db() (called at server startup) requires the file to
+already exist and raises otherwise. This is deliberate: a typo'd DB_PATH
+should fail loudly instead of silently standing up a fresh, empty database,
+and it matches how a future cloud database will need to be provisioned
+ahead of time rather than materialized on first connect.
 """
 
 import json
 import os
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-_db_path: str = "splitpro.db"
+if TYPE_CHECKING:
+    from core.session_state import SessionState
+
+_db_path: Optional[str] = None
+
+# schema.sql (repo root) is the single source of truth for the schema — both
+# the sqlite3 CLI (`sqlite3 $DB_PATH < schema.sql`) and this module read the
+# same file, so there's no separate copy of the CREATE TABLE statements to
+# drift out of sync.
+_SCHEMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 
 
-def init_db(db_path: str = "splitpro.db") -> None:
-    """Create tables if they don't exist. Call once at server startup."""
+def _load_schema() -> str:
+    with open(_SCHEMA_PATH) as f:
+        return f.read()
+
+
+def init_db(db_path: str) -> None:
+    """Point the module at an existing database and ensure its schema is current.
+
+    Call once at server startup. Requires db_path to be set AND the file to
+    already exist — does not create either. Use create_db() to provision a
+    fresh database first.
+    """
+    if not db_path:
+        raise ValueError(
+            "DB_PATH env var must be set (e.g. DB_PATH=splitpro.db for local "
+            "SQLite). There is no default — set it explicitly in .env."
+        )
+
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(
+            f"Database file not found at '{db_path}'. The app does not "
+            f"auto-create it — provision it once with:\n"
+            f"    ./scripts/init_db.sh\n"
+            f"or: python -m core.database {db_path}"
+        )
+
     global _db_path
     _db_path = db_path
+
+    with _connect() as conn:
+        conn.executescript(_load_schema())
+        _migrate_chat_sessions(conn)
+
+
+def create_db(db_path: str) -> None:
+    """Explicitly provision a new database file with the current schema.
+
+    The one place this module is allowed to create the underlying file.
+    Run by hand (or once in CI/deploy tooling) — never called from init_db()
+    or anywhere in the request path.
+    """
+    if not db_path:
+        raise ValueError("db_path is required.")
+
+    if os.path.exists(db_path):
+        raise FileExistsError(f"'{db_path}' already exists — refusing to overwrite it.")
 
     dirname = os.path.dirname(db_path)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
 
-    with _connect() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                google_id  TEXT UNIQUE NOT NULL,
-                email      TEXT UNIQUE NOT NULL,
-                name       TEXT,
-                avatar_url TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_load_schema())
+        conn.commit()
+    finally:
+        conn.close()
 
-            CREATE TABLE IF NOT EXISTS chat_sessions (
-                id               TEXT PRIMARY KEY,
-                user_id          INTEGER NOT NULL REFERENCES users(id),
-                name             TEXT NOT NULL DEFAULT 'New Session',
-                message_history  TEXT NOT NULL DEFAULT '[]',
-                session_state    TEXT NOT NULL DEFAULT '{}',
-                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
+
+def _migrate_chat_sessions(conn: sqlite3.Connection) -> None:
+    """One-time column migration for pre-existing chat_sessions tables.
+
+    schema.sql's CREATE TABLE IF NOT EXISTS can't retroactively alter a
+    table that already exists — this handles the one shape change needed:
+    dropping the old message_history/session_state JSON-blob columns (their
+    data now lives in LangGraph's checkpoint tables and the normalized
+    bills/session_participants/settlements tables, respectively) and adding
+    `finalized`. Safe to call on every startup — checks columns first.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+
+    if "session_state" in existing:
+        conn.execute("ALTER TABLE chat_sessions DROP COLUMN session_state")
+    if "message_history" in existing:
+        conn.execute("ALTER TABLE chat_sessions DROP COLUMN message_history")
+    if "finalized" not in existing:
+        conn.execute("ALTER TABLE chat_sessions ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0")
 
 
 @contextmanager
@@ -112,36 +184,133 @@ def create_session(session_id: str, user_id: int, name: str = "New Session") -> 
         """, (session_id, user_id, name))
 
 
-def load_session(session_id: str) -> Optional[dict]:
-    """Return the raw JSON blobs for message_history and session_state, or None."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM chat_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def save_session(
+def save_session_state(
     session_id: str,
-    message_history_json: str,
-    session_state_json: str,
+    state: "SessionState",
+    settlements: list[dict],
     name: Optional[str] = None,
 ) -> None:
-    """Write-through save after each chat/image turn."""
+    """Write-through save of bills/participants/settlements after each turn.
+
+    Delete+reinsert rather than diffing — SessionState is fully mutated in
+    place each turn, so this is simpler and correct at this data size, and
+    matches the app's existing write-through-every-turn persistence style.
+    All in one transaction (single _connect() context) for atomicity.
+    """
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
+        conn.execute("DELETE FROM session_participants WHERE session_id = ?", (session_id,))
+        conn.executemany(
+            "INSERT INTO session_participants (session_id, name) VALUES (?, ?)",
+            [(session_id, p) for p in state.participants],
+        )
+
+        # Deleting bills cascades to bill_items (ON DELETE CASCADE, foreign_keys=ON).
+        conn.execute("DELETE FROM bills WHERE session_id = ?", (session_id,))
+        for bill in state.bills:
+            cursor = conn.execute("""
+                INSERT INTO bills (session_id, bill_id, description, raw_text, tax, tip, paid_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, bill.bill_id, bill.description, bill.raw_text,
+                  bill.tax, bill.tip, bill.paid_by))
+            bill_row_id = cursor.lastrowid
+            for item in bill.items:
+                conn.execute("""
+                    INSERT INTO bill_items
+                        (bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (bill_row_id, item.name, item.price, item.qty,
+                      json.dumps(item.assigned_to), int(item.shared), int(item.unassigned),
+                      json.dumps(item.qty_allocations)))
+
+        conn.execute("DELETE FROM settlements WHERE session_id = ?", (session_id,))
+        conn.executemany(
+            "INSERT INTO settlements (session_id, from_person, to_person, amount) VALUES (?, ?, ?, ?)",
+            [(session_id, s["from"], s["to"], s["amount"]) for s in settlements],
+        )
+
         if name is not None:
             conn.execute("""
-                UPDATE chat_sessions
-                SET message_history = ?, session_state = ?, name = ?, updated_at = ?
-                WHERE id = ?
-            """, (message_history_json, session_state_json, name, now, session_id))
+                UPDATE chat_sessions SET finalized = ?, name = ?, updated_at = ? WHERE id = ?
+            """, (int(state.finalized), name, now, session_id))
         else:
             conn.execute("""
-                UPDATE chat_sessions
-                SET message_history = ?, session_state = ?, updated_at = ?
-                WHERE id = ?
-            """, (message_history_json, session_state_json, now, session_id))
+                UPDATE chat_sessions SET finalized = ?, updated_at = ? WHERE id = ?
+            """, (int(state.finalized), now, session_id))
+
+
+def load_session_state(session_id: str) -> dict:
+    """Reconstruct a dict shaped exactly like SessionState.from_dict() expects."""
+    with _connect() as conn:
+        participants = [
+            r["name"] for r in conn.execute(
+                "SELECT name FROM session_participants WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        ]
+
+        session_row = conn.execute(
+            "SELECT finalized FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        finalized = bool(session_row["finalized"]) if session_row else False
+
+        bills = []
+        for b in conn.execute(
+            "SELECT * FROM bills WHERE session_id = ? ORDER BY id", (session_id,)
+        ).fetchall():
+            items = [
+                {
+                    "name": i["name"],
+                    "price": i["price"],
+                    "qty": i["qty"],
+                    "assigned_to": json.loads(i["assigned_to"]),
+                    "shared": bool(i["shared"]),
+                    "unassigned": bool(i["unassigned"]),
+                    "qty_allocations": json.loads(i["qty_allocations"]),
+                }
+                for i in conn.execute(
+                    "SELECT * FROM bill_items WHERE bill_id = ? ORDER BY id", (b["id"],)
+                ).fetchall()
+            ]
+            bills.append({
+                "bill_id": b["bill_id"],
+                "description": b["description"],
+                "raw_text": b["raw_text"],
+                "tax": b["tax"],
+                "tip": b["tip"],
+                "paid_by": b["paid_by"],
+                "items": items,
+            })
+
+    return {"participants": participants, "bills": bills, "finalized": finalized}
+
+
+# ---------- Chat transcript (UI-facing) ----------
+
+def add_chat_message(
+    session_id: str,
+    role: str,
+    content: str,
+    image_base64: Optional[str] = None,
+    image_media_type: Optional[str] = None,
+) -> None:
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO chat_messages (session_id, role, content, image_base64, image_media_type)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_id, role, content, image_base64, image_media_type))
+
+
+def list_chat_messages(session_id: str) -> list[dict]:
+    """Return the chat transcript for a session, oldest first."""
+    with _connect() as conn:
+        rows = conn.execute("""
+            SELECT role, content, image_base64, image_media_type, created_at
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY id
+        """, (session_id,)).fetchall()
+        return [dict(r) for r in rows]
 
 
 def rename_session(session_id: str, user_id: int, name: str) -> bool:
@@ -170,3 +339,22 @@ def session_belongs_to_user(session_id: str, user_id: int) -> bool:
             (session_id, user_id),
         ).fetchone()
         return row is not None
+
+
+if __name__ == "__main__":
+    # Path is optional — falls back to DB_PATH (from .env, then the
+    # environment), the same variable the running app itself requires.
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    path = sys.argv[1] if len(sys.argv) > 1 else os.getenv("DB_PATH", "")
+    if not path:
+        print(
+            "Usage: python -m core.database [db_path]\n"
+            "No path given and DB_PATH is not set in .env or the environment.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    create_db(path)
+    print(f"Created {path}")

@@ -3,7 +3,7 @@ SplitPro FastAPI Server
 Run with: uvicorn server:app --reload
 """
 
-import json
+import base64
 import secrets
 from typing import Optional
 from uuid import uuid4
@@ -22,6 +22,7 @@ from agents.image_analyzer import ImageAnalyzer
 from config import ChatAgentConfig, load_config
 from core import auth as auth_module
 from core.auth import get_current_user
+from core import checkpointer
 from core import database as db
 from core.session_state import SessionState
 from core.settlement import Settlement
@@ -42,6 +43,7 @@ auth_module.configure(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init_db(app_config.auth.db_path)
+    checkpointer.init_checkpointer(app_config.auth.db_path)
     yield
 
 
@@ -147,41 +149,36 @@ def _compute_settlement(state: SessionState) -> list:
 
 
 def _get_agent(session_id: str, user: dict) -> ChatAgent:
-    """Return agent from cache or restore from DB. Validates ownership."""
+    """Return agent from cache or restore from DB. Validates ownership.
+
+    Conversation history no longer needs restoring here — LangGraph's
+    checkpointer already has it, keyed by thread_id (= session_id), and
+    ChatAgent.chat() picks it up transparently on the next invoke(). Only
+    the bill-splitting SessionState needs to be reloaded explicitly.
+    """
     if not db.session_belongs_to_user(session_id, user["id"]):
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
 
     if session_id in sessions:
         return sessions[session_id]
 
-    # Cache miss — restore from DB
-    row = db.load_session(session_id)
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
-
+    # Cache miss — rebuild the agent; its graph resumes via the checkpointer.
     config = _chat_config()
-    try:
-        saved = {
-            "message_history": json.loads(row["message_history"]),
-            "session_state": json.loads(row["session_state"]),
-        }
-        agent = ChatAgent.from_dict(saved, config=config)
-    except Exception:
-        agent = ChatAgent(config=config)
+    agent = ChatAgent(session_id=session_id, config=config)
+    agent.set_state(SessionState.from_dict(db.load_session_state(session_id)))
 
     sessions[session_id] = agent
     return agent
 
 
 def _save_agent(session_id: str, agent: ChatAgent, name: Optional[str] = None) -> None:
-    """Persist agent state to DB (write-through)."""
-    d = agent.to_dict()
-    db.save_session(
-        session_id,
-        message_history_json=json.dumps(d["message_history"]),
-        session_state_json=json.dumps(d["session_state"]),
-        name=name,
-    )
+    """Persist bill-splitting state to DB (write-through).
+
+    Conversation messages are already persisted by the checkpointer during
+    agent.chat()'s graph.invoke() call — nothing to do for those here.
+    """
+    settlements = _compute_settlement(agent.state) if agent.state.finalized else []
+    db.save_session_state(session_id, agent.state, settlements, name=name)
 
 
 def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
@@ -269,7 +266,7 @@ def create_session(
     """Create a new named session in DB + memory cache."""
     session_id = str(uuid4())
     config = _chat_config(req)
-    agent = ChatAgent(config=config)
+    agent = ChatAgent(session_id=session_id, config=config)
     sessions[session_id] = agent
 
     db.create_session(session_id, user["id"], name="New Session")
@@ -301,6 +298,7 @@ def delete_session(session_id: str, user: dict = Depends(get_current_user)):
     deleted = db.delete_session(session_id, user["id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
+    checkpointer.delete_thread(session_id)
     sessions.pop(session_id, None)
     return {"ok": True}
 
@@ -317,6 +315,8 @@ def chat(
     prev_bill_count = len(agent.state.bills)
 
     response = agent.chat(req.message)
+    db.add_chat_message(session_id, "user", req.message)
+    db.add_chat_message(session_id, "agent", response)
 
     # Auto-rename session when first bill is added
     new_name: Optional[str] = None
@@ -333,9 +333,18 @@ def get_state(session_id: str, user: dict = Depends(get_current_user)):
     return _serialize_state(agent.state)
 
 
+@app.get("/sessions/{session_id}/messages")
+def get_messages(session_id: str, user: dict = Depends(get_current_user)):
+    """Full chat transcript for replay when a session is reopened."""
+    if not db.session_belongs_to_user(session_id, user["id"]):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return db.list_chat_messages(session_id)
+
+
 @app.delete("/sessions/{session_id}")
 def end_session(session_id: str, user: dict = Depends(get_current_user)):
     db.delete_session(session_id, user["id"])
+    checkpointer.delete_thread(session_id)
     sessions.pop(session_id, None)
     return {"ok": True}
 
@@ -353,6 +362,7 @@ async def upload_image(
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
 
     image_bytes = await file.read()
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
     analyzer = ImageAnalyzer(app_config.image_analyzer)
     result = analyzer.analyze(image_bytes, media_type=content_type)
@@ -371,6 +381,8 @@ async def upload_image(
         )
 
     response = agent.chat(agent_message)
+    db.add_chat_message(session_id, "user", "", image_base64=image_b64, image_media_type=content_type)
+    db.add_chat_message(session_id, "agent", response)
 
     new_name: Optional[str] = None
     if len(agent.state.bills) > prev_bill_count:

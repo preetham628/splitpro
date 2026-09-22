@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
+from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, messages_to_dict, messages_from_dict
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from agents.llm_factory import create_llm
 from config import ChatAgentConfig
+from core.checkpointer import get_checkpointer
 from core.session_state import LineItem, ParsedBill, SessionState
 from core.settlement import Settlement
 
@@ -331,75 +336,76 @@ def _build_tools(state: SessionState) -> list:
     return [add_bill, set_participants, assign_items, set_payer, mark_items_unassigned, calculate_split]
 
 
+class GraphState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
 class ChatAgent:
-    """Conversational bill-splitting agent powered by LangChain tool calling."""
+    """Conversational bill-splitting agent — a small LangGraph graph
+    (agent node -> tools node, looping until the model stops calling tools),
+    checkpointed by session_id via core/checkpointer.py. Conversation
+    continuity (the equivalent of the old hand-rolled message_history) is
+    handled entirely by the checkpointer, keyed by thread_id = session_id —
+    nothing to manually serialize/restore here anymore.
+    """
 
-    def __init__(self, config: ChatAgentConfig = None):
-        cfg = config or ChatAgentConfig()
-        self._max_iterations = cfg.max_iterations
-
+    def __init__(self, session_id: str, config: ChatAgentConfig = None):
+        self.session_id = session_id
+        self._config = config or ChatAgentConfig()
+        self._max_iterations = self._config.max_iterations
         self.state = SessionState()
-        self.message_history: list[Any] = []
+        self._rebuild()
 
+    def _rebuild(self) -> None:
+        """(Re)build tools/llm/graph bound to the current self.state.
+
+        Must run whenever self.state is replaced (see set_state()) — the
+        tool closures and the graph's ToolNode both need to close over the
+        same SessionState instance, so they're rebuilt together.
+        """
         self._tools = _build_tools(self.state)
-        self.tool_map = {t.name: t for t in self._tools}
+        llm = create_llm(self._config)
+        self._llm_with_tools = llm.bind_tools(self._tools)
 
-        llm = create_llm(cfg)
-        self.llm_with_tools = llm.bind_tools(self._tools)
+        graph = StateGraph(GraphState)
+        graph.add_node("agent", self._agent_node)
+        graph.add_node("tools", ToolNode(self._tools))
+        graph.set_entry_point("agent")
+        graph.add_conditional_edges("agent", tools_condition)
+        graph.add_edge("tools", "agent")
+        self._graph = graph.compile(checkpointer=get_checkpointer())
 
-    def _system_message(self) -> SystemMessage:
-        content = SYSTEM_PROMPT_TEMPLATE.format(state_summary=self.state.state_summary())
-        return SystemMessage(content=content)
+    def _agent_node(self, graph_state: GraphState) -> dict:
+        """Render the system prompt fresh from live state on every call —
+        same dynamic-prompt behavior as the original hand-rolled loop."""
+        system_message = SystemMessage(
+            content=SYSTEM_PROMPT_TEMPLATE.format(state_summary=self.state.state_summary())
+        )
+        response = self._llm_with_tools.invoke([system_message] + graph_state["messages"])
+        return {"messages": [response]}
+
+    def set_state(self, state: SessionState) -> None:
+        """Replace the bill-splitting state (e.g. when restoring a session
+        from the DB) and rebuild the tools/graph to match."""
+        self.state = state
+        self._rebuild()
 
     def chat(self, user_message: str) -> str:
-        """Process one user turn, executing tools as needed, and return the final response."""
-        self.message_history.append(HumanMessage(content=user_message))
+        """Process one user turn and return the final response.
 
-        for _ in range(self._max_iterations):
-            messages = [self._system_message()] + self.message_history
-            ai_response = self.llm_with_tools.invoke(messages)
-
-            if not ai_response.tool_calls:
-                self.message_history.append(ai_response)
-                return ai_response.content
-
-            # Execute all tool calls and collect results
-            self.message_history.append(ai_response)
-            for tc in ai_response.tool_calls:
-                tool_name = tc["name"]
-                tool_args = tc["args"]
-                tool_call_id = tc["id"]
-
-                if tool_name not in self.tool_map:
-                    result = f"Error: unknown tool '{tool_name}'"
-                else:
-                    try:
-                        result = self.tool_map[tool_name].invoke(tool_args)
-                    except Exception as e:
-                        result = f"Error executing {tool_name}: {e}"
-
-                self.message_history.append(
-                    ToolMessage(content=str(result), tool_call_id=tool_call_id)
-                )
-
-        return "I'm having trouble processing that. Could you try rephrasing?"
-
-    def to_dict(self) -> dict:
-        """Serialize agent state for DB storage."""
-        return {
-            "message_history": messages_to_dict(self.message_history),
-            "session_state": self.state.to_dict(),
+        The checkpointer transparently loads prior messages for this
+        thread_id and persists the new ones — no manual history handling.
+        """
+        config = {
+            "configurable": {"thread_id": self.session_id},
+            # Each old "iteration" was one LLM call; the graph takes ~2 steps
+            # per iteration (agent + tools), so double the budget plus slack.
+            "recursion_limit": self._max_iterations * 2 + 1,
         }
-
-    @classmethod
-    def from_dict(cls, d: dict, config: "ChatAgentConfig" = None) -> "ChatAgent":
-        """Restore a ChatAgent from a previously serialized dict."""
-        agent = cls(config=config)
-        agent.message_history = messages_from_dict(d.get("message_history", []))
-        state_dict = d.get("session_state", {})
-        if state_dict:
-            agent.state = SessionState.from_dict(state_dict)
-            # Rebuild tools so they close over the restored state instance
-            agent._tools = _build_tools(agent.state)
-            agent.tool_map = {t.name: t for t in agent._tools}
-        return agent
+        try:
+            result = self._graph.invoke(
+                {"messages": [HumanMessage(content=user_message)]}, config=config
+            )
+        except GraphRecursionError:
+            return "I'm having trouble processing that. Could you try rephrasing?"
+        return result["messages"][-1].content

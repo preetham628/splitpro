@@ -60,9 +60,13 @@ splitpro/
 │   ├── api.html
 │   └── assets/
 │
+├── scripts/
+│   └── init_db.sh           # Provisions the SQLite file from schema.sql (see step 4 below)
+│
+├── schema.sql                # Canonical DB schema — core/database.py reads this file directly
 ├── .env.example              # Template for the .env file described below
 ├── Dockerfile
-├── docker-compose.yml        # Local build + run, with volume-backed SQLite persistence
+├── docker-compose.yml        # Local build + run, bind-mounts $DB_PATH into the container
 ├── requirements.txt
 └── .gitignore
 ```
@@ -92,7 +96,7 @@ Then fill in `.env`. What you need depends on how you're running SplitPro:
 | Running | Required |
 |---|---|
 | `python main.py` (CLI) | An API key for the LLM provider you use — nothing else. |
-| `uvicorn server:app` (web app) | An LLM API key **and** `JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`. |
+| `uvicorn server:app` (web app) | An LLM API key **and** `JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `DB_PATH`. |
 
 ```env
 # LLM providers — only the ones matching config/defaults.yaml are required
@@ -107,11 +111,16 @@ GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
 
 # Required to run the web app
 JWT_SECRET=...
+
+# Required to run the web app — no default. Local SQLite file path today;
+# will point at a cloud database connection string later.
+DB_PATH=splitpro.db
 ```
 
-> **The web server will not start** without `JWT_SECRET`, `GOOGLE_CLIENT_ID`, and
-> `GOOGLE_CLIENT_SECRET` — it validates them at import time and raises immediately if any are
-> missing. The CLI doesn't touch `server.py` at all, so it's unaffected.
+> **The web server will not start** without `JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+> or `DB_PATH` — auth vars are validated at import time, and `DB_PATH` is validated when the server
+> starts accepting connections; all four raise immediately if missing. The CLI doesn't touch
+> `server.py` at all, so it's unaffected by any of this.
 
 Generate a JWT secret:
 
@@ -125,7 +134,22 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 2. Add an **Authorized redirect URI** that exactly matches `GOOGLE_REDIRECT_URI` above (default: `http://localhost:8000/auth/google/callback`).
 3. Copy the generated Client ID and Client Secret into `.env`.
 
-### 4. (Optional) Edit provider/model settings
+### 4. Create the database (first time only, web app only)
+
+The server does **not** auto-create the SQLite file — it requires the path in `DB_PATH` to
+already exist and fails fast (`FileNotFoundError`) if it doesn't. This is deliberate: a typo'd
+`DB_PATH` should error loudly, not silently stand up a fresh empty database. Create it once:
+
+```bash
+./scripts/init_db.sh
+```
+
+It reads `DB_PATH` from `.env` automatically (or `DB_PATH=other.db ./scripts/init_db.sh` to
+override), runs `schema.sql` through the `sqlite3` CLI, and is safe to re-run — it no-ops if the
+file already exists rather than touching it. `schema.sql` is the single source of truth for the
+schema; `core/database.py` reads the same file, so there's nothing to keep in sync by hand.
+
+### 5. (Optional) Edit provider/model settings
 
 `config/defaults.yaml` controls which model is used for each tool:
 
@@ -147,8 +171,9 @@ server:
 ```
 
 > `auth.db_path` (the SQLite file location) is deliberately *not* set here — it's controlled by
-> the `DB_PATH` env var instead (defaults to `splitpro.db` if unset), so Docker/compose can point
-> it at a mounted volume without editing this file. See [Docker](#docker) below.
+> the `DB_PATH` env var instead, which is **required** (no fallback — the server refuses to start
+> without it), so Docker/compose can point it at a mounted volume without editing this file. See
+> [Docker](#docker) below.
 
 ---
 
@@ -180,43 +205,45 @@ CLI commands during a session:
 
 ### docker compose (recommended)
 
-Builds the image, wires up your `.env`, and persists the SQLite database in a named volume so
-it survives container restarts/rebuilds.
+Builds the image, wires up your `.env`, and bind-mounts the exact SQLite file at `DB_PATH` into
+the container — the same file your local `./scripts/init_db.sh` / `uvicorn` setup uses, nothing
+else is mounted. **`DB_PATH` must be a relative path** (the default, `splitpro.db`, is fine) —
+see the comment on `volumes:` in `docker-compose.yml` for why an absolute path breaks the mount.
 
 ```bash
 cp .env.example .env   # fill it in first — see "Configure environment variables" above
+./scripts/init_db.sh   # first time only — creates $DB_PATH on the host, e.g. ./splitpro.db
 docker compose up -d --build
 ```
+
+`init_db.sh` must run **before** `docker compose up` — the bind mount requires the file to
+already exist (Docker silently creates an empty *directory* there otherwise, which then breaks
+every DB read/write with a confusing error). It's a plain file sitting right in your repo root
+afterward (gitignored), so you can also inspect it directly: `sqlite3 splitpro.db ".tables"`.
 
 Open `http://localhost:8000`. Useful follow-ups:
 
 ```bash
 docker compose ps        # includes container health (from GET /health)
 docker compose logs -f   # tail logs
-docker compose down      # stop, keep the splitpro_data volume (DB persists)
-docker compose down -v   # stop AND delete the volume (DB is wiped)
+docker compose down      # stop the container — $DB_PATH is a host file, unaffected either way
 ```
-
-`docker-compose.yml` pins `DB_PATH=data/splitpro.db` and mounts a named volume at `/app/data`,
-so the database survives `docker compose down` / `up` and image rebuilds — only `-v` deletes it.
 
 ### Plain `docker run` (manual, no compose)
 
 ```bash
 docker build -t splitpro .
+./scripts/init_db.sh   # first time only — same as above
+
 docker run -p 8000:8000 \
-  -e ANTHROPIC_API_KEY=your_key \
-  -e GOOGLE_API_KEY=your_key \
-  -e JWT_SECRET=your_jwt_secret \
-  -e GOOGLE_CLIENT_ID=your_client_id \
-  -e GOOGLE_CLIENT_SECRET=your_client_secret \
-  -e DB_PATH=data/splitpro.db \
-  -v splitpro_data:/app/data \
+  --env-file .env \
+  -v "$(pwd)/splitpro.db:/app/splitpro.db" \
   splitpro
 ```
 
-Without `-v splitpro_data:/app/data`, the SQLite database lives only inside the container's
-writable layer and is lost when the container is removed.
+The bind-mount source/target must match `DB_PATH` in `.env` (`splitpro.db` by default) —
+`docker-compose.yml` derives this automatically from `${DB_PATH}`; with plain `docker run` you
+have to keep the `-v` flag's path in sync with `.env` yourself.
 
 ---
 
