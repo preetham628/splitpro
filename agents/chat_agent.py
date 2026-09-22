@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
@@ -271,58 +270,7 @@ def _build_tools(state: SessionState) -> list:
         if missing_payers:
             return f"Error: payer not set for {missing_payers}. Please set payers first."
 
-        global_balances: dict[str, float] = defaultdict(float)
-        warnings = []
-
-        for bill in state.bills:
-            person_subtotal: dict[str, float] = defaultdict(float)
-
-            for item in bill.items:
-                if item.qty_allocations:
-                    # Qty-based: pay unit_price * units consumed
-                    unit_price = item.unit_price
-                    allocated_qty = sum(item.qty_allocations.values())
-                    for person, pqty in item.qty_allocations.items():
-                        person_subtotal[person] += unit_price * pqty
-
-                    # Unallocated remainder goes equally to assigned_to minus those with explicit qtys
-                    remaining_qty = item.qty - allocated_qty
-                    if remaining_qty > 1e-9:
-                        remainder_people = [p for p in item.assigned_to if p not in item.qty_allocations]
-                        if not remainder_people:
-                            remainder_people = state.participants
-                        share = unit_price * remaining_qty / len(remainder_people)
-                        for person in remainder_people:
-                            person_subtotal[person] += share
-                else:
-                    # Fall back to all participants if still unassigned
-                    recipients = item.assigned_to if item.assigned_to else state.participants
-                    if not item.assigned_to:
-                        warnings.append(f"'{item.name}' in {bill.bill_id} had no assignment — split equally.")
-                    share = item.price / len(recipients)
-                    for person in recipients:
-                        person_subtotal[person] += share
-
-            # Proportionally distribute tax + tip
-            bill_subtotal = sum(person_subtotal.values())
-            combined_extra = bill.tax + bill.tip
-            if combined_extra > 0:
-                if bill_subtotal > 0:
-                    for person in list(person_subtotal.keys()):
-                        proportion = person_subtotal[person] / bill_subtotal
-                        person_subtotal[person] += proportion * combined_extra
-                else:
-                    equal_share = combined_extra / len(state.participants)
-                    for person in state.participants:
-                        person_subtotal[person] += equal_share
-
-            # Accumulate into global balances
-            bill_total = sum(person_subtotal.values())
-            global_balances[bill.paid_by] += bill_total
-            for person, amount in person_subtotal.items():
-                global_balances[person] -= amount
-
-        balances = dict(global_balances)
+        balances, warnings = Settlement.compute_balances(state.participants, state.bills)
         settlements = Settlement.generate_settlements(balances)
         report = Settlement.format_report(balances, settlements)
 

@@ -125,27 +125,12 @@ def _serialize_state(state: SessionState) -> dict:
 
 
 def _compute_settlement(state: SessionState) -> list:
-    from collections import defaultdict
-    global_balances: dict = defaultdict(float)
-    for bill in state.bills:
-        if not bill.paid_by:
-            continue
-        person_subtotal: dict = defaultdict(float)
-        for item in bill.items:
-            recipients = item.assigned_to if item.assigned_to else state.participants
-            share = item.price / len(recipients) if recipients else 0
-            for person in recipients:
-                person_subtotal[person] += share
-        bill_subtotal = sum(person_subtotal.values())
-        combined_extra = bill.tax + bill.tip
-        if combined_extra > 0 and bill_subtotal > 0:
-            for person in list(person_subtotal):
-                person_subtotal[person] += (person_subtotal[person] / bill_subtotal) * combined_extra
-        bill_total = sum(person_subtotal.values())
-        global_balances[bill.paid_by] += bill_total
-        for person, amt in person_subtotal.items():
-            global_balances[person] -= amt
-    return Settlement.generate_settlements(dict(global_balances))
+    """Thin wrapper over the shared balance math (core/settlement.py) — this
+    used to duplicate that logic inline and had drifted out of sync with the
+    calculate_split tool (missing qty_allocations handling entirely), so the
+    state panel and the finalized report could disagree. Not anymore."""
+    balances, _warnings = Settlement.compute_balances(state.participants, state.bills)
+    return Settlement.generate_settlements(balances)
 
 
 def _get_agent(session_id: str, user: dict) -> ChatAgent:
