@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>API Reference — SplitPro Docs</title>
+<link rel="stylesheet" href="assets/docs.css" />
+</head>
+<body>
+
+<div class="topnav">
+  <a class="brand" href="index.html"><span class="mark">🧾</span> SplitPro Docs</a>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="api.html" class="active">API Reference</a>
+  </nav>
+  <span class="tag">v0.1.0</span>
+</div>
+
+<main class="page">
+
+  <div class="hero">
+    <h1>API Reference</h1>
+    <p class="lede">Every route the FastAPI server exposes, as implemented in <code>server.py</code>.</p>
+  </div>
+
+  <div class="callout">
+    <strong>Base URL &amp; interactive docs</strong>
+    All examples below assume the server is running locally at <code>http://localhost:8000</code>.
+    FastAPI also auto-generates interactive Swagger/OpenAPI docs at <code>/docs</code> and
+    <code>/redoc</code> on the running server itself — this page is a hand-written companion to those,
+    not a replacement.
+  </div>
+
+  <div class="callout warn">
+    <strong>Auth required almost everywhere</strong>
+    Every route except <code>/auth/google</code>, <code>/auth/google/callback</code>, <code>/auth/logout</code>,
+    and <code>/health</code> requires a valid <code>access_token</code> cookie (set by completing the Google
+    sign-in flow in a browser). Calling these with <code>curl</code> means first signing in via a real
+    browser and copying the cookie, e.g. <code>curl -b "access_token=&lt;jwt&gt;" ...</code>.
+  </div>
+
+  <h2>Auth</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method &amp; Path</th><th>Auth</th><th>Description</th></tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/auth/google</code></td>
+      <td>—</td>
+      <td>Redirects the browser to Google's OAuth consent screen.</td>
+    </tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/auth/google/callback</code></td>
+      <td>—</td>
+      <td>OAuth redirect target. Exchanges <code>code</code> for a token, upserts the user, sets the <code>access_token</code> cookie, redirects to <code>/</code>. On error or a missing code, redirects to <code>/?auth_error=1</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/auth/me</code></td>
+      <td>cookie</td>
+      <td>Returns the current user. <code>401</code> if not signed in.</td>
+    </tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/auth/logout</code></td>
+      <td>—</td>
+      <td>Clears the <code>access_token</code> cookie.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h4>GET /auth/me</h4>
+  <pre><code>curl http://localhost:8000/auth/me -b "access_token=&lt;jwt&gt;"</code></pre>
+  <pre><code>{
+  "id": 1,
+  "email": "you@example.com",
+  "name": "Your Name",
+  "avatar_url": "https://..."
+}</code></pre>
+
+  <hr class="section" />
+
+  <h2>Session management</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method &amp; Path</th><th>Description</th></tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/api/sessions</code></td>
+      <td>List the current user's sessions, newest-updated first.</td>
+    </tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/api/sessions</code></td>
+      <td>Create a new session. Optional body overrides the provider/model.</td>
+    </tr>
+    <tr>
+      <td><span class="method patch">PATCH</span> <code>/api/sessions/{session_id}/name</code></td>
+      <td>Rename a session.</td>
+    </tr>
+    <tr>
+      <td><span class="method delete">DELETE</span> <code>/api/sessions/{session_id}</code></td>
+      <td>Delete a session (removes it from the DB and the in-memory cache).</td>
+    </tr>
+  </table>
+  </div>
+
+  <h4>GET /api/sessions</h4>
+  <pre><code>curl http://localhost:8000/api/sessions -b "access_token=&lt;jwt&gt;"</code></pre>
+  <pre><code>[
+  { "id": "abc-123", "name": "Dinner at Spice Garden", "created_at": "...", "updated_at": "..." }
+]</code></pre>
+
+  <h4>POST /api/sessions</h4>
+  <pre><code>curl -X POST http://localhost:8000/api/sessions \
+  -b "access_token=&lt;jwt&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"provider": "openai", "model": "gpt-4o"}'</code></pre>
+  <p class="dim">Body is optional — <code>{}</code> uses the configured defaults (<code>config/defaults.yaml</code>). Response: <code>201</code></p>
+  <pre><code>{ "session_id": "abc-123", "name": "New Session", "provider": "openai" }</code></pre>
+
+  <h4>PATCH /api/sessions/{session_id}/name</h4>
+  <pre><code>curl -X PATCH http://localhost:8000/api/sessions/abc-123/name \
+  -b "access_token=&lt;jwt&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Vegas trip"}'</code></pre>
+
+  <h4>DELETE /api/sessions/{session_id}</h4>
+  <pre><code>curl -X DELETE http://localhost:8000/api/sessions/abc-123 -b "access_token=&lt;jwt&gt;"</code></pre>
+  <p class="dim">
+    Note: an equivalent <code>DELETE /sessions/{session_id}</code> (no <code>/api</code> prefix) also
+    exists under the chat routes below and does the same thing.
+  </p>
+
+  <hr class="section" />
+
+  <h2>Chat &amp; images</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method &amp; Path</th><th>Description</th></tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/sessions/{session_id}/chat</code></td>
+      <td>Send a chat message; runs the agent's tool-calling loop and returns its reply plus the updated state.</td>
+    </tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/sessions/{session_id}/image</code></td>
+      <td>Upload a receipt image (multipart). Vision model extracts it, then feeds the result into the same chat loop.</td>
+    </tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/sessions/{session_id}/state</code></td>
+      <td>Get the current serialized session state without sending a message.</td>
+    </tr>
+    <tr>
+      <td><span class="method delete">DELETE</span> <code>/sessions/{session_id}</code></td>
+      <td>Delete the session (same behavior as the <code>/api/sessions</code> delete route above).</td>
+    </tr>
+  </table>
+  </div>
+
+  <h4>POST /sessions/{session_id}/chat</h4>
+  <pre><code>curl -X POST http://localhost:8000/sessions/abc-123/chat \
+  -b "access_token=&lt;jwt&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Burger $12, Fries $4, Coke $3. Tax $1.90"}'</code></pre>
+  <pre><code>{
+  "response": "Got it — added that as a bill. Who's splitting this one?",
+  "state": {
+    "participants": [],
+    "bills": [
+      {
+        "bill_id": "bill_1",
+        "description": "Burger, Fries, Coke",
+        "subtotal": 19.0,
+        "tax": 1.9,
+        "tip": 0.0,
+        "total": 20.9,
+        "paid_by": null,
+        "items": [
+          { "name": "Burger", "price": 12.0, "assigned_to": [], "shared": false },
+          { "name": "Fries",  "price": 4.0,  "assigned_to": [], "shared": false },
+          { "name": "Coke",   "price": 3.0,  "assigned_to": [], "shared": false }
+        ],
+        "unassigned_items": ["Burger", "Fries", "Coke"]
+      }
+    ],
+    "finalized": false,
+    "all_bills_ready": false,
+    "settlement": []
+  }
+}</code></pre>
+
+  <h4>POST /sessions/{session_id}/image</h4>
+  <pre><code>curl -X POST http://localhost:8000/sessions/abc-123/image \
+  -b "access_token=&lt;jwt&gt;" \
+  -F "file=@receipt.jpg"</code></pre>
+  <p class="dim">
+    Response shape is identical to the chat endpoint (<code>{response, state}</code>). Returns
+    <code>400</code> if the uploaded file's content type doesn't start with <code>image/</code>.
+  </p>
+
+  <h4>GET /sessions/{session_id}/state</h4>
+  <pre><code>curl http://localhost:8000/sessions/abc-123/state -b "access_token=&lt;jwt&gt;"</code></pre>
+  <p class="dim">
+    Once <code>calculate_split</code> has run, <code>finalized</code> becomes <code>true</code> and
+    <code>settlement</code> is populated:
+  </p>
+  <pre><code>"settlement": [
+  { "from": "Bob", "to": "Alice", "amount": 14.3 }
+]</code></pre>
+
+  <hr class="section" />
+
+  <h2>Health</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method &amp; Path</th><th>Description</th></tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/health</code></td>
+      <td>No auth. Liveness check plus the active chat provider.</td>
+    </tr>
+  </table>
+  </div>
+  <pre><code>curl http://localhost:8000/health</code></pre>
+  <pre><code>{ "status": "ok", "config": { "provider": "anthropic" } }</code></pre>
+
+  <hr class="section" />
+
+  <h2>Error shape</h2>
+  <p>Standard FastAPI/Starlette error body on any non-2xx response:</p>
+  <pre><code>{ "detail": "Session 'abc-123' not found" }</code></pre>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Status</th><th>When</th></tr>
+    <tr><td><code>401</code></td><td>Missing/invalid/expired <code>access_token</code> cookie.</td></tr>
+    <tr><td><code>404</code></td><td>Session doesn't exist, or exists but isn't owned by the current user (both cases return the same 404 — session existence isn't leaked across users).</td></tr>
+    <tr><td><code>400</code></td><td>Uploaded file to <code>/sessions/{id}/image</code> isn't an image.</td></tr>
+  </table>
+  </div>
+
+  <div class="footer">
+    <span>SplitPro — internal developer documentation</span>
+    <a href="architecture.html">← Back to Architecture</a>
+  </div>
+
+</main>
+</body>
+</html>

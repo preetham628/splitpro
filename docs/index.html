@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SplitPro Docs</title>
+<link rel="stylesheet" href="assets/docs.css" />
+</head>
+<body>
+
+<div class="topnav">
+  <a class="brand" href="index.html"><span class="mark">🧾</span> SplitPro Docs</a>
+  <nav>
+    <a href="index.html" class="active">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="api.html">API Reference</a>
+  </nav>
+  <span class="tag">v0.1.0</span>
+</div>
+
+<main class="page">
+
+  <div class="hero">
+    <h1>SplitPro</h1>
+    <p class="lede">
+      A conversational, AI-powered bill-splitting app. You paste a receipt or
+      snap a photo of one, chat naturally about who had what, and SplitPro's
+      agent figures out the minimal set of payments to settle up.
+    </p>
+    <div class="pill-row">
+      <span class="pill">FastAPI</span>
+      <span class="pill">LangChain</span>
+      <span class="pill">OpenAI / Anthropic / Google</span>
+      <span class="pill">SQLite</span>
+      <span class="pill">Google OAuth</span>
+      <span class="pill">Vanilla JS frontend</span>
+    </div>
+  </div>
+
+  <h2>Live preview</h2>
+  <p class="dim">
+    This is the actual <code>frontend/</code> of the app, loaded directly from
+    the repo — not a mockup. Since this static page isn't connected to a
+    running SplitPro server, the app can't authenticate and falls back to its
+    real sign-in screen, exactly like a fresh visitor would see it.
+    <a href="../README.md">Run the server</a> and open it at
+    <code>localhost:8000</code> to see the full chat UI.
+  </p>
+
+  <div class="preview-frame-wrap">
+    <div class="preview-chrome">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">localhost:8000</span>
+    </div>
+    <iframe src="../frontend/index.html" title="SplitPro live frontend preview" loading="lazy"></iframe>
+  </div>
+
+  <hr class="section" />
+
+  <h2>What it does</h2>
+  <ul>
+    <li><strong>Conversational parsing</strong> — paste bill text or describe it in chat; the agent extracts line items, tax, and tip.</li>
+    <li><strong>Receipt photo upload</strong> — a vision model reads a receipt image and hands the extracted text back into the same chat flow.</li>
+    <li><strong>Item-level assignment</strong> — assign items to one or more people, including fractional/quantity-based splits ("Alice had 1 of 4 burgers").</li>
+    <li><strong>Multi-bill sessions</strong> — add several bills to one session; everything settles together.</li>
+    <li><strong>Minimal settlements</strong> — a greedy debt-simplification algorithm reduces the group's debts to the fewest possible payments.</li>
+    <li><strong>Accounts &amp; history</strong> — Google sign-in, and every session is persisted to SQLite so chat history survives a server restart.</li>
+    <li><strong>CLI mode</strong> — the same agent runs standalone in a terminal, no server or auth required.</li>
+  </ul>
+
+  <h2>How the pieces fit</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 900 230" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" class="dx-label" style="fill: var(--text-faint)"/>
+        </marker>
+      </defs>
+
+      <rect x="20" y="80" width="150" height="70" rx="10" class="dx-box"/>
+      <text x="95" y="110" text-anchor="middle" class="dx-label">Browser</text>
+      <text x="95" y="128" text-anchor="middle" class="dx-sub">frontend/*.html,js,css</text>
+
+      <line x1="170" y1="115" x2="228" y2="115" class="dx-arrow"/>
+
+      <rect x="230" y="60" width="200" height="110" rx="10" class="dx-box-accent"/>
+      <text x="330" y="90" text-anchor="middle" class="dx-label">FastAPI server</text>
+      <text x="330" y="108" text-anchor="middle" class="dx-sub">server.py</text>
+      <text x="330" y="126" text-anchor="middle" class="dx-sub">auth · sessions · chat</text>
+      <text x="330" y="144" text-anchor="middle" class="dx-sub">image upload</text>
+
+      <line x1="430" y1="90" x2="488" y2="55" class="dx-arrow"/>
+      <line x1="430" y1="140" x2="488" y2="175" class="dx-arrow"/>
+
+      <rect x="490" y="20" width="190" height="70" rx="10" class="dx-box-accent2"/>
+      <text x="585" y="50" text-anchor="middle" class="dx-label">ChatAgent</text>
+      <text x="585" y="68" text-anchor="middle" class="dx-sub">LangChain tool-calling loop</text>
+
+      <rect x="490" y="140" width="190" height="70" rx="10" class="dx-box"/>
+      <text x="585" y="170" text-anchor="middle" class="dx-label">SQLite (splitpro.db)</text>
+      <text x="585" y="188" text-anchor="middle" class="dx-sub">users · chat_sessions</text>
+
+      <line x1="680" y1="55" x2="740" y2="55" class="dx-arrow"/>
+      <rect x="742" y="20" width="140" height="70" rx="10" class="dx-box-accent3"/>
+      <text x="812" y="50" text-anchor="middle" class="dx-label">LLM provider</text>
+      <text x="812" y="68" text-anchor="middle" class="dx-sub">OpenAI / Anthropic / Google</text>
+
+      <line x1="330" y1="60" x2="330" y2="10" class="dx-arrow"/>
+      <rect x="235" y="-20" width="190" height="0" opacity="0"/>
+      <text x="230" y="20" class="dx-sub">Google OAuth (sign-in)</text>
+      <line x1="230" y1="25" x2="280" y2="60" class="dx-arrow"/>
+    </svg>
+    <div class="caption">Request flow: browser → FastAPI → per-session ChatAgent → LLM provider, with SQLite as the write-through store.</div>
+  </div>
+
+  <h2>Explore the docs</h2>
+  <div class="card-grid">
+    <a class="card" href="architecture.html">
+      <span class="card-icon">🧩</span>
+      <h3>Architecture</h3>
+      <p>Auth flow, the agent's tool-calling loop, session persistence, and the settlement algorithm — how a chat message turns into a settled bill.</p>
+    </a>
+    <a class="card" href="api.html">
+      <span class="card-icon">🔌</span>
+      <h3>API Reference</h3>
+      <p>Every REST endpoint the server exposes, with request/response shapes and curl examples.</p>
+    </a>
+    <a class="card" href="../README.md">
+      <span class="card-icon">🛠️</span>
+      <h3>Dev Setup</h3>
+      <p>Install, configure environment variables and Google OAuth, and run the app locally or in Docker.</p>
+    </a>
+  </div>
+
+  <div class="footer">
+    <span>SplitPro — internal developer documentation</span>
+    <span>Generated from the current codebase, not aspirational</span>
+  </div>
+
+</main>
+</body>
+</html>
