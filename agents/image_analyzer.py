@@ -6,12 +6,13 @@ via its add_bill tool. If not, returns a user-facing explanation of what was det
 
 Supported providers and their vision models:
   openai  → gpt-4o (default vision model)
-  google  → gemini-2.0-flash (free tier, 250 req/day)
+  google  → gemini-3.6-flash
 """
 
 from __future__ import annotations
 
 import base64
+import sys
 from dataclasses import dataclass
 
 from langchain_core.messages import HumanMessage
@@ -71,14 +72,39 @@ class ImageAnalyzer:
 
         try:
             response = self._llm.invoke([message])
-            return self._parse_response(response.content)
+            return self._parse_response(self._content_to_text(response.content))
         except Exception as e:
+            # Swallowed deliberately (caller always gets a usable result), but
+            # logged — a bare "not a bill" result looks identical to a real
+            # API/model failure otherwise, and this has masked real bugs before
+            # (a deprecated model, a response-shape change) that only surfaced
+            # as confusing user-facing messages.
+            print(f"[ImageAnalyzer] analyze() failed: {type(e).__name__}: {e}", file=sys.stderr)
             return ImageAnalysisResult(
                 is_bill=False,
                 description="Analysis failed",
                 message=f"I couldn't analyze the image: {e}",
                 bill_text="",
             )
+
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """Normalize LangChain message content to plain text.
+
+        Most models return a plain string. Some (e.g. newer Gemini flash
+        models) return a list of content blocks instead, e.g.
+        [{"type": "text", "text": "...", "extras": {...}}] — concatenate
+        just the text parts.
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return str(content)
 
     def _build_message(self, b64: str, media_type: str) -> HumanMessage:
         """Build a provider-appropriate multimodal message."""

@@ -6,7 +6,7 @@ chat_agent:
 
 image_analyzer:
   provider: google
-  model: gemini-2.5-flash
+  model: gemini-3.6-flash   # gemini-2.5-flash was deprecated by Google (404 for new API keys)
   temperature: 0.1      # low = deterministic OCR extraction
 
 server:
