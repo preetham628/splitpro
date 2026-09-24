@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Roadmap — SplitPro Docs</title>
+<link rel="stylesheet" href="assets/docs.css" />
+</head>
+<body>
+
+<div class="topnav">
+  <a class="brand" href="index.html"><span class="mark">🧾</span> SplitPro Docs</a>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="api.html">API Reference</a>
+    <a href="roadmap.html" class="active">Roadmap</a>
+  </nav>
+  <span class="tag">v0.1.0</span>
+</div>
+
+<main class="page">
+
+  <div class="hero">
+    <h1>Future scope</h1>
+    <p class="lede">
+      Three directions the app could evolve in, each grounded in a gap the current
+      implementation already documents. This is a planning doc, not a commitment —
+      nothing here is built yet.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Feature depth</span>
+      <span class="pill">Multi-user collaboration</span>
+      <span class="pill">Production readiness</span>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Current focus</strong>
+    Multi-user collaboration is the active track. Production readiness is deliberately deferred.
+  </div>
+
+  <hr class="section" />
+
+  <h2>A. Feature depth (Splitwise-like)</h2>
+  <p class="dim">Ongoing ledgers, recurring expenses, multi-currency, and reporting — depth within a single user's use of the app, no new collaboration model required.</p>
+
+  <div class="table-wrap">
+  <table>
+    <tr><th>#</th><th>Requirement</th><th>Why it's a jump from today</th><th>Effort</th></tr>
+    <tr>
+      <td>A1</td>
+      <td><strong>Running balances across sessions</strong></td>
+      <td>Today <code>bills</code>/<code>settlements</code> are scoped to one <code>chat_sessions</code> row with no cross-session ledger; needs a new <code>ledger_entries</code> table keyed by (payer, ower) independent of session.</td>
+      <td>L</td>
+    </tr>
+    <tr>
+      <td>A2</td>
+      <td><strong>Recurring / templated bills</strong></td>
+      <td>No template concept exists; needs a schedule model plus a way to re-trigger the agent flow without a human re-pasting text.</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>A3</td>
+      <td><strong>Multi-currency</strong></td>
+      <td>No currency field anywhere in <code>bills</code>/<code>bill_items</code>/<code>settlements</code>; needs a currency column plus conversion handling in <code>core/settlement.py</code>.</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>A4</td>
+      <td><strong>Partial / marked-paid settlements</strong></td>
+      <td><code>settlements</code> is fully rewritten on every finalize; needs a payment-status sub-ledger, not just a computed list.</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>A5</td>
+      <td><strong>Edit/undo a finalized session</strong></td>
+      <td>Today only supports "add more bills and recalculate from scratch" — no partial edit path.</td>
+      <td>S–M</td>
+    </tr>
+    <tr>
+      <td>A6</td>
+      <td><strong>Categories / export (CSV, monthly summary)</strong></td>
+      <td>Purely additive, no architectural conflict.</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>A7</td>
+      <td><strong>Receipt retention / re-view</strong></td>
+      <td>Images live inline as base64 in <code>chat_messages.image_base64</code> for transcript replay only — no dedicated gallery.</td>
+      <td>S</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="callout warn">
+    <strong>Dependency</strong>
+    A1 (cross-session ledger) reshapes the data model the most — worth deciding early, since A4 and A6 are far cheaper to build on top of it than to retrofit later.
+  </div>
+
+  <hr class="section" />
+
+  <h2>B. Multi-user collaboration <span class="pill" style="margin-left:8px;">active track</span></h2>
+  <p class="dim">Real accounts for participants, shared sessions, invites, notifications — turning single-owner sessions into something a group actually shares.</p>
+
+  <div class="table-wrap">
+  <table>
+    <tr><th>#</th><th>Requirement</th><th>Why it's a jump from today</th><th>Effort</th></tr>
+    <tr>
+      <td>B1</td>
+      <td><strong>Participants as real accounts, not free-text names</strong></td>
+      <td><code>session_participants.name</code> is a plain string, unique per session, with no link to <code>users.id</code>. Foundational — everything else here depends on it.</td>
+      <td>L</td>
+    </tr>
+    <tr>
+      <td>B2</td>
+      <td><strong>Invite flow</strong> (email or link) to add a real user to a session</td>
+      <td>Needs B1 first; needs an invite / pending-membership state machine.</td>
+      <td>M (after B1)</td>
+    </tr>
+    <tr>
+      <td>B3</td>
+      <td><strong>Shared session ownership</strong> — more than one user can view/edit a session</td>
+      <td><code>chat_sessions.user_id</code> is a single FK today (session ownership is checked and enforced as single-owner); needs a join table (<code>session_members</code>) and a rework of every ownership check in <code>server.py</code>.</td>
+      <td>M (after B1)</td>
+    </tr>
+    <tr>
+      <td>B4</td>
+      <td><strong>Notifications</strong> (email/push) on bill added, split finalized, payment marked</td>
+      <td>No notification infra exists today — needs a delivery mechanism plus an events/outbox table.</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>B5</td>
+      <td><strong>Activity feed / audit trail per session</strong></td>
+      <td><code>chat_messages</code> is conversational, not structured; would want a separate <code>session_events</code> table ("Alice added Item X").</td>
+      <td>S–M</td>
+    </tr>
+    <tr>
+      <td>B6</td>
+      <td><strong>Permissions model</strong> (who can finalize, who can edit others' assignments)</td>
+      <td>Currently anyone with session access can call any tool; needs a role concept once B3 exists.</td>
+      <td>S (after B3)</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="callout warn">
+    <strong>Dependency</strong>
+    B1 is the linchpin — the largest single change (touches auth, schema, and every tool in <code>agents/chat_agent.py</code> that currently takes a free-text name), but B2–B6 are all comparatively small once it's done.
+  </div>
+
+  <hr class="section" />
+
+  <h2>C. Production readiness <span class="pill" style="margin-left:8px;">deferred</span></h2>
+  <p class="dim">Hardening what exists — cloud DB, scaling, tests, observability — rather than adding features. Parked for now.</p>
+
+  <div class="table-wrap">
+  <table>
+    <tr><th>#</th><th>Requirement</th><th>Why it's a jump from today</th><th>Effort</th></tr>
+    <tr>
+      <td>C1</td>
+      <td><strong>Cloud/managed database</strong> (Postgres, etc.)</td>
+      <td><code>DB_PATH</code> is explicitly a placeholder seam, but <code>core/database.py</code> and <code>core/checkpointer.py</code> both currently assume raw SQLite file semantics (journal mode forced to <code>DELETE</code>, <code>SqliteSaver</code>).</td>
+      <td>M–L</td>
+    </tr>
+    <tr>
+      <td>C2</td>
+      <td><strong>Horizontal scaling</strong> (multiple app instances)</td>
+      <td>Blocked on C1 — the in-memory session cache and LangGraph's SQLite checkpointer are both single-file, single-process by construction.</td>
+      <td>L (after C1)</td>
+    </tr>
+    <tr>
+      <td>C3</td>
+      <td><strong>Automated test suite</strong></td>
+      <td>Zero test files exist today; highest-leverage, lowest-risk item on the whole roadmap.</td>
+      <td>M, do first</td>
+    </tr>
+    <tr>
+      <td>C4</td>
+      <td><strong>Structured logging / observability</strong> (LLM call tracing, latency, cost per session)</td>
+      <td>Only ad hoc <code>stderr</code> prints exist today; no visibility into LLM spend or failure rates.</td>
+      <td>S–M</td>
+    </tr>
+    <tr>
+      <td>C5</td>
+      <td><strong>Rate limiting / abuse protection</strong></td>
+      <td>Every chat/image call costs real LLM money with zero throttling today.</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>C6</td>
+      <td><strong>Secrets management</strong> (not flat <code>.env</code> in prod)</td>
+      <td>Fine for local dev/Docker Compose; a real deploy needs a secrets manager or platform-level env injection.</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>C7</td>
+      <td><strong>CI/CD pipeline</strong></td>
+      <td>Depends on C3 existing to be worth anything.</td>
+      <td>S (after C3)</td>
+    </tr>
+  </table>
+  </div>
+
+  <hr class="section" />
+
+  <h2>Cross-cutting sequencing</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="ah-rm" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" style="fill: var(--text-faint)"/>
+        </marker>
+      </defs>
+
+      <rect x="20" y="20" width="180" height="50" rx="8" class="dx-box"/>
+      <text x="110" y="50" text-anchor="middle" class="dx-label">C3 — Tests</text>
+
+      <line x1="200" y1="45" x2="690" y2="45" class="dx-arrow"/>
+      <text x="440" y="35" text-anchor="middle" class="dx-sub">makes everything below safer to build</text>
+
+      <rect x="20" y="110" width="180" height="50" rx="8" class="dx-box-accent"/>
+      <text x="110" y="140" text-anchor="middle" class="dx-label">B1 — Real participants</text>
+
+      <line x1="200" y1="135" x2="258" y2="135" class="dx-arrow"/>
+      <rect x="260" y="110" width="180" height="50" rx="8" class="dx-box-accent"/>
+      <text x="350" y="140" text-anchor="middle" class="dx-label">B2 / B3 / B4 / B6</text>
+
+      <rect x="480" y="110" width="180" height="50" rx="8" class="dx-box-accent3"/>
+      <text x="570" y="140" text-anchor="middle" class="dx-label">C1 — Cloud DB</text>
+
+      <line x1="660" y1="135" x2="718" y2="135" class="dx-arrow"/>
+      <rect x="720" y="110" width="160" height="50" rx="8" class="dx-box-accent3"/>
+      <text x="800" y="140" text-anchor="middle" class="dx-label">C2 — Scaling</text>
+
+      <rect x="20" y="200" width="180" height="50" rx="8" class="dx-box-accent2"/>
+      <text x="110" y="230" text-anchor="middle" class="dx-label">A1 — Ledger</text>
+
+      <line x1="200" y1="225" x2="258" y2="225" class="dx-arrow"/>
+      <rect x="260" y="200" width="180" height="50" rx="8" class="dx-box-accent2"/>
+      <text x="350" y="230" text-anchor="middle" class="dx-label">A4 / A6</text>
+    </svg>
+    <div class="caption">C3 underlies every track. B1 gates the rest of the collaboration track. C1 gates scaling. A1 gates the cheaper ledger-dependent features.</div>
+  </div>
+
+  <p class="dim">
+    Product-first path: <code>C3 → B1 → C1 → (A1 or B2/B3) → C2</code>.
+    Personal-use path: <code>C3 → A1 → A2/A4/A6</code>, skipping the collaboration track entirely.
+  </p>
+
+  <div class="footer">
+    <span>SplitPro — internal developer documentation</span>
+    <span>Planning doc — describes proposed work, not the shipped codebase</span>
+  </div>
+
+</main>
+</body>
+</html>
