@@ -8,6 +8,8 @@ Tables (see schema.sql for the authoritative definitions):
   session_participants  — participant names per session
   bills / bill_items    — parsed bills, normalized (replaces the old session_state JSON blob)
   settlements           — computed once a session is finalized
+  session_members       — per-user admin/member role on a session
+  expense_proposals     — AI-drafted expenses staged for admin approval
 
 Conversation memory for the agent itself (system/tool-call plumbing) lives
 separately in LangGraph's own checkpoint tables — see core/checkpointer.py.
@@ -73,6 +75,7 @@ def init_db(db_path: str) -> None:
     with _connect() as conn:
         conn.executescript(_load_schema())
         _migrate_chat_sessions(conn)
+        _migrate_membership(conn)
 
 
 def create_db(db_path: str) -> None:
@@ -118,6 +121,41 @@ def _migrate_chat_sessions(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE chat_sessions DROP COLUMN message_history")
     if "finalized" not in existing:
         conn.execute("ALTER TABLE chat_sessions ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0")
+
+
+def _migrate_membership(conn: sqlite3.Connection) -> None:
+    """One-time migration for multi-user membership + expense proposals.
+
+    Adds chat_messages.user_id (nullable — null for role='agent' rows) and
+    bills.approved_by/approved_at (both nullable, populated once an expense
+    proposal referencing that bill is approved) — same ALTER TABLE pattern
+    as _migrate_chat_sessions(), since CREATE TABLE IF NOT EXISTS can't add
+    columns to a table that already exists.
+
+    Then backfills session_members: every pre-existing chat_sessions row
+    that has no session_members row yet gets its original owner
+    (chat_sessions.user_id) inserted as an 'admin' member, so existing
+    single-owner sessions keep working unchanged under the new membership
+    model. Safe to call on every startup — checks columns/rows first.
+    """
+    chat_messages_cols = {row["name"] for row in conn.execute("PRAGMA table_info(chat_messages)")}
+    if "user_id" not in chat_messages_cols:
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN user_id INTEGER REFERENCES users(id)")
+
+    bills_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bills)")}
+    if "approved_by" not in bills_cols:
+        conn.execute("ALTER TABLE bills ADD COLUMN approved_by INTEGER REFERENCES users(id)")
+    if "approved_at" not in bills_cols:
+        conn.execute("ALTER TABLE bills ADD COLUMN approved_at TIMESTAMP")
+
+    conn.execute("""
+        INSERT INTO session_members (session_id, user_id, role)
+        SELECT cs.id, cs.user_id, 'admin'
+        FROM chat_sessions cs
+        WHERE NOT EXISTS (
+            SELECT 1 FROM session_members sm WHERE sm.session_id = cs.id
+        )
+    """)
 
 
 @contextmanager
@@ -339,6 +377,204 @@ def session_belongs_to_user(session_id: str, user_id: int) -> bool:
             (session_id, user_id),
         ).fetchone()
         return row is not None
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return dict(row) if row else None
+
+
+# ---------- Session membership ----------
+
+def add_session_member(session_id: str, user_id: int, role: str = "member") -> None:
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO session_members (session_id, user_id, role)
+            VALUES (?, ?, ?)
+        """, (session_id, user_id, role))
+
+
+def list_session_members(session_id: str) -> list[dict]:
+    """Return this session's members, joined against users, oldest first."""
+    with _connect() as conn:
+        rows = conn.execute("""
+            SELECT u.id AS user_id, u.name, u.email, u.avatar_url, sm.role
+            FROM session_members sm
+            JOIN users u ON u.id = sm.user_id
+            WHERE sm.session_id = ?
+            ORDER BY sm.id
+        """, (session_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def is_session_member(session_id: str, user_id: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM session_members WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+        return row is not None
+
+
+def is_session_admin(session_id: str, user_id: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM session_members WHERE session_id = ? AND user_id = ? AND role = 'admin'",
+            (session_id, user_id),
+        ).fetchone()
+        return row is not None
+
+
+def count_admins(session_id: str) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM session_members WHERE session_id = ? AND role = 'admin'",
+            (session_id,),
+        ).fetchone()
+        return row["c"]
+
+
+def _member_role(session_id: str, user_id: int, role: str) -> bool:
+    """Change an existing member's role. Returns False if no row matched."""
+    with _connect() as conn:
+        cursor = conn.execute("""
+            UPDATE session_members SET role = ?
+            WHERE session_id = ? AND user_id = ?
+        """, (role, session_id, user_id))
+        return cursor.rowcount > 0
+
+
+def remove_session_member(session_id: str, user_id: int) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM session_members WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        )
+        return cursor.rowcount > 0
+
+
+# ---------- Expense proposals ----------
+
+def create_proposal(
+    session_id: str,
+    proposed_by: int,
+    payload: dict,
+    supersedes_bill_id: Optional[int] = None,
+) -> int:
+    """Stage an AI-drafted expense for admin approval. Returns the new proposal id."""
+    with _connect() as conn:
+        cursor = conn.execute("""
+            INSERT INTO expense_proposals (session_id, proposed_by, supersedes_bill_id, payload)
+            VALUES (?, ?, ?, ?)
+        """, (session_id, proposed_by, supersedes_bill_id, json.dumps(payload)))
+        return cursor.lastrowid
+
+
+def update_proposal_payload(proposal_id: int, payload: dict) -> None:
+    """Overwrite a proposal's payload. Only meaningful while status is 'pending' —
+    that isn't enforced here; callers are responsible for checking status first.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute("""
+            UPDATE expense_proposals SET payload = ?, updated_at = ? WHERE id = ?
+        """, (json.dumps(payload), now, proposal_id))
+
+
+def get_proposal(proposal_id: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM expense_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+
+def list_pending_proposals(session_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("""
+            SELECT * FROM expense_proposals WHERE session_id = ? AND status = 'pending'
+            ORDER BY id
+        """, (session_id,)).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d["payload"])
+            results.append(d)
+        return results
+
+
+def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
+    """Approve or reject a pending proposal. Returns the updated proposal row
+    (payload json.loads'd), all inside one transaction.
+
+    Rejection only touches the proposal row itself. Approval additionally
+    materializes the payload into bills/bill_items: a fresh bill (plus its
+    items) when supersedes_bill_id is None, or an in-place UPDATE of the
+    superseded bill row with its bill_items deleted and reinserted from the
+    payload — the same delete+reinsert style save_session_state() uses.
+    """
+    if decision not in ("approved", "rejected"):
+        raise ValueError(f"decision must be 'approved' or 'rejected', got {decision!r}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM expense_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Proposal {proposal_id} not found")
+
+        conn.execute("""
+            UPDATE expense_proposals
+            SET status = ?, decided_by = ?, decided_at = ?, updated_at = ?
+            WHERE id = ?
+        """, (decision, decided_by, now, now, proposal_id))
+
+        if decision == "approved":
+            payload = json.loads(row["payload"])
+            supersedes_bill_id = row["supersedes_bill_id"]
+
+            if supersedes_bill_id is None:
+                cursor = conn.execute("""
+                    INSERT INTO bills
+                        (session_id, bill_id, description, raw_text, tax, tip, paid_by,
+                         approved_by, approved_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (row["session_id"], payload["bill_id"], payload.get("description", ""),
+                      payload.get("raw_text", ""), payload.get("tax", 0), payload.get("tip", 0),
+                      payload.get("paid_by"), decided_by, now))
+                bill_row_id = cursor.lastrowid
+            else:
+                conn.execute("""
+                    UPDATE bills
+                    SET description = ?, raw_text = ?, tax = ?, tip = ?, paid_by = ?,
+                        approved_by = ?, approved_at = ?
+                    WHERE id = ?
+                """, (payload.get("description", ""), payload.get("raw_text", ""),
+                      payload.get("tax", 0), payload.get("tip", 0), payload.get("paid_by"),
+                      decided_by, now, supersedes_bill_id))
+                conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (supersedes_bill_id,))
+                bill_row_id = supersedes_bill_id
+
+            for item in payload.get("items", []):
+                conn.execute("""
+                    INSERT INTO bill_items
+                        (bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (bill_row_id, item["name"], item["price"], item.get("qty", 1),
+                      json.dumps(item.get("assigned_to", [])), int(item.get("shared", False)),
+                      int(item.get("unassigned", False)), json.dumps(item.get("qty_allocations", {}))))
+
+        result = dict(conn.execute(
+            "SELECT * FROM expense_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone())
+        result["payload"] = json.loads(result["payload"])
+        return result
 
 
 if __name__ == "__main__":

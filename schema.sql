@@ -18,6 +18,11 @@
 -- runs a small one-time ALTER TABLE migration for those two columns (and to
 -- add the new `finalized` column) — see _migrate_chat_sessions() there.
 --
+-- Same story for chat_messages.user_id and bills.approved_by/approved_at —
+-- added after those tables already existed in deployed databases, so they're
+-- added via ALTER TABLE ADD COLUMN in _migrate_membership() rather than being
+-- retrofitted into the CREATE TABLE statements below.
+--
 -- Usage (local, requires the sqlite3 CLI — ships with macOS/most Linux):
 --   sqlite3 splitpro.db < schema.sql
 --
@@ -102,3 +107,34 @@ CREATE TABLE IF NOT EXISTS settlements (
     to_person   TEXT NOT NULL,
     amount      REAL NOT NULL
 );
+
+-- Real per-user membership on a session, distinct from chat_sessions.user_id
+-- (the original creator). Every pre-existing session is backfilled with its
+-- creator as an 'admin' member — see _migrate_membership() in
+-- core/database.py.
+CREATE TABLE IF NOT EXISTS session_members (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    role       TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+    joined_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, user_id)
+);
+
+-- AI-drafted expenses staged for admin approval before they count toward
+-- bills/bill_items (and therefore balances). `payload` mirrors the shape of
+-- a bill (bill_id, description, raw_text, items[], tax, tip, paid_by) as
+-- JSON, since it hasn't been materialized into bills/bill_items yet.
+CREATE TABLE IF NOT EXISTS expense_proposals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    proposed_by        INTEGER NOT NULL REFERENCES users(id),
+    status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    supersedes_bill_id INTEGER REFERENCES bills(id),
+    payload            TEXT NOT NULL,
+    decided_by         INTEGER REFERENCES users(id),
+    decided_at         TIMESTAMP,
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_expense_proposals_session ON expense_proposals(session_id, status);
