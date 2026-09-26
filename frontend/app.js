@@ -5,6 +5,9 @@ const API = '';
 let sessionId  = null;
 let isLoading  = false;
 let currentUser = null;
+let members     = new Map();  // user_id -> {user_id, name, email, avatar_url, role}
+let isCurrentUserAdmin = false;
+let activeTab   = 'session';
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -20,6 +23,19 @@ const newSessionBtn = document.getElementById('new-session-btn');
 const userAvatar    = document.getElementById('user-avatar');
 const userName      = document.getElementById('user-name');
 const logoutBtn     = document.getElementById('logout-btn');
+
+const stateTabButtons  = document.querySelectorAll('.state-tab');
+const tabPanels = {
+  session:   document.getElementById('tab-panel-session'),
+  members:   document.getElementById('tab-panel-members'),
+  approvals: document.getElementById('tab-panel-approvals'),
+};
+const approvalsTabBtn   = document.getElementById('approvals-tab');
+const approvalsTabBadge = document.getElementById('approvals-tab-badge');
+const membersContent    = document.getElementById('members-content');
+const inviteEmailInput  = document.getElementById('invite-email-input');
+const inviteBtn         = document.getElementById('invite-btn');
+const approvalsContent  = document.getElementById('approvals-content');
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
@@ -121,8 +137,11 @@ async function createNewSession() {
   await loadSessionList();
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+  membersContent.innerHTML = '<p class="muted">Loading…</p>';
+  switchTab('session');
 
   setActiveSession(sessionId);
+  await loadMembers(sessionId);
   await sendToAgent("Hello, I'm ready to help split some bills.");
 }
 
@@ -133,6 +152,16 @@ async function loadSession(id) {
 
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">Loading…</p>';
+  membersContent.innerHTML = '<p class="muted">Loading…</p>';
+  approvalsContent.innerHTML = '<p class="muted">No pending proposals.</p>';
+  switchTab('session');
+
+  // Member list is loaded first (and awaited) so both message attribution
+  // (sender names) and the admin-only approval/member controls have the
+  // current user's role and the id→name map ready before anything below
+  // tries to use it — re-fetched on every session load, not cached
+  // indefinitely, in case the user's role changed since they last opened it.
+  await loadMembers(id);
 
   try {
     const res = await fetch(`${API}/sessions/${id}/messages`, { credentials: 'include' });
@@ -142,7 +171,7 @@ async function loadSession(id) {
         const imageDataUrl = m.image_base64
           ? `data:${m.image_media_type};base64,${m.image_base64}`
           : null;
-        appendBubble(m.role, m.content, imageDataUrl);
+        appendBubble(m.role, m.content, imageDataUrl, m.user_id);
       });
     }
   } catch {
@@ -159,6 +188,286 @@ async function loadSession(id) {
     stateContent.innerHTML = '<p class="muted">No data yet.</p>';
   }
 }
+
+// ── Members / roles ──────────────────────────────────────────────────────────
+async function loadMembers(id) {
+  try {
+    const res = await fetch(`${API}/api/sessions/${id}/members`, { credentials: 'include' });
+    if (res.ok) {
+      const list = await res.json();
+      members = new Map(list.map(m => [m.user_id, m]));
+      const me = members.get(currentUser.id);
+      isCurrentUserAdmin = !!(me && me.role === 'admin');
+    } else {
+      members = new Map();
+      isCurrentUserAdmin = false;
+    }
+  } catch {
+    members = new Map();
+    isCurrentUserAdmin = false;
+  }
+  renderMembers();
+  updateAdminVisibility();
+}
+
+function updateAdminVisibility() {
+  approvalsTabBtn.hidden = !isCurrentUserAdmin;
+  if (!isCurrentUserAdmin && activeTab === 'approvals') switchTab('session');
+}
+
+function senderName(userId) {
+  if (userId == null) return 'Someone';
+  const m = members.get(userId);
+  return m ? (m.name || m.email) : 'Unknown';
+}
+
+function renderMembers() {
+  membersContent.innerHTML = '';
+  if (members.size === 0) {
+    membersContent.innerHTML = '<p class="muted">No members.</p>';
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'member-list';
+
+  members.forEach(m => {
+    const row = document.createElement('div');
+    row.className = 'member-row';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    if (m.avatar_url) {
+      const img = document.createElement('img');
+      img.src = m.avatar_url;
+      img.alt = '';
+      avatar.appendChild(img);
+    } else {
+      avatar.textContent = (m.name || m.email || '?').charAt(0).toUpperCase();
+    }
+
+    const info = document.createElement('div');
+    info.className = 'member-info';
+    const nameLine = document.createElement('div');
+    nameLine.className = 'member-name';
+    const label = m.name || m.email;
+    nameLine.textContent = m.user_id === currentUser.id ? `${label} (you)` : label;
+    const roleLine = document.createElement('div');
+    roleLine.className = 'member-role';
+    roleLine.textContent = m.role;
+    info.appendChild(nameLine);
+    info.appendChild(roleLine);
+
+    row.appendChild(avatar);
+    row.appendChild(info);
+
+    if (isCurrentUserAdmin && m.user_id !== currentUser.id) {
+      const actions = document.createElement('div');
+      actions.className = 'member-actions';
+
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = 'member-action-btn';
+      toggleBtn.textContent = m.role === 'admin' ? 'Demote' : 'Promote';
+      toggleBtn.addEventListener('click', () =>
+        changeMemberRole(m.user_id, m.role === 'admin' ? 'member' : 'admin'));
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'member-action-btn danger';
+      removeBtn.textContent = 'Remove';
+      removeBtn.addEventListener('click', () => removeMember(m.user_id));
+
+      actions.appendChild(toggleBtn);
+      actions.appendChild(removeBtn);
+      row.appendChild(actions);
+    }
+
+    list.appendChild(row);
+  });
+
+  membersContent.appendChild(list);
+}
+
+async function changeMemberRole(userId, role) {
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/members/${userId}/role`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ role }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || 'Failed to update role.');
+      return;
+    }
+    await loadMembers(sessionId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+async function removeMember(userId) {
+  if (!confirm('Remove this member from the session?')) return;
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/members/${userId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      // Surface the backend's own message (e.g. "last admin") rather than
+      // pre-validating that rule client-side — the backend is the source
+      // of truth for it.
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || 'Failed to remove member.');
+      return;
+    }
+    await loadMembers(sessionId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+inviteBtn.addEventListener('click', async () => {
+  const email = inviteEmailInput.value.trim();
+  if (!email || !sessionId) return;
+  inviteBtn.disabled = true;
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/members`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.detail || 'Failed to invite member.');
+      return;
+    }
+    inviteEmailInput.value = '';
+    await loadMembers(sessionId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  } finally {
+    inviteBtn.disabled = false;
+  }
+});
+
+inviteEmailInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); inviteBtn.click(); }
+});
+
+// ── Approval view ────────────────────────────────────────────────────────────
+async function loadProposals() {
+  approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/proposals`, { credentials: 'include' });
+    if (!res.ok) {
+      approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
+      return;
+    }
+    renderProposals(await res.json());
+  } catch {
+    approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
+  }
+}
+
+function renderProposals(proposals) {
+  if (!proposals.length) {
+    approvalsContent.innerHTML = '<p class="muted">No pending proposals.</p>';
+    return;
+  }
+
+  approvalsContent.innerHTML = '';
+  proposals.forEach(p => {
+    const payload = p.payload || {};
+    const items = payload.items || [];
+    const tax = payload.tax || 0;
+    const tip = payload.tip || 0;
+    const total = items.reduce((sum, i) => sum + i.price * (i.qty || 1), 0) + tax + tip;
+    const payer = payload.paid_by ? `Paid by ${payload.paid_by}` : 'Payer unknown';
+
+    const card = document.createElement('div');
+    card.className = 'bill-card proposal-card';
+
+    let html = `<div class="bill-title">${escapeHtml(payload.description || 'Untitled expense')}</div>
+      <div class="bill-meta">${escapeHtml(payer)} · $${total.toFixed(2)}</div>`;
+
+    items.forEach(item => {
+      const isUnassigned = !item.assigned_to || item.assigned_to.length === 0;
+      const assignText = isUnassigned
+        ? 'unassigned'
+        : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');
+      html += `<div class="item-row">
+        <span class="item-name">${escapeHtml(item.name)}</span>
+        <span class="item-price">$${item.price.toFixed(2)}</span>
+        <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
+      </div>`;
+    });
+
+    if (tax > 0 || tip > 0) {
+      html += `<div class="item-row">
+        <span class="item-name" style="color:var(--muted)">Tax + Tip</span>
+        <span class="item-price">$${(tax + tip).toFixed(2)}</span>
+        <span class="item-assign">proportional</span>
+      </div>`;
+    }
+
+    card.innerHTML = html;
+
+    const actions = document.createElement('div');
+    actions.className = 'proposal-actions';
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'proposal-btn approve';
+    approveBtn.textContent = 'Approve';
+    approveBtn.addEventListener('click', () => decideProposal(p.id, 'approve'));
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'proposal-btn reject';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', () => decideProposal(p.id, 'reject'));
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(rejectBtn);
+    card.appendChild(actions);
+
+    approvalsContent.appendChild(card);
+  });
+}
+
+async function decideProposal(proposalId, decision) {
+  try {
+    const res = await fetch(
+      `${API}/api/sessions/${sessionId}/proposals/${proposalId}/${decision}`,
+      { method: 'POST', credentials: 'include' },
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || `Failed to ${decision} proposal.`);
+      return;
+    }
+    // A decided proposal changes bills/settlement/pending_proposals_count —
+    // refresh both the proposal list and the state panel.
+    await loadProposals();
+    const stateRes = await fetch(`${API}/sessions/${sessionId}/state`, { credentials: 'include' });
+    if (stateRes.ok) renderState(await stateRes.json());
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  if (name === 'approvals' && !isCurrentUserAdmin) return;
+  activeTab = name;
+  stateTabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
+  Object.entries(tabPanels).forEach(([key, el]) => el.classList.toggle('hidden', key !== name));
+  if (name === 'approvals') loadProposals();
+}
+
+stateTabButtons.forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
 
 function setActiveSession(id) {
   document.querySelectorAll('.session-item').forEach(el => {
@@ -243,7 +552,7 @@ async function sendImageToAgent(file) {
   setLoading(true);
 
   const reader = new FileReader();
-  reader.onload = e => appendBubble('user', '', e.target.result);
+  reader.onload = e => appendBubble('user', '', e.target.result, currentUser.id);
   reader.readAsDataURL(file);
 
   const typing = appendTyping();
@@ -270,13 +579,41 @@ async function sendImageToAgent(file) {
 }
 
 // ── UI builders ───────────────────────────────────────────────────────────────
-function appendBubble(role, text, imageDataUrl = null) {
+function appendBubble(role, text, imageDataUrl = null, userId = null) {
+  const isOwn = role === 'user' && !!currentUser && userId === currentUser.id;
+
   const row = document.createElement('div');
-  row.className = `bubble-row ${role}`;
+  row.className = `bubble-row ${role}` + (isOwn ? ' own' : '');
 
   const avatar = document.createElement('div');
   avatar.className = 'avatar';
-  avatar.textContent = role === 'agent' ? '🤖' : '🙂';
+  if (role === 'agent') {
+    avatar.textContent = '🤖';
+  } else if (isOwn) {
+    avatar.textContent = '🙂';
+  } else {
+    const m = members.get(userId);
+    if (m && m.avatar_url) {
+      const img = document.createElement('img');
+      img.src = m.avatar_url;
+      img.alt = '';
+      avatar.appendChild(img);
+    } else {
+      avatar.textContent = ((m && (m.name || m.email)) || '?').charAt(0).toUpperCase();
+    }
+  }
+
+  const col = document.createElement('div');
+  col.className = 'bubble-col';
+
+  // Own messages are self-evident; label everyone else's (other members and
+  // the agent) so the transcript reads as a group chat, not a 1:1.
+  if (!isOwn) {
+    const label = document.createElement('div');
+    label.className = 'sender-label';
+    label.textContent = role === 'agent' ? 'SplitPro' : senderName(userId);
+    col.appendChild(label);
+  }
 
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
@@ -296,8 +633,9 @@ function appendBubble(role, text, imageDataUrl = null) {
     bubble.appendChild(content);
   }
 
+  col.appendChild(bubble);
   row.appendChild(avatar);
-  row.appendChild(bubble);
+  row.appendChild(col);
   messagesEl.appendChild(row);
   scrollToBottom();
   return row;
@@ -335,7 +673,18 @@ function escapeHtml(str) {
 function renderState(state) {
   if (!state) return;
 
+  const pendingCount = state.pending_proposals_count || 0;
+  approvalsTabBadge.textContent = String(pendingCount);
+  approvalsTabBadge.hidden = pendingCount === 0;
+
   let html = '';
+
+  if (pendingCount > 0) {
+    const plural = pendingCount === 1 ? '' : 's';
+    html += isCurrentUserAdmin
+      ? `<div class="pending-alert">⏳ <strong>${pendingCount}</strong> pending proposal${plural} — <button class="link-btn" id="review-proposals-btn">Review</button></div>`
+      : `<div class="pending-alert readonly">⏳ <strong>${pendingCount}</strong> pending proposal${plural} awaiting admin review</div>`;
+  }
 
   html += '<div class="section-label">Participants</div>';
   if (state.participants && state.participants.length) {
@@ -392,6 +741,9 @@ function renderState(state) {
   }
 
   stateContent.innerHTML = html || '<p class="muted">No data yet.</p>';
+
+  const reviewBtn = document.getElementById('review-proposals-btn');
+  if (reviewBtn) reviewBtn.addEventListener('click', () => switchTab('approvals'));
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────
@@ -420,7 +772,7 @@ fileInput.addEventListener('change', () => {
 function handleSend() {
   const text = inputEl.value.trim();
   if (!text || isLoading) return;
-  appendBubble('user', text);
+  appendBubble('user', text, null, currentUser.id);
   inputEl.value = '';
   inputEl.style.height = 'auto';
   sendToAgent(text);
