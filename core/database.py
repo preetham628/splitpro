@@ -76,6 +76,7 @@ def init_db(db_path: str) -> None:
         conn.executescript(_load_schema())
         _migrate_chat_sessions(conn)
         _migrate_membership(conn)
+        _migrate_expense_proposals_fk(conn)
 
 
 def create_db(db_path: str) -> None:
@@ -155,6 +156,54 @@ def _migrate_membership(conn: sqlite3.Connection) -> None:
         WHERE NOT EXISTS (
             SELECT 1 FROM session_members sm WHERE sm.session_id = cs.id
         )
+    """)
+
+
+def _migrate_expense_proposals_fk(conn: sqlite3.Connection) -> None:
+    """Rebuild expense_proposals if its supersedes_bill_id FK predates
+    ON DELETE SET NULL.
+
+    CREATE TABLE IF NOT EXISTS is a no-op against an already-existing table,
+    so any database provisioned before this fix landed would otherwise keep
+    the old FK (no ON DELETE clause) forever — and hit the exact
+    IntegrityError the fix was meant to eliminate on the next
+    save_session_state() delete+reinsert of bills. SQLite can't ALTER a
+    foreign key in place, so this does the standard rename+recreate+copy+
+    drop dance. No-ops once the FK is already correct, and no-ops on a
+    brand-new DB (schema.sql's own CREATE TABLE already has it right, so
+    there's nothing to migrate).
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'expense_proposals'"
+    ).fetchone()
+    if not exists:
+        return
+
+    fks = conn.execute("PRAGMA foreign_key_list(expense_proposals)").fetchall()
+    supersedes_fk = next((fk for fk in fks if fk["from"] == "supersedes_bill_id"), None)
+    if supersedes_fk is None or supersedes_fk["on_delete"] == "SET NULL":
+        return
+
+    conn.executescript("""
+        ALTER TABLE expense_proposals RENAME TO expense_proposals_old;
+
+        CREATE TABLE expense_proposals (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id         TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            proposed_by        INTEGER NOT NULL REFERENCES users(id),
+            status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+            supersedes_bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
+            payload            TEXT NOT NULL,
+            decided_by         INTEGER REFERENCES users(id),
+            decided_at         TIMESTAMP,
+            created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO expense_proposals SELECT * FROM expense_proposals_old;
+        DROP TABLE expense_proposals_old;
+
+        CREATE INDEX IF NOT EXISTS idx_expense_proposals_session ON expense_proposals(session_id, status);
     """)
 
 
@@ -435,58 +484,75 @@ def count_admins(session_id: str) -> int:
         return row["c"]
 
 
-def _count_admins(conn: sqlite3.Connection, session_id: str) -> int:
-    """count_admins() logic against an already-open connection/transaction —
-    used by the guards below, which can't call the public count_admins()
-    without opening a second, separate connection mid-transaction.
-    """
-    row = conn.execute(
-        "SELECT COUNT(*) AS c FROM session_members WHERE session_id = ? AND role = 'admin'",
-        (session_id,),
-    ).fetchone()
-    return row["c"]
-
-
 def update_member_role(session_id: str, user_id: int, role: str) -> bool:
     """Change an existing member's role. Returns False if no row matched.
 
     Refuses (raises ValueError) to demote a session's last remaining admin —
     every session must keep at least one admin.
+
+    The admin-count check and the write are one atomic UPDATE statement
+    (the count is a correlated subquery in the WHERE clause), not a
+    separate SELECT-then-UPDATE — a check-then-act split would leave a race
+    window where two concurrent demotions could both read "2 admins" and
+    both proceed, leaving zero. A single UPDATE statement runs to
+    completion under SQLite's write lock with no other writer interleaved,
+    so this can't happen here.
     """
     with _connect() as conn:
-        if role != "admin":
-            current = conn.execute(
-                "SELECT role FROM session_members WHERE session_id = ? AND user_id = ?",
-                (session_id, user_id),
-            ).fetchone()
-            if current and current["role"] == "admin" and _count_admins(conn, session_id) <= 1:
-                raise ValueError(f"cannot demote the last admin of session {session_id!r}")
-
         cursor = conn.execute("""
-            UPDATE session_members SET role = ?
+            UPDATE session_members
+            SET role = ?
             WHERE session_id = ? AND user_id = ?
-        """, (role, session_id, user_id))
-        return cursor.rowcount > 0
+              AND (
+                ? = 'admin'
+                OR role != 'admin'
+                OR (SELECT COUNT(*) FROM session_members AS sm2
+                    WHERE sm2.session_id = session_members.session_id AND sm2.role = 'admin') > 1
+              )
+        """, (role, session_id, user_id, role))
+        if cursor.rowcount > 0:
+            return True
+
+        # Either not a member, or the guard blocked it — disambiguate for a
+        # clear error. This second read is diagnostic only; it doesn't
+        # affect correctness since the atomic UPDATE above already made the
+        # real decision.
+        current = conn.execute(
+            "SELECT role FROM session_members WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+        if current is not None and current["role"] == "admin" and role != "admin":
+            raise ValueError(f"cannot demote the last admin of session {session_id!r}")
+        return False
 
 
 def remove_session_member(session_id: str, user_id: int) -> bool:
     """Remove a member from a session. Returns False if they weren't a member.
 
     Refuses (raises ValueError) to remove a session's last remaining admin.
+    Same atomic-statement approach as update_member_role() — see there for
+    why the guard has to be part of the DELETE itself, not a prior SELECT.
     """
     with _connect() as conn:
+        cursor = conn.execute("""
+            DELETE FROM session_members
+            WHERE session_id = ? AND user_id = ?
+              AND (
+                role != 'admin'
+                OR (SELECT COUNT(*) FROM session_members AS sm2
+                    WHERE sm2.session_id = session_members.session_id AND sm2.role = 'admin') > 1
+              )
+        """, (session_id, user_id))
+        if cursor.rowcount > 0:
+            return True
+
         current = conn.execute(
             "SELECT role FROM session_members WHERE session_id = ? AND user_id = ?",
             (session_id, user_id),
         ).fetchone()
-        if current and current["role"] == "admin" and _count_admins(conn, session_id) <= 1:
+        if current is not None and current["role"] == "admin":
             raise ValueError(f"cannot remove the last admin of session {session_id!r}")
-
-        cursor = conn.execute(
-            "DELETE FROM session_members WHERE session_id = ? AND user_id = ?",
-            (session_id, user_id),
-        )
-        return cursor.rowcount > 0
+        return False
 
 
 # ---------- Expense proposals ----------
@@ -579,66 +645,77 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
     """Approve or reject a pending proposal. Returns the updated proposal row
     (payload json.loads'd), all inside one transaction.
 
-    Raises ValueError if the proposal isn't (still) 'pending' — deciding a
-    proposal is a one-shot transition, not idempotent: a second call (retry,
-    double-click) would otherwise either violate the bills UNIQUE(session_id,
-    bill_id) constraint (new-bill case) or silently redo the supersede
-    against whatever the payload says now, rather than erroring loudly.
+    Raises ValueError if the proposal isn't (still) 'pending'. That check is
+    folded into the UPDATE itself (`WHERE id = ? AND status = 'pending'`,
+    rowcount checked) rather than a prior SELECT — a check-then-act split
+    would leave a race window where two concurrent decide_proposal() calls
+    on the same id could both read 'pending' and both proceed, the second
+    hitting the bills UNIQUE(session_id, bill_id) constraint. A single
+    UPDATE statement can't be interleaved with another writer, so only one
+    caller ever wins the claim.
 
     Rejection only touches the proposal row itself. Approval additionally
-    materializes the payload into bills/bill_items: a fresh bill (plus its
-    items) when supersedes_bill_id is None, or an in-place UPDATE of the
-    superseded bill row with its bill_items deleted and reinserted from the
-    payload — the same delete+reinsert style save_session_state() uses.
+    materializes the payload into bills/bill_items. Which bill is targeted
+    is resolved fresh, by the *natural* key (session_id, bill_id) — not by
+    trusting the stored supersedes_bill_id surrogate FK. That FK is
+    ON DELETE SET NULL (so it doesn't block save_session_state()'s
+    every-turn delete+reinsert of bills), which means it can go stale or
+    null between proposal creation and decision if any normal chat turn
+    happens on this session in between — the row it pointed at may have
+    been deleted and reinserted under a new id, or it may have never
+    existed. (session_id, bill_id) is stable across that churn since
+    bills.bill_id is the app-level id the agent already keys off, so
+    looking a bill up by it always finds the live row if one exists,
+    scoped to this proposal's own session — which also means this can never
+    write to another session's bill regardless of what supersedes_bill_id
+    says.
     """
     if decision not in ("approved", "rejected"):
         raise ValueError(f"decision must be 'approved' or 'rejected', got {decision!r}")
 
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
+        cursor = conn.execute("""
+            UPDATE expense_proposals
+            SET status = ?, decided_by = ?, decided_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+        """, (decision, decided_by, now, now, proposal_id))
+
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                "SELECT status FROM expense_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            if existing is None:
+                raise ValueError(f"Proposal {proposal_id} not found")
+            raise ValueError(
+                f"proposal {proposal_id} was already decided (status={existing['status']!r})"
+            )
+
         row = conn.execute(
             "SELECT * FROM expense_proposals WHERE id = ?", (proposal_id,)
         ).fetchone()
-        if row is None:
-            raise ValueError(f"Proposal {proposal_id} not found")
-        if row["status"] != "pending":
-            raise ValueError(
-                f"proposal {proposal_id} was already decided (status={row['status']!r})"
-            )
-
-        supersedes_bill_id = row["supersedes_bill_id"]
-        if supersedes_bill_id is not None:
-            # Re-checked here (not just at create_proposal time) since this is
-            # the point where the cross-session write would actually happen.
-            bill = conn.execute(
-                "SELECT session_id FROM bills WHERE id = ?", (supersedes_bill_id,)
-            ).fetchone()
-            if bill is None or bill["session_id"] != row["session_id"]:
-                raise ValueError(
-                    f"supersedes_bill_id {supersedes_bill_id} does not belong to "
-                    f"session {row['session_id']!r}"
-                )
-
-        conn.execute("""
-            UPDATE expense_proposals
-            SET status = ?, decided_by = ?, decided_at = ?, updated_at = ?
-            WHERE id = ?
-        """, (decision, decided_by, now, now, proposal_id))
 
         if decision == "approved":
             payload = json.loads(row["payload"])
+            session_id = row["session_id"]
 
-            if supersedes_bill_id is None:
+            existing_bill = conn.execute(
+                "SELECT id FROM bills WHERE session_id = ? AND bill_id = ?",
+                (session_id, payload["bill_id"]),
+            ).fetchone()
+
+            if existing_bill is None:
                 cursor = conn.execute("""
                     INSERT INTO bills
                         (session_id, bill_id, description, raw_text, tax, tip, paid_by,
                          approved_by, approved_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (row["session_id"], payload["bill_id"], payload.get("description", ""),
+                """, (session_id, payload["bill_id"], payload.get("description", ""),
                       payload.get("raw_text", ""), payload.get("tax", 0), payload.get("tip", 0),
                       payload.get("paid_by"), decided_by, now))
                 bill_row_id = cursor.lastrowid
             else:
+                bill_row_id = existing_bill["id"]
                 conn.execute("""
                     UPDATE bills
                     SET description = ?, raw_text = ?, tax = ?, tip = ?, paid_by = ?,
@@ -646,15 +723,12 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
                     WHERE id = ?
                 """, (payload.get("description", ""), payload.get("raw_text", ""),
                       payload.get("tax", 0), payload.get("tip", 0), payload.get("paid_by"),
-                      decided_by, now, supersedes_bill_id))
-                conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (supersedes_bill_id,))
-                bill_row_id = supersedes_bill_id
+                      decided_by, now, bill_row_id))
+                conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_row_id,))
 
             _insert_bill_items(conn, bill_row_id, payload.get("items", []))
 
-        result = dict(conn.execute(
-            "SELECT * FROM expense_proposals WHERE id = ?", (proposal_id,)
-        ).fetchone())
+        result = dict(row)
         result["payload"] = json.loads(result["payload"])
         return result
 
