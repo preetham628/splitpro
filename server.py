@@ -486,11 +486,7 @@ def get_messages(session_id: str, user: dict = Depends(get_current_user)):
 @app.delete("/sessions/{session_id}")
 def end_session(session_id: str, user: dict = Depends(get_current_user)):
     """Duplicate of DELETE /api/sessions/{session_id} (no /api prefix). Admin only."""
-    _require_admin(session_id, user)
-    db.delete_session_by_id(session_id)
-    checkpointer.delete_thread(session_id)
-    sessions.pop(session_id, None)
-    return {"ok": True}
+    return delete_session(session_id, user)
 
 
 @app.post("/sessions/{session_id}/image", response_model=ChatResponse)

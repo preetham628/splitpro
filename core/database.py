@@ -407,30 +407,10 @@ def list_chat_messages(session_id: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def rename_session(session_id: str, user_id: int, name: str) -> bool:
-    """Rename a session. Returns True if a row was updated."""
-    with _connect() as conn:
-        cursor = conn.execute("""
-            UPDATE chat_sessions SET name = ?
-            WHERE id = ? AND user_id = ?
-        """, (name, session_id, user_id))
-        return cursor.rowcount > 0
-
-
-def delete_session(session_id: str, user_id: int) -> bool:
-    """Delete a session owned by user_id. Returns True if deleted."""
-    with _connect() as conn:
-        cursor = conn.execute("""
-            DELETE FROM chat_sessions WHERE id = ? AND user_id = ?
-        """, (session_id, user_id))
-        return cursor.rowcount > 0
-
-
 def rename_session_by_id(session_id: str, name: str) -> bool:
     """Rename a session with no ownership filter. Returns True if a row was
     updated. Callers must authorize access themselves first (e.g. via
-    session membership) — unlike rename_session(), this doesn't check who's
-    asking, since "may rename" is now a membership question rather than
+    session membership) — access is a membership question now, not
     "is the original creator."
     """
     with _connect() as conn:
@@ -451,15 +431,6 @@ def delete_session_by_id(session_id: str) -> bool:
             DELETE FROM chat_sessions WHERE id = ?
         """, (session_id,))
         return cursor.rowcount > 0
-
-
-def session_belongs_to_user(session_id: str, user_id: int) -> bool:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM chat_sessions WHERE id = ? AND user_id = ?",
-            (session_id, user_id),
-        ).fetchone()
-        return row is not None
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
