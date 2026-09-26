@@ -328,3 +328,72 @@ def test_reject_proposal_evicts_cache(fresh_server, monkeypatch):
     server.reject_proposal(session_id, pid, admin)
 
     assert session_id not in server.sessions
+
+
+def test_approve_proposal_race_with_concurrent_chat_turn_keeps_bill(fresh_server, monkeypatch):
+    """Regression for a race an earlier version of this fix reopened:
+    db.decide_proposal()'s bill write happened *before* the session lock was
+    taken for cache eviction, leaving a window where a concurrent chat turn
+    could grab the lock first, find the still-cached pre-approval agent, and
+    finish its own write-through save before eviction ran — silently
+    reproducing the original stale-cache data loss. The DB write and the
+    eviction must share one locked section, exactly like delete_session's
+    DB-delete + cache-pop."""
+
+    chat_turn_started = threading.Event()
+    release_chat_turn = threading.Event()
+
+    def blocking_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        chat_turn_started.set()
+        assert release_chat_turn.wait(timeout=5), "test deadlocked"
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", blocking_chat)
+
+    admin = make_user("admin5@example.com", "g-admin5", "Admin5")
+    session_id = make_session_with_members(admin)
+
+    # Prime the cache with a pre-approval (bill-less) agent, holding the
+    # session lock for the duration of its (mocked, blocked) turn — mimics a
+    # real in-flight chat message that started just before the approval.
+    server.get_state(session_id, admin)
+    assert server.sessions[session_id].state.bills == []
+
+    pid = db.create_proposal(session_id, admin["id"], sample_payload())
+
+    chat_thread = threading.Thread(
+        target=server.chat,
+        args=(session_id, server.ChatRequest(message="hi"), admin),
+    )
+    chat_thread.start()
+    assert chat_turn_started.wait(timeout=2), "chat turn never started"
+
+    # approve_proposal must now block behind the in-flight turn's lock
+    # rather than writing the bill unlocked and racing the eviction.
+    approve_thread = threading.Thread(
+        target=server.approve_proposal, args=(session_id, pid, admin)
+    )
+    approve_thread.start()
+    time.sleep(0.1)  # give a buggy unlocked decide_proposal a chance to run
+    release_chat_turn.set()
+
+    chat_thread.join(timeout=5)
+    approve_thread.join(timeout=5)
+    assert not chat_thread.is_alive() and not approve_thread.is_alive()
+
+    persisted = db.load_session_state(session_id)
+    assert [b["description"] for b in persisted["bills"]] == ["Dinner"], (
+        "approved bill lost to a concurrent chat turn's stale write-through save"
+    )
+
+
+def test_chat_raises_401_when_user_row_is_missing(fresh_server):
+    """_speaker_name's None-check: a syntactically valid but nonexistent user
+    id (e.g. a row deleted after the JWT was issued) must fail cleanly with
+    401, not an unguarded TypeError on user_row["name"]."""
+    admin = make_user("admin6@example.com", "g-admin6", "Admin6")
+    session_id = make_session_with_members(admin)
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.chat(session_id, server.ChatRequest(message="hi"), {"id": 999999})
+    assert exc_info.value.status_code == 401
