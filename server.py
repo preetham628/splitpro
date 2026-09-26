@@ -387,6 +387,56 @@ def update_member_role(
     return {"role": req.role}
 
 
+# ---------- Expense Proposal Review Endpoints ----------
+
+@app.get("/api/sessions/{session_id}/proposals")
+def list_proposals(session_id: str, user: dict = Depends(get_current_user)):
+    """List pending expense proposals for a session. Admin only."""
+    _require_admin(session_id, user)
+    return db.list_pending_proposals(session_id)
+
+
+def _require_proposal_in_session(session_id: str, proposal_id: int) -> None:
+    """decide_proposal() is keyed only by proposal_id, with no session_id
+    scoping of its own — without this check, an admin of any session could
+    decide a proposal belonging to a different session by id alone."""
+    proposal = db.get_proposal(proposal_id)
+    if proposal is None or proposal["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found")
+
+
+@app.post("/api/sessions/{session_id}/proposals/{proposal_id}/approve")
+def approve_proposal(
+    session_id: str,
+    proposal_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Approve a pending expense proposal, materializing it into bills/bill_items. Admin only."""
+    _require_admin(session_id, user)
+    _require_proposal_in_session(session_id, proposal_id)
+
+    try:
+        return db.decide_proposal(proposal_id, user["id"], "approved")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/sessions/{session_id}/proposals/{proposal_id}/reject")
+def reject_proposal(
+    session_id: str,
+    proposal_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Reject a pending expense proposal. Admin only."""
+    _require_admin(session_id, user)
+    _require_proposal_in_session(session_id, proposal_id)
+
+    try:
+        return db.decide_proposal(proposal_id, user["id"], "rejected")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 # ---------- Chat Endpoints ----------
 
 @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
