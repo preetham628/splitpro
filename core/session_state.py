@@ -1,4 +1,5 @@
 from __future__ import annotations
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -49,7 +50,16 @@ class SessionState:
     finalized: bool = False
 
     def next_bill_id(self) -> str:
-        return f"bill_{len(self.bills) + 1}"
+        """A bill_id that's never reused within this session's lifetime.
+
+        Deliberately not len(self.bills) + 1 — that scheme reissues the same
+        id after a bill is removed and a new one added (e.g. once an
+        edit/delete-bill capability exists), which would let a stale,
+        still-pending expense_proposals row silently target the wrong bill
+        on approval (proposals are matched by (session_id, bill_id) — see
+        decide_proposal() in core/database.py).
+        """
+        return f"bill_{uuid.uuid4().hex[:8]}"
 
     def get_bill(self, bill_id: str) -> Optional[ParsedBill]:
         for b in self.bills:
