@@ -669,6 +669,18 @@ def get_proposal(proposal_id: int) -> Optional[dict]:
         return result
 
 
+def count_pending_proposals(session_id: str) -> int:
+    """Bare count for the chat UI's badge — mirrors count_admins() rather
+    than len(list_pending_proposals(...)), which would fetch and
+    json.loads() every pending proposal's full payload just to discard it."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM expense_proposals WHERE session_id = ? AND status = 'pending'",
+            (session_id,),
+        ).fetchone()
+        return row["c"]
+
+
 def list_pending_proposals(session_id: str) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("""
