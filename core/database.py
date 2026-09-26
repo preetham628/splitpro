@@ -387,19 +387,26 @@ def add_chat_message(
     content: str,
     image_base64: Optional[str] = None,
     image_media_type: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> None:
     with _connect() as conn:
         conn.execute("""
-            INSERT INTO chat_messages (session_id, role, content, image_base64, image_media_type)
-            VALUES (?, ?, ?, ?, ?)
-        """, (session_id, role, content, image_base64, image_media_type))
+            INSERT INTO chat_messages (session_id, role, content, image_base64, image_media_type, user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (session_id, role, content, image_base64, image_media_type, user_id))
 
 
 def list_chat_messages(session_id: str) -> list[dict]:
-    """Return the chat transcript for a session, oldest first."""
+    """Return the chat transcript for a session, oldest first.
+
+    Returns raw user_id (nullable, null for role='agent' rows) rather than a
+    joined name/avatar — callers that need sender identity resolve it via
+    GET /api/sessions/{id}/members, which the frontend already loads for the
+    approval/member-management UI.
+    """
     with _connect() as conn:
         rows = conn.execute("""
-            SELECT role, content, image_base64, image_media_type, created_at
+            SELECT role, content, image_base64, image_media_type, created_at, user_id
             FROM chat_messages
             WHERE session_id = ?
             ORDER BY id
@@ -660,6 +667,18 @@ def get_proposal(proposal_id: int) -> Optional[dict]:
         result = dict(row)
         result["payload"] = json.loads(result["payload"])
         return result
+
+
+def count_pending_proposals(session_id: str) -> int:
+    """Bare count for the chat UI's badge — mirrors count_admins() rather
+    than len(list_pending_proposals(...)), which would fetch and
+    json.loads() every pending proposal's full payload just to discard it."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM expense_proposals WHERE session_id = ? AND status = 'pending'",
+            (session_id,),
+        ).fetchone()
+        return row["c"]
 
 
 def list_pending_proposals(session_id: str) -> list[dict]:

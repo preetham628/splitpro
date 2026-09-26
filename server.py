@@ -3,9 +3,11 @@ SplitPro FastAPI Server
 Run with: uvicorn server:app --reload
 """
 
+import asyncio
 import base64
 import secrets
-from typing import Literal, Optional
+import threading
+from typing import Callable, Literal, Optional
 from uuid import uuid4
 
 from contextlib import asynccontextmanager
@@ -60,6 +62,40 @@ app.add_middleware(
 # In-memory session cache: session_id -> ChatAgent (write-through with SQLite)
 sessions: dict[str, ChatAgent] = {}
 
+# Per-session lock guarding a full chat turn — a session can now have real
+# concurrent senders (multiple members messaging at once), and while Task 3's
+# speaker-identity fix means they can no longer misattribute proposals to the
+# wrong user, concurrent turns could still interleave against the same
+# SessionState/checkpoint thread (e.g. two turns reading/writing agent.state
+# at once). The lock must wrap the *entire* turn — cache lookup/creation of
+# the agent (_get_agent's cache-miss path is itself a check-then-act race),
+# agent.chat(), persistence, and the state read for the response — not just
+# the agent.chat() call, otherwise two first-touch requests for a brand-new
+# session can each build/cache their own ChatAgent+SessionState before either
+# takes the lock, and the loser's save silently clobbers the winner's.
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    with _session_locks_guard:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_id] = lock
+        return lock
+
+
+def _drop_session_lock(session_id: str) -> None:
+    """Remove a session's lock entry once the session itself is gone, so
+    _session_locks doesn't grow unboundedly over a long-running process.
+    Safe even if another thread is currently holding the lock object — it
+    still holds its own reference and will release it normally; only a
+    future _get_session_lock() call for this (now-deleted) session_id would
+    build a fresh Lock, and session_ids are never reused."""
+    with _session_locks_guard:
+        _session_locks.pop(session_id, None)
+
 
 # ---------- Request / Response models ----------
 
@@ -100,10 +136,11 @@ def _chat_config(req: SessionRequest = None) -> ChatAgentConfig:
     )
 
 
-def _serialize_state(state: SessionState) -> dict:
+def _serialize_state(state: SessionState, session_id: str) -> dict:
     """Convert SessionState to a JSON-serializable dict for the UI."""
     return {
         "participants": state.participants,
+        "pending_proposals_count": db.count_pending_proposals(session_id),
         "bills": [
             {
                 "bill_id": bill.bill_id,
@@ -171,6 +208,56 @@ def _save_agent(session_id: str, agent: ChatAgent, name: Optional[str] = None) -
     """
     settlements = _compute_settlement(agent.state) if agent.state.finalized else []
     db.save_session_state(session_id, agent.state, settlements, name=name)
+
+
+def _run_chat_turn(
+    session_id: str,
+    user: dict,
+    agent_message: str,
+    speaker_name: str,
+    persist_user_message: Callable[[], None],
+) -> tuple[str, dict]:
+    """Run one full chat turn — agent lookup/creation, the model call,
+    persistence, and the response's state snapshot — as a single critical
+    section under this session's lock.
+
+    Must cover the *whole* turn, not just agent.chat(): _get_agent()'s
+    cache-miss path constructs and caches a new ChatAgent/SessionState, which
+    is itself an unsynchronized check-then-act if it can run outside the
+    lock — two first-touch requests for the same brand-new session would
+    each build an independent state object, get serialized against each
+    other for nothing, and have one save silently discard the other's bill.
+    Likewise the state snapshot returned to the caller must be read before
+    the lock releases, or a concurrent turn could mutate agent.state in the
+    gap between this turn's unlock and its own serialization.
+
+    `persist_user_message` is a callback (rather than the raw message here)
+    so callers can pass image-specific kwargs (upload_image) without this
+    helper needing to know about them; it's called with the lock held, right
+    after agent.chat() returns, matching the message ordering the two
+    endpoints already had.
+
+    Synchronous end-to-end — callers on an async path (upload_image) must
+    run this via asyncio.to_thread so the lock (a plain threading.Lock)
+    never blocks the event loop.
+    """
+    with _get_session_lock(session_id):
+        agent = _get_agent(session_id, user)
+        prev_bill_count = len(agent.state.bills)
+
+        response = agent.chat(agent_message, speaker_name=speaker_name, speaker_user_id=user["id"])
+        persist_user_message()
+        db.add_chat_message(session_id, "agent", response)
+
+        # Auto-rename session when first bill is added
+        new_name: Optional[str] = None
+        if len(agent.state.bills) > prev_bill_count:
+            new_name = _session_name_from_agent(agent)
+
+        _save_agent(session_id, agent, name=new_name)
+        state = _serialize_state(agent.state, session_id)
+
+    return response, state
 
 
 def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
@@ -302,13 +389,27 @@ def rename_session(
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, user: dict = Depends(get_current_user)):
-    """Delete a session. Admin only."""
+    """Delete a session. Admin only.
+
+    Takes the same per-session lock _run_chat_turn holds for the whole
+    turn, so this can't interleave with an in-flight chat/image turn for
+    this session — without it, deleting mid-turn (cascading away the bills
+    a concurrent turn is about to save against) turned that turn's later
+    save into an unhandled IntegrityError instead of either finishing
+    cleanly first or failing with a clean 404. Dropping the lock entry
+    afterward (success or already-gone) means a lock is never left behind
+    for a session_id that no longer exists.
+    """
     _require_admin(session_id, user)
-    deleted = db.delete_session_by_id(session_id)
+    with _get_session_lock(session_id):
+        deleted = db.delete_session_by_id(session_id)
+        if deleted:
+            checkpointer.delete_thread(session_id)
+            sessions.pop(session_id, None)
+    _drop_session_lock(session_id)
+
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
-    checkpointer.delete_thread(session_id)
-    sessions.pop(session_id, None)
     return {"ok": True}
 
 
@@ -454,26 +555,28 @@ def chat(
     req: ChatRequest,
     user: dict = Depends(get_current_user),
 ):
-    agent = _get_agent(session_id, user)
-    prev_bill_count = len(agent.state.bills)
-
-    response = agent.chat(req.message)
-    db.add_chat_message(session_id, "user", req.message)
-    db.add_chat_message(session_id, "agent", response)
-
-    # Auto-rename session when first bill is added
-    new_name: Optional[str] = None
-    if len(agent.state.bills) > prev_bill_count:
-        new_name = _session_name_from_agent(agent)
-
-    _save_agent(session_id, agent, name=new_name)
-    return ChatResponse(response=response, state=_serialize_state(agent.state))
+    speaker_name = user["name"] or user["email"]
+    response, state = _run_chat_turn(
+        session_id,
+        user,
+        req.message,
+        speaker_name,
+        persist_user_message=lambda: db.add_chat_message(
+            session_id, "user", req.message, user_id=user["id"]
+        ),
+    )
+    return ChatResponse(response=response, state=state)
 
 
 @app.get("/sessions/{session_id}/state")
 def get_state(session_id: str, user: dict = Depends(get_current_user)):
-    agent = _get_agent(session_id, user)
-    return _serialize_state(agent.state)
+    # Locked for the same reason _run_chat_turn is: an unlocked read here
+    # could race a concurrent chat turn's mutation of agent.state, or (on a
+    # cache miss) build a redundant ChatAgent alongside one a concurrent
+    # chat turn is already constructing.
+    with _get_session_lock(session_id):
+        agent = _get_agent(session_id, user)
+        return _serialize_state(agent.state, session_id)
 
 
 @app.get("/sessions/{session_id}/messages")
@@ -495,7 +598,12 @@ async def upload_image(
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
 ):
-    agent = _get_agent(session_id, user)
+    # Cheap, read-only membership check for early rejection — deliberately
+    # not _get_agent() here, since that can construct+cache a brand-new
+    # ChatAgent on a cache miss, and doing that outside the per-session lock
+    # is exactly the unsynchronized check-then-act _run_chat_turn's docstring
+    # warns about. The real agent lookup happens inside _run_chat_turn.
+    _require_member(session_id, user)
 
     content_type = file.content_type or "image/jpeg"
     if not content_type.startswith("image/"):
@@ -505,9 +613,12 @@ async def upload_image(
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
     analyzer = ImageAnalyzer(app_config.image_analyzer)
-    result = analyzer.analyze(image_bytes, media_type=content_type)
-
-    prev_bill_count = len(agent.state.bills)
+    # analyzer.analyze() is a synchronous call out to the vision model — the
+    # same event-loop-blocking hazard the chat-turn lock had (a slow model
+    # response or provider outage would otherwise stall the entire loop for
+    # every session, not just this request), so it gets the same to_thread
+    # treatment.
+    result = await asyncio.to_thread(analyzer.analyze, image_bytes, media_type=content_type)
 
     if result.is_bill:
         agent_message = (
@@ -520,16 +631,24 @@ async def upload_image(
             f"Tell the user what you see and ask them to upload a receipt image instead."
         )
 
-    response = agent.chat(agent_message)
-    db.add_chat_message(session_id, "user", "", image_base64=image_b64, image_media_type=content_type)
-    db.add_chat_message(session_id, "agent", response)
+    speaker_name = user["name"] or user["email"]
 
-    new_name: Optional[str] = None
-    if len(agent.state.bills) > prev_bill_count:
-        new_name = _session_name_from_agent(agent)
-
-    _save_agent(session_id, agent, name=new_name)
-    return ChatResponse(response=response, state=_serialize_state(agent.state))
+    # _run_chat_turn is synchronous and holds a plain threading.Lock for its
+    # duration — run it off the event loop thread so lock contention on a
+    # busy session stalls only this request, not every other request the
+    # process is serving.
+    response, state = await asyncio.to_thread(
+        _run_chat_turn,
+        session_id,
+        user,
+        agent_message,
+        speaker_name,
+        lambda: db.add_chat_message(
+            session_id, "user", "", image_base64=image_b64, image_media_type=content_type,
+            user_id=user["id"],
+        ),
+    )
+    return ChatResponse(response=response, state=state)
 
 
 @app.get("/health")
