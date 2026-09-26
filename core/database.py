@@ -497,8 +497,16 @@ def update_member_role(session_id: str, user_id: int, role: str) -> bool:
     both proceed, leaving zero. A single UPDATE statement runs to
     completion under SQLite's write lock with no other writer interleaved,
     so this can't happen here.
+
+    The transaction is opened with BEGIN IMMEDIATE (rather than relying on
+    the driver's default deferred BEGIN) so the write lock is held from
+    before the guarded UPDATE all the way through the diagnostic SELECT
+    below — otherwise that second read's consistency with the UPDATE it's
+    explaining would depend on unstated lock-escalation timing instead of
+    something explicit in the code.
     """
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute("""
             UPDATE session_members
             SET role = ?
@@ -516,7 +524,8 @@ def update_member_role(session_id: str, user_id: int, role: str) -> bool:
         # Either not a member, or the guard blocked it — disambiguate for a
         # clear error. This second read is diagnostic only; it doesn't
         # affect correctness since the atomic UPDATE above already made the
-        # real decision.
+        # real decision. Safe from concurrent modification because BEGIN
+        # IMMEDIATE above still holds the write lock at this point.
         current = conn.execute(
             "SELECT role FROM session_members WHERE session_id = ? AND user_id = ?",
             (session_id, user_id),
@@ -531,9 +540,11 @@ def remove_session_member(session_id: str, user_id: int) -> bool:
 
     Refuses (raises ValueError) to remove a session's last remaining admin.
     Same atomic-statement approach as update_member_role() — see there for
-    why the guard has to be part of the DELETE itself, not a prior SELECT.
+    why the guard has to be part of the DELETE itself, not a prior SELECT,
+    and why the transaction opens with BEGIN IMMEDIATE.
     """
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute("""
             DELETE FROM session_members
             WHERE session_id = ? AND user_id = ?
