@@ -148,6 +148,30 @@ def test_get_user_by_email(fresh_db):
     assert db.get_user_by_email("missing@example.com") is None
 
 
+def test_get_user_by_email_is_case_insensitive(fresh_db):
+    user = make_user("Bob@Example.com", "g-bob")
+    assert db.get_user_by_email("bob@example.com")["id"] == user["id"]
+    assert db.get_user_by_email("BOB@EXAMPLE.COM")["id"] == user["id"]
+    assert db.get_user_by_email("Bob@Example.com")["id"] == user["id"]
+
+
+def test_list_sessions_includes_membership_not_just_ownership(fresh_db):
+    """list_sessions(user_id) must surface sessions a user is only invited
+    to, not just ones they created — the primary discovery path for a
+    session_members-only participant."""
+    owner = make_user("owner6@example.com", "g-owner6")
+    invitee = make_user("invitee6@example.com", "g-invitee6")
+    make_session("sess-6", owner["id"], name="Owner's session")
+    db.add_session_member("sess-6", owner["id"], "admin")
+    db.add_session_member("sess-6", invitee["id"], "member")
+
+    invitee_sessions = db.list_sessions(invitee["id"])
+    assert [s["id"] for s in invitee_sessions] == ["sess-6"]
+
+    owner_sessions = db.list_sessions(owner["id"])
+    assert [s["id"] for s in owner_sessions] == ["sess-6"]
+
+
 # ---------- Expense proposals ----------
 
 def test_create_update_get_list_proposal(fresh_db):
