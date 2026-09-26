@@ -252,14 +252,14 @@ def save_session_state(
             """, (session_id, bill.bill_id, bill.description, bill.raw_text,
                   bill.tax, bill.tip, bill.paid_by))
             bill_row_id = cursor.lastrowid
-            for item in bill.items:
-                conn.execute("""
-                    INSERT INTO bill_items
-                        (bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (bill_row_id, item.name, item.price, item.qty,
-                      json.dumps(item.assigned_to), int(item.shared), int(item.unassigned),
-                      json.dumps(item.qty_allocations)))
+            _insert_bill_items(conn, bill_row_id, [
+                {
+                    "name": item.name, "price": item.price, "qty": item.qty,
+                    "assigned_to": item.assigned_to, "shared": item.shared,
+                    "unassigned": item.unassigned, "qty_allocations": item.qty_allocations,
+                }
+                for item in bill.items
+            ])
 
         conn.execute("DELETE FROM settlements WHERE session_id = ?", (session_id,))
         conn.executemany(
@@ -435,9 +435,33 @@ def count_admins(session_id: str) -> int:
         return row["c"]
 
 
-def _member_role(session_id: str, user_id: int, role: str) -> bool:
-    """Change an existing member's role. Returns False if no row matched."""
+def _count_admins(conn: sqlite3.Connection, session_id: str) -> int:
+    """count_admins() logic against an already-open connection/transaction —
+    used by the guards below, which can't call the public count_admins()
+    without opening a second, separate connection mid-transaction.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM session_members WHERE session_id = ? AND role = 'admin'",
+        (session_id,),
+    ).fetchone()
+    return row["c"]
+
+
+def update_member_role(session_id: str, user_id: int, role: str) -> bool:
+    """Change an existing member's role. Returns False if no row matched.
+
+    Refuses (raises ValueError) to demote a session's last remaining admin —
+    every session must keep at least one admin.
+    """
     with _connect() as conn:
+        if role != "admin":
+            current = conn.execute(
+                "SELECT role FROM session_members WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            ).fetchone()
+            if current and current["role"] == "admin" and _count_admins(conn, session_id) <= 1:
+                raise ValueError(f"cannot demote the last admin of session {session_id!r}")
+
         cursor = conn.execute("""
             UPDATE session_members SET role = ?
             WHERE session_id = ? AND user_id = ?
@@ -446,7 +470,18 @@ def _member_role(session_id: str, user_id: int, role: str) -> bool:
 
 
 def remove_session_member(session_id: str, user_id: int) -> bool:
+    """Remove a member from a session. Returns False if they weren't a member.
+
+    Refuses (raises ValueError) to remove a session's last remaining admin.
+    """
     with _connect() as conn:
+        current = conn.execute(
+            "SELECT role FROM session_members WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+        if current and current["role"] == "admin" and _count_admins(conn, session_id) <= 1:
+            raise ValueError(f"cannot remove the last admin of session {session_id!r}")
+
         cursor = conn.execute(
             "DELETE FROM session_members WHERE session_id = ? AND user_id = ?",
             (session_id, user_id),
@@ -462,8 +497,23 @@ def create_proposal(
     payload: dict,
     supersedes_bill_id: Optional[int] = None,
 ) -> int:
-    """Stage an AI-drafted expense for admin approval. Returns the new proposal id."""
+    """Stage an AI-drafted expense for admin approval. Returns the new proposal id.
+
+    Raises ValueError if supersedes_bill_id is given but doesn't belong to
+    session_id — the same check decide_proposal() re-runs at approval time,
+    since a bill's session_id can't change after this either.
+    """
     with _connect() as conn:
+        if supersedes_bill_id is not None:
+            bill = conn.execute(
+                "SELECT session_id FROM bills WHERE id = ?", (supersedes_bill_id,)
+            ).fetchone()
+            if bill is None or bill["session_id"] != session_id:
+                raise ValueError(
+                    f"supersedes_bill_id {supersedes_bill_id} does not belong to "
+                    f"session {session_id!r}"
+                )
+
         cursor = conn.execute("""
             INSERT INTO expense_proposals (session_id, proposed_by, supersedes_bill_id, payload)
             VALUES (?, ?, ?, ?)
@@ -508,9 +558,32 @@ def list_pending_proposals(session_id: str) -> list[dict]:
         return results
 
 
+def _insert_bill_items(conn: sqlite3.Connection, bill_row_id: int, items: list[dict]) -> None:
+    """Insert bill_items rows for one bill from plain dicts (keys: name,
+    price, qty, assigned_to, shared, unassigned, qty_allocations). Shared by
+    save_session_state() (converting LineItem dataclasses to dicts first)
+    and decide_proposal()'s approval path (payload items are already dicts),
+    so the insert shape only has to change in one place.
+    """
+    for item in items:
+        conn.execute("""
+            INSERT INTO bill_items
+                (bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (bill_row_id, item["name"], item["price"], item.get("qty", 1),
+              json.dumps(item.get("assigned_to", [])), int(item.get("shared", False)),
+              int(item.get("unassigned", False)), json.dumps(item.get("qty_allocations", {}))))
+
+
 def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
     """Approve or reject a pending proposal. Returns the updated proposal row
     (payload json.loads'd), all inside one transaction.
+
+    Raises ValueError if the proposal isn't (still) 'pending' — deciding a
+    proposal is a one-shot transition, not idempotent: a second call (retry,
+    double-click) would otherwise either violate the bills UNIQUE(session_id,
+    bill_id) constraint (new-bill case) or silently redo the supersede
+    against whatever the payload says now, rather than erroring loudly.
 
     Rejection only touches the proposal row itself. Approval additionally
     materializes the payload into bills/bill_items: a fresh bill (plus its
@@ -528,6 +601,23 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
         ).fetchone()
         if row is None:
             raise ValueError(f"Proposal {proposal_id} not found")
+        if row["status"] != "pending":
+            raise ValueError(
+                f"proposal {proposal_id} was already decided (status={row['status']!r})"
+            )
+
+        supersedes_bill_id = row["supersedes_bill_id"]
+        if supersedes_bill_id is not None:
+            # Re-checked here (not just at create_proposal time) since this is
+            # the point where the cross-session write would actually happen.
+            bill = conn.execute(
+                "SELECT session_id FROM bills WHERE id = ?", (supersedes_bill_id,)
+            ).fetchone()
+            if bill is None or bill["session_id"] != row["session_id"]:
+                raise ValueError(
+                    f"supersedes_bill_id {supersedes_bill_id} does not belong to "
+                    f"session {row['session_id']!r}"
+                )
 
         conn.execute("""
             UPDATE expense_proposals
@@ -537,7 +627,6 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
 
         if decision == "approved":
             payload = json.loads(row["payload"])
-            supersedes_bill_id = row["supersedes_bill_id"]
 
             if supersedes_bill_id is None:
                 cursor = conn.execute("""
@@ -561,14 +650,7 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
                 conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (supersedes_bill_id,))
                 bill_row_id = supersedes_bill_id
 
-            for item in payload.get("items", []):
-                conn.execute("""
-                    INSERT INTO bill_items
-                        (bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (bill_row_id, item["name"], item["price"], item.get("qty", 1),
-                      json.dumps(item.get("assigned_to", [])), int(item.get("shared", False)),
-                      int(item.get("unassigned", False)), json.dumps(item.get("qty_allocations", {}))))
+            _insert_bill_items(conn, bill_row_id, payload.get("items", []))
 
         result = dict(conn.execute(
             "SELECT * FROM expense_proposals WHERE id = ?", (proposal_id,)

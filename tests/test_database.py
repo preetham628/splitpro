@@ -78,7 +78,7 @@ def test_list_session_members(fresh_db):
     assert all({"user_id", "name", "email", "avatar_url", "role"} <= m.keys() for m in members)
 
 
-def test_count_admins_and_member_role(fresh_db):
+def test_count_admins_and_update_member_role(fresh_db):
     admin = make_user("a3@example.com", "g-a3")
     member = make_user("m3@example.com", "g-m3")
     make_session("sess-3", admin["id"])
@@ -87,11 +87,28 @@ def test_count_admins_and_member_role(fresh_db):
 
     assert db.count_admins("sess-3") == 1
 
-    assert db._member_role("sess-3", member["id"], "admin") is True
+    assert db.update_member_role("sess-3", member["id"], "admin") is True
     assert db.count_admins("sess-3") == 2
     assert db.is_session_admin("sess-3", member["id"])
 
-    assert db._member_role("sess-3", 424242, "admin") is False
+    assert db.update_member_role("sess-3", 424242, "admin") is False
+
+
+def test_update_member_role_blocks_demoting_last_admin(fresh_db):
+    admin = make_user("a3b@example.com", "g-a3b")
+    member = make_user("m3b@example.com", "g-m3b")
+    make_session("sess-3b", admin["id"])
+    db.add_session_member("sess-3b", admin["id"], "admin")
+    db.add_session_member("sess-3b", member["id"], "member")
+
+    with pytest.raises(ValueError):
+        db.update_member_role("sess-3b", admin["id"], "member")
+    assert db.is_session_admin("sess-3b", admin["id"])
+
+    # With two admins, demoting one is fine.
+    db.update_member_role("sess-3b", member["id"], "admin")
+    assert db.update_member_role("sess-3b", admin["id"], "member") is True
+    assert db.count_admins("sess-3b") == 1
 
 
 def test_remove_session_member(fresh_db):
@@ -104,6 +121,22 @@ def test_remove_session_member(fresh_db):
     assert db.remove_session_member("sess-4", member["id"]) is True
     assert not db.is_session_member("sess-4", member["id"])
     assert db.remove_session_member("sess-4", member["id"]) is False
+
+
+def test_remove_session_member_blocks_removing_last_admin(fresh_db):
+    admin = make_user("a4b@example.com", "g-a4b")
+    member = make_user("m4b@example.com", "g-m4b")
+    make_session("sess-4b", admin["id"])
+    db.add_session_member("sess-4b", admin["id"], "admin")
+    db.add_session_member("sess-4b", member["id"], "member")
+
+    with pytest.raises(ValueError):
+        db.remove_session_member("sess-4b", admin["id"])
+    assert db.is_session_member("sess-4b", admin["id"])
+
+    # With two admins, removing one is fine.
+    db.update_member_role("sess-4b", member["id"], "admin")
+    assert db.remove_session_member("sess-4b", admin["id"]) is True
 
 
 def test_get_user_by_email(fresh_db):
@@ -238,6 +271,137 @@ def test_decide_proposal_invalid_decision_raises(fresh_db):
 def test_decide_proposal_missing_raises(fresh_db):
     with pytest.raises(ValueError):
         db.decide_proposal(999999, decided_by=1, decision="approved")
+
+
+def test_decide_proposal_is_not_repeatable(fresh_db):
+    """A second decide_proposal() call on an already-decided proposal must
+    raise rather than re-apply (silently, or via an IntegrityError on the
+    bills UNIQUE(session_id, bill_id) constraint) — retries/double-clicks
+    should fail loudly, not corrupt or duplicate data.
+    """
+    admin = make_user("a10@example.com", "g-a10")
+    make_session("sess-10", admin["id"])
+    db.add_session_member("sess-10", admin["id"], "admin")
+
+    pid = db.create_proposal("sess-10", proposed_by=admin["id"], payload=sample_payload())
+    db.decide_proposal(pid, decided_by=admin["id"], decision="approved")
+
+    with pytest.raises(ValueError):
+        db.decide_proposal(pid, decided_by=admin["id"], decision="approved")
+    with pytest.raises(ValueError):
+        db.decide_proposal(pid, decided_by=admin["id"], decision="rejected")
+
+
+def test_create_proposal_rejects_cross_session_supersede(fresh_db):
+    admin_a = make_user("a11@example.com", "g-a11")
+    admin_b = make_user("b11@example.com", "g-b11")
+    make_session("sess-11a", admin_a["id"])
+    make_session("sess-11b", admin_b["id"])
+    db.add_session_member("sess-11a", admin_a["id"], "admin")
+    db.add_session_member("sess-11b", admin_b["id"], "admin")
+
+    pid_b = db.create_proposal("sess-11b", proposed_by=admin_b["id"], payload=sample_payload())
+    db.decide_proposal(pid_b, decided_by=admin_b["id"], decision="approved")
+
+    conn = sqlite3.connect(fresh_db)
+    conn.row_factory = sqlite3.Row
+    bill_b = conn.execute("SELECT * FROM bills WHERE session_id = 'sess-11b'").fetchone()
+    conn.close()
+
+    with pytest.raises(ValueError):
+        db.create_proposal(
+            "sess-11a", proposed_by=admin_a["id"],
+            payload=sample_payload(description="HIJACKED"),
+            supersedes_bill_id=bill_b["id"],
+        )
+
+
+def test_decide_proposal_rejects_cross_session_supersede_even_if_bypassed(fresh_db):
+    """Belt-and-suspenders: even if a proposal somehow ends up with a
+    supersedes_bill_id from another session (bypassing create_proposal's own
+    check), decide_proposal must refuse to act on it rather than overwrite
+    another session's bill.
+    """
+    admin_a = make_user("a12@example.com", "g-a12")
+    admin_b = make_user("b12@example.com", "g-b12")
+    make_session("sess-12a", admin_a["id"])
+    make_session("sess-12b", admin_b["id"])
+    db.add_session_member("sess-12a", admin_a["id"], "admin")
+    db.add_session_member("sess-12b", admin_b["id"], "admin")
+
+    pid_b = db.create_proposal("sess-12b", proposed_by=admin_b["id"], payload=sample_payload())
+    db.decide_proposal(pid_b, decided_by=admin_b["id"], decision="approved")
+
+    conn = sqlite3.connect(fresh_db)
+    conn.row_factory = sqlite3.Row
+    bill_b = conn.execute("SELECT * FROM bills WHERE session_id = 'sess-12b'").fetchone()
+    conn.close()
+
+    # Bypass create_proposal's guard by inserting the row directly.
+    conn = sqlite3.connect(fresh_db)
+    conn.execute("PRAGMA foreign_keys = ON")
+    cursor = conn.execute(
+        "INSERT INTO expense_proposals (session_id, proposed_by, supersedes_bill_id, payload) "
+        "VALUES (?, ?, ?, ?)",
+        ("sess-12a", admin_a["id"], bill_b["id"], '{"bill_id": "x", "items": []}'),
+    )
+    pid_a = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ValueError):
+        db.decide_proposal(pid_a, decided_by=admin_a["id"], decision="approved")
+
+    conn = sqlite3.connect(fresh_db)
+    conn.row_factory = sqlite3.Row
+    bill_b_after = conn.execute("SELECT * FROM bills WHERE id = ?", (bill_b["id"],)).fetchone()
+    conn.close()
+    assert bill_b_after["session_id"] == "sess-12b"
+    assert bill_b_after["description"] == sample_payload()["description"]
+
+
+def test_save_session_state_after_supersede_does_not_raise(fresh_db):
+    """Regression test: expense_proposals.supersedes_bill_id must not block
+    the normal delete-and-reinsert save_session_state() does on bills every
+    turn. Previously this raised sqlite3.IntegrityError on the very next
+    save for any session with a decided correction-proposal, because the FK
+    had no ON DELETE clause.
+    """
+    from core.session_state import SessionState
+
+    admin = make_user("a13@example.com", "g-a13")
+    make_session("sess-13", admin["id"])
+    db.add_session_member("sess-13", admin["id"], "admin")
+
+    pid1 = db.create_proposal("sess-13", proposed_by=admin["id"], payload=sample_payload())
+    db.decide_proposal(pid1, decided_by=admin["id"], decision="approved")
+
+    conn = sqlite3.connect(fresh_db)
+    conn.row_factory = sqlite3.Row
+    bill = conn.execute("SELECT * FROM bills WHERE session_id = 'sess-13'").fetchone()
+    conn.close()
+
+    pid2 = db.create_proposal(
+        "sess-13", proposed_by=admin["id"],
+        payload=sample_payload(description="v2"), supersedes_bill_id=bill["id"],
+    )
+    db.decide_proposal(pid2, decided_by=admin["id"], decision="approved")
+
+    state = SessionState(participants=[], bills=[], finalized=False)
+    db.save_session_state("sess-13", state, settlements=[])  # must not raise
+
+    conn = sqlite3.connect(fresh_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM bills").fetchone()[0] == 0
+        proposal_row = conn.execute(
+            "SELECT supersedes_bill_id FROM expense_proposals WHERE id = ?", (pid2,)
+        ).fetchone()
+        assert proposal_row["supersedes_bill_id"] is None, (
+            "FK should SET NULL rather than block the bill delete"
+        )
+    finally:
+        conn.close()
 
 
 # ---------- Legacy backfill migration ----------

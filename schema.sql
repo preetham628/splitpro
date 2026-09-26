@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS expense_proposals (
     session_id         TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
     proposed_by        INTEGER NOT NULL REFERENCES users(id),
     status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    supersedes_bill_id INTEGER REFERENCES bills(id),
+    supersedes_bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
     payload            TEXT NOT NULL,
     decided_by         INTEGER REFERENCES users(id),
     decided_at         TIMESTAMP,
