@@ -5,7 +5,7 @@ Run with: uvicorn server:app --reload
 
 import base64
 import secrets
-from typing import Optional
+from typing import Literal, Optional
 from uuid import uuid4
 
 from contextlib import asynccontextmanager
@@ -81,6 +81,14 @@ class RenameRequest(BaseModel):
     name: str
 
 
+class AddMemberRequest(BaseModel):
+    email: str
+
+
+class UpdateRoleRequest(BaseModel):
+    role: Literal["admin", "member"]
+
+
 # ---------- Helpers ----------
 
 def _chat_config(req: SessionRequest = None) -> ChatAgentConfig:
@@ -141,8 +149,7 @@ def _get_agent(session_id: str, user: dict) -> ChatAgent:
     ChatAgent.chat() picks it up transparently on the next invoke(). Only
     the bill-splitting SessionState needs to be reloaded explicitly.
     """
-    if not db.session_belongs_to_user(session_id, user["id"]):
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    _require_member(session_id, user)
 
     if session_id in sessions:
         return sessions[session_id]
@@ -171,6 +178,20 @@ def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
     if agent.state.bills:
         return agent.state.bills[0].description
     return None
+
+
+def _require_member(session_id: str, user: dict) -> None:
+    """Any member (admin or not) may access the session. 404 rather than 403
+    on failure — matches the existing behavior of not leaking whether a
+    session exists to a caller with no access to it."""
+    if not db.is_session_member(session_id, user["id"]):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+
+def _require_admin(session_id: str, user: dict) -> None:
+    _require_member(session_id, user)
+    if not db.is_session_admin(session_id, user["id"]):
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 
 # ---------- Auth Endpoints ----------
@@ -255,6 +276,7 @@ def create_session(
     sessions[session_id] = agent
 
     db.create_session(session_id, user["id"], name="New Session")
+    db.add_session_member(session_id, user["id"], role="admin")
     _save_agent(session_id, agent)
 
     return {
@@ -270,8 +292,9 @@ def rename_session(
     req: RenameRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Rename a session."""
-    updated = db.rename_session(session_id, user["id"], req.name)
+    """Rename a session. Any member may rename — no admin requirement."""
+    _require_member(session_id, user)
+    updated = db.rename_session_by_id(session_id, req.name)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"name": req.name}
@@ -279,13 +302,148 @@ def rename_session(
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, user: dict = Depends(get_current_user)):
-    """Delete a session."""
-    deleted = db.delete_session(session_id, user["id"])
+    """Delete a session. Admin only."""
+    _require_admin(session_id, user)
+    deleted = db.delete_session_by_id(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
     checkpointer.delete_thread(session_id)
     sessions.pop(session_id, None)
     return {"ok": True}
+
+
+# ---------- Session Membership Endpoints ----------
+
+@app.get("/api/sessions/{session_id}/members")
+def list_members(session_id: str, user: dict = Depends(get_current_user)):
+    """List a session's members. Any member may view the roster."""
+    _require_member(session_id, user)
+    return db.list_session_members(session_id)
+
+
+@app.post("/api/sessions/{session_id}/members", status_code=201)
+def add_member(
+    session_id: str,
+    req: AddMemberRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Add an existing user (by email) to a session. Admin only.
+
+    Idempotent: adding someone who's already a member is a 200 no-op
+    rather than a duplicate-row error — db.add_session_member does the
+    existence check and the insert as one atomic statement, so this is
+    also race-safe against a concurrent duplicate invite.
+    """
+    _require_admin(session_id, user)
+
+    target = db.get_user_by_email(req.email)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found — they must sign in at least once before being added",
+        )
+
+    inserted = db.add_session_member(session_id, target["id"], role="member")
+    if not inserted:
+        return JSONResponse(status_code=200, content={"ok": True, "already_member": True})
+    return {"ok": True, "already_member": False}
+
+
+@app.delete("/api/sessions/{session_id}/members/{target_user_id}")
+def remove_member(
+    session_id: str,
+    target_user_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Remove a member from a session. Admin only."""
+    _require_admin(session_id, user)
+
+    try:
+        removed = db.remove_session_member(session_id, target_user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not removed:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"ok": True}
+
+
+@app.patch("/api/sessions/{session_id}/members/{target_user_id}/role")
+def update_member_role(
+    session_id: str,
+    target_user_id: int,
+    req: UpdateRoleRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Change a member's role. Admin only."""
+    _require_admin(session_id, user)
+
+    try:
+        updated = db.update_member_role(session_id, target_user_id, req.role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"role": req.role}
+
+
+# ---------- Expense Proposal Review Endpoints ----------
+
+@app.get("/api/sessions/{session_id}/proposals")
+def list_proposals(session_id: str, user: dict = Depends(get_current_user)):
+    """List pending expense proposals for a session. Admin only."""
+    _require_admin(session_id, user)
+    return db.list_pending_proposals(session_id)
+
+
+def _require_proposal_in_session(session_id: str, proposal_id: int) -> None:
+    """decide_proposal() is keyed only by proposal_id, with no session_id
+    scoping of its own — without this check, an admin of any session could
+    decide a proposal belonging to a different session by id alone."""
+    proposal = db.get_proposal(proposal_id)
+    if proposal is None or proposal["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found")
+
+
+@app.post("/api/sessions/{session_id}/proposals/{proposal_id}/approve")
+def approve_proposal(
+    session_id: str,
+    proposal_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Approve a pending expense proposal, materializing it into bills/bill_items. Admin only."""
+    _require_admin(session_id, user)
+    _require_proposal_in_session(session_id, proposal_id)
+
+    try:
+        return db.decide_proposal(proposal_id, user["id"], "approved")
+    except ValueError as e:
+        # _require_proposal_in_session already confirmed the proposal exists
+        # in this session, so a ValueError here means decide_proposal's own
+        # `WHERE status = 'pending'` guard rejected it — i.e. someone else
+        # already decided it between that check and this call. That's a
+        # conflict with the proposal's current state, not a missing
+        # resource, so 409 rather than 404.
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/sessions/{session_id}/proposals/{proposal_id}/reject")
+def reject_proposal(
+    session_id: str,
+    proposal_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Reject a pending expense proposal. Admin only."""
+    _require_admin(session_id, user)
+    _require_proposal_in_session(session_id, proposal_id)
+
+    try:
+        return db.decide_proposal(proposal_id, user["id"], "rejected")
+    except ValueError as e:
+        # See the matching comment in approve_proposal — already-decided is
+        # a conflict (409), not a missing resource (404).
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 # ---------- Chat Endpoints ----------
@@ -321,17 +479,14 @@ def get_state(session_id: str, user: dict = Depends(get_current_user)):
 @app.get("/sessions/{session_id}/messages")
 def get_messages(session_id: str, user: dict = Depends(get_current_user)):
     """Full chat transcript for replay when a session is reopened."""
-    if not db.session_belongs_to_user(session_id, user["id"]):
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    _require_member(session_id, user)
     return db.list_chat_messages(session_id)
 
 
 @app.delete("/sessions/{session_id}")
 def end_session(session_id: str, user: dict = Depends(get_current_user)):
-    db.delete_session(session_id, user["id"])
-    checkpointer.delete_thread(session_id)
-    sessions.pop(session_id, None)
-    return {"ok": True}
+    """Duplicate of DELETE /api/sessions/{session_id} (no /api prefix). Admin only."""
+    return delete_session(session_id, user)
 
 
 @app.post("/sessions/{session_id}/image", response_model=ChatResponse)

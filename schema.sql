@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS users (
     avatar_url TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- get_user_by_email() (core/database.py) matches case-insensitively, since
+-- invite-by-email shouldn't fail over casing — this index enforces that
+-- same case-insensitive uniqueness at the DB level, on top of the
+-- column's own case-sensitive UNIQUE, so two accounts can't coexist
+-- differing only by case (which would otherwise make that lookup
+-- ambiguous about which account it means).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_nocase ON users(email COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
     id               TEXT PRIMARY KEY,
@@ -120,6 +127,11 @@ CREATE TABLE IF NOT EXISTS session_members (
     joined_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(session_id, user_id)
 );
+-- UNIQUE(session_id, user_id) above gives a leading-session_id index only —
+-- list_sessions() joins this table filtered by user_id (to find a caller's
+-- sessions via membership, not just chat_sessions.user_id ownership), which
+-- would otherwise scan this table linearly in total membership rows.
+CREATE INDEX IF NOT EXISTS idx_session_members_user ON session_members(user_id);
 
 -- AI-drafted expenses staged for admin approval before they count toward
 -- bills/bill_items (and therefore balances). `payload` mirrors the shape of

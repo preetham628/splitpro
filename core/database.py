@@ -252,13 +252,20 @@ def get_user_by_id(user_id: int) -> Optional[dict]:
 # ---------- Sessions ----------
 
 def list_sessions(user_id: int) -> list[dict]:
-    """Return all sessions for a user, newest first."""
+    """Return every session user_id is a member of (not just ones they
+    created), newest first. Membership, not chat_sessions.user_id, is the
+    access model now — every session gets a session_members row for its
+    creator (see create_session's caller in server.py, and _migrate_membership
+    for pre-existing rows), so this join always includes what the old
+    owner-only query returned, plus sessions the user was only invited to.
+    """
     with _connect() as conn:
         rows = conn.execute("""
-            SELECT id, name, created_at, updated_at
-            FROM chat_sessions
-            WHERE user_id = ?
-            ORDER BY updated_at DESC
+            SELECT cs.id, cs.name, cs.created_at, cs.updated_at
+            FROM chat_sessions cs
+            JOIN session_members sm ON sm.session_id = cs.id
+            WHERE sm.user_id = ?
+            ORDER BY cs.updated_at DESC
         """, (user_id,)).fetchall()
         return [dict(r) for r in rows]
 
@@ -400,48 +407,67 @@ def list_chat_messages(session_id: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def rename_session(session_id: str, user_id: int, name: str) -> bool:
-    """Rename a session. Returns True if a row was updated."""
+def rename_session_by_id(session_id: str, name: str) -> bool:
+    """Rename a session with no ownership filter. Returns True if a row was
+    updated. Callers must authorize access themselves first (e.g. via
+    session membership) — access is a membership question now, not
+    "is the original creator."
+    """
     with _connect() as conn:
         cursor = conn.execute("""
-            UPDATE chat_sessions SET name = ?
-            WHERE id = ? AND user_id = ?
-        """, (name, session_id, user_id))
+            UPDATE chat_sessions SET name = ? WHERE id = ?
+        """, (name, session_id))
         return cursor.rowcount > 0
 
 
-def delete_session(session_id: str, user_id: int) -> bool:
-    """Delete a session owned by user_id. Returns True if deleted."""
+def delete_session_by_id(session_id: str) -> bool:
+    """Delete a session with no ownership filter. Returns True if deleted.
+    Callers must authorize access themselves first (e.g. via
+    is_session_admin) — see rename_session_by_id() for why this doesn't
+    take a user_id.
+    """
     with _connect() as conn:
         cursor = conn.execute("""
-            DELETE FROM chat_sessions WHERE id = ? AND user_id = ?
-        """, (session_id, user_id))
+            DELETE FROM chat_sessions WHERE id = ?
+        """, (session_id,))
         return cursor.rowcount > 0
-
-
-def session_belongs_to_user(session_id: str, user_id: int) -> bool:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM chat_sessions WHERE id = ? AND user_id = ?",
-            (session_id, user_id),
-        ).fetchone()
-        return row is not None
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
+    """Case-insensitive lookup — email addresses aren't case-sensitive in
+    practice, and a plain `=` comparison here previously made inviting
+    "Bob@Example.com" fail to find an account stored as "bob@example.com",
+    surfacing as the same 404 as "this person has never signed in."
+    """
     with _connect() as conn:
-        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,)
+        ).fetchone()
         return dict(row) if row else None
 
 
 # ---------- Session membership ----------
 
-def add_session_member(session_id: str, user_id: int, role: str = "member") -> None:
+def add_session_member(session_id: str, user_id: int, role: str = "member") -> bool:
+    """Add a member to a session. Returns True if a row was inserted, False
+    if user_id was already a member (existing role is left untouched —
+    re-inviting an admin doesn't downgrade them to member).
+
+    The existence check and the insert are one atomic statement
+    (INSERT ... ON CONFLICT DO NOTHING) rather than a prior
+    is_session_member() SELECT — a check-then-act split would let two
+    concurrent invites for the same (session_id, user_id) both see "not a
+    member" and both attempt the insert, and the loser would hit the
+    UNIQUE(session_id, user_id) constraint as an unhandled IntegrityError
+    instead of the idempotent no-op callers expect.
+    """
     with _connect() as conn:
-        conn.execute("""
+        cursor = conn.execute("""
             INSERT INTO session_members (session_id, user_id, role)
             VALUES (?, ?, ?)
+            ON CONFLICT(session_id, user_id) DO NOTHING
         """, (session_id, user_id, role))
+        return cursor.rowcount > 0
 
 
 def list_session_members(session_id: str) -> list[dict]:
