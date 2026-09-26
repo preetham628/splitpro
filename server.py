@@ -419,7 +419,13 @@ def approve_proposal(
     try:
         return db.decide_proposal(proposal_id, user["id"], "approved")
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        # _require_proposal_in_session already confirmed the proposal exists
+        # in this session, so a ValueError here means decide_proposal's own
+        # `WHERE status = 'pending'` guard rejected it — i.e. someone else
+        # already decided it between that check and this call. That's a
+        # conflict with the proposal's current state, not a missing
+        # resource, so 409 rather than 404.
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.post("/api/sessions/{session_id}/proposals/{proposal_id}/reject")
@@ -435,7 +441,9 @@ def reject_proposal(
     try:
         return db.decide_proposal(proposal_id, user["id"], "rejected")
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        # See the matching comment in approve_proposal — already-decided is
+        # a conflict (409), not a missing resource (404).
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 # ---------- Chat Endpoints ----------
