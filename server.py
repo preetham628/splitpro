@@ -5,7 +5,7 @@ Run with: uvicorn server:app --reload
 
 import base64
 import secrets
-from typing import Optional
+from typing import Literal, Optional
 from uuid import uuid4
 
 from contextlib import asynccontextmanager
@@ -81,6 +81,14 @@ class RenameRequest(BaseModel):
     name: str
 
 
+class AddMemberRequest(BaseModel):
+    email: str
+
+
+class UpdateRoleRequest(BaseModel):
+    role: Literal["admin", "member"]
+
+
 # ---------- Helpers ----------
 
 def _chat_config(req: SessionRequest = None) -> ChatAgentConfig:
@@ -141,8 +149,7 @@ def _get_agent(session_id: str, user: dict) -> ChatAgent:
     ChatAgent.chat() picks it up transparently on the next invoke(). Only
     the bill-splitting SessionState needs to be reloaded explicitly.
     """
-    if not db.session_belongs_to_user(session_id, user["id"]):
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    _require_member(session_id, user)
 
     if session_id in sessions:
         return sessions[session_id]
@@ -171,6 +178,20 @@ def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
     if agent.state.bills:
         return agent.state.bills[0].description
     return None
+
+
+def _require_member(session_id: str, user: dict) -> None:
+    """Any member (admin or not) may access the session. 404 rather than 403
+    on failure — matches the existing behavior of not leaking whether a
+    session exists to a caller with no access to it."""
+    if not db.is_session_member(session_id, user["id"]):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+
+def _require_admin(session_id: str, user: dict) -> None:
+    _require_member(session_id, user)
+    if not db.is_session_admin(session_id, user["id"]):
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 
 # ---------- Auth Endpoints ----------
@@ -255,6 +276,7 @@ def create_session(
     sessions[session_id] = agent
 
     db.create_session(session_id, user["id"], name="New Session")
+    db.add_session_member(session_id, user["id"], role="admin")
     _save_agent(session_id, agent)
 
     return {
@@ -270,8 +292,9 @@ def rename_session(
     req: RenameRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Rename a session."""
-    updated = db.rename_session(session_id, user["id"], req.name)
+    """Rename a session. Any member may rename — no admin requirement."""
+    _require_member(session_id, user)
+    updated = db.rename_session_by_id(session_id, req.name)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"name": req.name}
@@ -279,8 +302,9 @@ def rename_session(
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, user: dict = Depends(get_current_user)):
-    """Delete a session."""
-    deleted = db.delete_session(session_id, user["id"])
+    """Delete a session. Admin only."""
+    _require_admin(session_id, user)
+    deleted = db.delete_session_by_id(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
     checkpointer.delete_thread(session_id)
@@ -321,14 +345,15 @@ def get_state(session_id: str, user: dict = Depends(get_current_user)):
 @app.get("/sessions/{session_id}/messages")
 def get_messages(session_id: str, user: dict = Depends(get_current_user)):
     """Full chat transcript for replay when a session is reopened."""
-    if not db.session_belongs_to_user(session_id, user["id"]):
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    _require_member(session_id, user)
     return db.list_chat_messages(session_id)
 
 
 @app.delete("/sessions/{session_id}")
 def end_session(session_id: str, user: dict = Depends(get_current_user)):
-    db.delete_session(session_id, user["id"])
+    """Duplicate of DELETE /api/sessions/{session_id} (no /api prefix). Admin only."""
+    _require_admin(session_id, user)
+    db.delete_session_by_id(session_id)
     checkpointer.delete_thread(session_id)
     sessions.pop(session_id, None)
     return {"ok": True}
