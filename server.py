@@ -389,14 +389,27 @@ def rename_session(
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, user: dict = Depends(get_current_user)):
-    """Delete a session. Admin only."""
+    """Delete a session. Admin only.
+
+    Takes the same per-session lock _run_chat_turn holds for the whole
+    turn, so this can't interleave with an in-flight chat/image turn for
+    this session — without it, deleting mid-turn (cascading away the bills
+    a concurrent turn is about to save against) turned that turn's later
+    save into an unhandled IntegrityError instead of either finishing
+    cleanly first or failing with a clean 404. Dropping the lock entry
+    afterward (success or already-gone) means a lock is never left behind
+    for a session_id that no longer exists.
+    """
     _require_admin(session_id, user)
-    deleted = db.delete_session_by_id(session_id)
+    with _get_session_lock(session_id):
+        deleted = db.delete_session_by_id(session_id)
+        if deleted:
+            checkpointer.delete_thread(session_id)
+            sessions.pop(session_id, None)
+    _drop_session_lock(session_id)
+
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
-    checkpointer.delete_thread(session_id)
-    sessions.pop(session_id, None)
-    _drop_session_lock(session_id)
     return {"ok": True}
 
 
@@ -600,7 +613,12 @@ async def upload_image(
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
     analyzer = ImageAnalyzer(app_config.image_analyzer)
-    result = analyzer.analyze(image_bytes, media_type=content_type)
+    # analyzer.analyze() is a synchronous call out to the vision model — the
+    # same event-loop-blocking hazard the chat-turn lock had (a slow model
+    # response or provider outage would otherwise stall the entire loop for
+    # every session, not just this request), so it gets the same to_thread
+    # treatment.
+    result = await asyncio.to_thread(analyzer.analyze, image_bytes, media_type=content_type)
 
     if result.is_bill:
         agent_message = (
