@@ -330,7 +330,9 @@ def add_member(
     """Add an existing user (by email) to a session. Admin only.
 
     Idempotent: adding someone who's already a member is a 200 no-op
-    rather than a duplicate-row error.
+    rather than a duplicate-row error — db.add_session_member does the
+    existence check and the insert as one atomic statement, so this is
+    also race-safe against a concurrent duplicate invite.
     """
     _require_admin(session_id, user)
 
@@ -341,10 +343,9 @@ def add_member(
             detail="User not found — they must sign in at least once before being added",
         )
 
-    if db.is_session_member(session_id, target["id"]):
+    inserted = db.add_session_member(session_id, target["id"], role="member")
+    if not inserted:
         return JSONResponse(status_code=200, content={"ok": True, "already_member": True})
-
-    db.add_session_member(session_id, target["id"], role="member")
     return {"ok": True, "already_member": False}
 
 

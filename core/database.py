@@ -470,12 +470,26 @@ def get_user_by_email(email: str) -> Optional[dict]:
 
 # ---------- Session membership ----------
 
-def add_session_member(session_id: str, user_id: int, role: str = "member") -> None:
+def add_session_member(session_id: str, user_id: int, role: str = "member") -> bool:
+    """Add a member to a session. Returns True if a row was inserted, False
+    if user_id was already a member (existing role is left untouched —
+    re-inviting an admin doesn't downgrade them to member).
+
+    The existence check and the insert are one atomic statement
+    (INSERT ... ON CONFLICT DO NOTHING) rather than a prior
+    is_session_member() SELECT — a check-then-act split would let two
+    concurrent invites for the same (session_id, user_id) both see "not a
+    member" and both attempt the insert, and the loser would hit the
+    UNIQUE(session_id, user_id) constraint as an unhandled IntegrityError
+    instead of the idempotent no-op callers expect.
+    """
     with _connect() as conn:
-        conn.execute("""
+        cursor = conn.execute("""
             INSERT INTO session_members (session_id, user_id, role)
             VALUES (?, ?, ?)
+            ON CONFLICT(session_id, user_id) DO NOTHING
         """, (session_id, user_id, role))
+        return cursor.rowcount > 0
 
 
 def list_session_members(session_id: str) -> list[dict]:
