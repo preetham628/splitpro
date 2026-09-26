@@ -10,18 +10,25 @@ to an already-approved bill through a superseding correction proposal.
 
 Per-turn speaker identity is passed as a LangChain RunnableConfig
 (`config={"configurable": {"speaker_user_id": ...}}`) rather than any state
-on the ChatAgent instance — that's what lets two "requests" for the same
-session use different speakers without racing each other (see
-test_concurrent_speakers_do_not_leak_across_invocations below).
+on the ChatAgent instance — that's what lets two concurrent chat() calls for
+the same session use different speakers without racing each other (see
+test_concurrent_speakers_do_not_leak_across_chat_calls below, which forces
+real thread interleaving through ChatAgent.chat() itself — the same pattern
+tests/test_database.py uses for its own concurrency tests).
 
 Each test gets its own fresh scratch SQLite file (tmp_path), same pattern as
 tests/test_database.py.
 """
 
-import pytest
+import threading
+import uuid
 
-from agents.chat_agent import _build_tools, _pending_proposals_summary
-from core import database as db
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+
+from agents.chat_agent import ChatAgent, _build_tools, _pending_proposals_summary
+from config import ChatAgentConfig
+from core import checkpointer, database as db
 from core.session_state import SessionState
 
 
@@ -220,6 +227,43 @@ def test_correction_to_approved_bill_creates_superseding_proposal(fresh_db):
     assert final_state.bills[0].paid_by == "Alice"
 
 
+def test_known_bill_ids_dedupes_a_correction_sharing_its_approved_bills_id(fresh_db):
+    """A pending correction proposal reuses its target bill's app-level
+    bill_id (see decide_proposal() in core/database.py) — so once one
+    exists, that id is legitimately in both state.bills and the pending
+    list at once. The 'Known bills' error list must show it once, not twice."""
+    admin = make_user("admin@example.com", "g-admin9")
+    alice = make_user("alice@example.com", "g-alice9")
+    bob = make_user("bob@example.com", "g-bob9")
+    session_id = "sess-dedupe-1"
+    make_session_with_members(session_id, admin["id"], alice["id"], bob["id"])
+
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    db.save_session_state(session_id, state, [])
+
+    add_bill, *_rest = _build_tools(state, session_id)
+    add_bill.invoke(one_item_bill(), config=as_speaker(alice["id"]))
+    proposal = db.list_pending_proposals(session_id)[0]
+    bill_id = proposal["payload"]["bill_id"]
+    db.decide_proposal(proposal["id"], admin["id"], "approved")
+
+    approved_state = SessionState.from_dict(db.load_session_state(session_id))
+    _add2, _set_p2, assign_items2, set_payer2, _mark2, _calc2 = _build_tools(approved_state, session_id)
+
+    # Propose a correction (same bill_id) so it now exists in BOTH
+    # approved_state.bills and the pending-proposals list simultaneously.
+    set_payer2.invoke({"bill_id": bill_id, "paid_by": "Alice"}, config=as_speaker(bob["id"]))
+    assert len(db.list_pending_proposals(session_id)) == 1
+
+    msg = assign_items2.invoke({
+        "bill_id": "bill_does_not_exist",
+        "assignments": [{"item_name": "Pizza", "assigned_to": ["Alice"]}],
+    }, config=as_speaker(bob["id"]))
+
+    assert msg.count(bill_id) == 1, f"expected '{bill_id}' exactly once in: {msg}"
+
+
 # ---------- mark_items_unassigned check ordering ----------
 
 def test_mark_items_unassigned_reports_bill_not_found_before_participants_check(fresh_db):
@@ -260,37 +304,110 @@ def test_mark_items_unassigned_requires_participants_once_bill_exists(fresh_db):
 
 # ---------- Concurrency safety ----------
 
-def test_concurrent_speakers_do_not_leak_across_invocations(fresh_db):
-    """Regression test for the race the old self._current_user_id design had:
-    two tool invocations for the same cached tool closures, each carrying its
-    own RunnableConfig, must never see each other's speaker_user_id — there's
-    no shared mutable attribute for one call to clobber before the other
-    reads it."""
+class _StallingToolCallLLM:
+    """Stand-in chat model — no live API calls, no API key needed — that
+    reproduces the exact race window the old self._current_user_id design
+    lived in: Alice's chat() call reaches the model, then genuinely BLOCKS
+    (a real thread, parked on a real Event) for as long as a slow network
+    round-trip would take, while Bob's entire chat() turn — including his
+    own tool execution — runs to completion on the very same cached
+    ChatAgent instance. Only once Bob is fully done does Alice's call
+    proceed to actually run her tool. Under the old design this is exactly
+    when self._current_user_id would have already been overwritten to
+    bob_id by Bob's chat() call; under the config-threaded fix, Alice's own
+    speaker_user_id was captured into her own call's config before the
+    model was ever invoked, so it can't have been touched by Bob's turn.
+
+    Distinguishes turns by the "[Alice]"/"[Bob]" prefix ChatAgent.chat()
+    puts on message content, and by whether the latest message is the
+    original HumanMessage (need a tool call) or the ToolMessage that comes
+    back after the tool ran (turn is done) — mirroring how a real
+    tool-calling model would behave across the two agent-node visits per turn.
+    """
+
+    def __init__(self):
+        self.alice_llm_called = threading.Event()
+        self.bob_turn_done = threading.Event()
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        last = messages[-1]
+        if isinstance(last, HumanMessage):
+            if last.content.startswith("[Alice]"):
+                self.alice_llm_called.set()
+                assert self.bob_turn_done.wait(timeout=5), "Bob's turn never completed"
+                return AIMessage(content="", tool_calls=[{
+                    "name": "add_bill",
+                    "id": "call-alice-1",
+                    "args": {
+                        "raw_text": "r", "description": "Alice's bill",
+                        "items": [{"name": "Pizza", "price": 10.0}], "tax": 0.0, "tip": 0.0,
+                    },
+                }])
+            if last.content.startswith("[Bob]"):
+                assert self.alice_llm_called.wait(timeout=5), "Alice's LLM call never started"
+                return AIMessage(content="", tool_calls=[{
+                    "name": "add_bill",
+                    "id": "call-bob-1",
+                    "args": {
+                        "raw_text": "r", "description": "Bob's bill",
+                        "items": [{"name": "Soda", "price": 5.0}], "tax": 0.0, "tip": 0.0,
+                    },
+                }])
+        return AIMessage(content="ok")  # second agent-node visit, after the tool ran: end the turn
+
+
+def test_concurrent_speakers_do_not_leak_across_chat_calls(fresh_db, monkeypatch):
+    """Regression test for the self._current_user_id race: two real threads
+    call ChatAgent.chat() concurrently on the SAME cached agent/session —
+    the actual object and code path the original bug lived in — with
+    Alice's model call forced to stall until Bob's whole turn has finished.
+    A reintroduction of shared mutable per-turn identity on `self` would
+    misattribute Alice's proposal to Bob here; the config-threaded fix does not.
+    """
     admin = make_user("admin@example.com", "g-admin7")
     alice = make_user("alice@example.com", "g-alice7")
     bob = make_user("bob@example.com", "g-bob7")
-    session_id = "sess-concurrent-1"
+    session_id = str(uuid.uuid4())
     make_session_with_members(session_id, admin["id"], alice["id"], bob["id"])
 
-    state = SessionState()
-    add_bill, *_rest = _build_tools(state, session_id)
+    fake_llm = _StallingToolCallLLM()
+    monkeypatch.setattr("agents.chat_agent.create_llm", lambda config: fake_llm)
+    checkpointer.init_checkpointer(":memory:")
 
-    # Interleave "Alice's call" and "Bob's call" manually, the way two
-    # threads racing through the same cached ChatAgent's tools could.
-    alice_bill = one_item_bill(price=10.0)
-    alice_bill["description"] = "Alice's bill"
-    bob_bill = one_item_bill(price=20.0)
-    bob_bill["description"] = "Bob's bill"
+    agent = ChatAgent(session_id=session_id, config=ChatAgentConfig())
 
-    msg_alice = add_bill.invoke(alice_bill, config=as_speaker(alice["id"]))
-    msg_bob = add_bill.invoke(bob_bill, config=as_speaker(bob["id"]))
+    results = {}
 
+    def alice_call():
+        results["alice"] = agent.chat(
+            "we had pizza", speaker_name="Alice", speaker_user_id=alice["id"]
+        )
+
+    def bob_call():
+        results["bob"] = agent.chat(
+            "we had soda", speaker_name="Bob", speaker_user_id=bob["id"]
+        )
+        fake_llm.bob_turn_done.set()
+
+    t_alice = threading.Thread(target=alice_call)
+    t_bob = threading.Thread(target=bob_call)
+    t_alice.start()
+    t_bob.start()
+    t_alice.join(timeout=10)
+    t_bob.join(timeout=10)
+
+    assert not t_alice.is_alive(), "Alice's chat() call never returned"
+    assert not t_bob.is_alive(), "Bob's chat() call never returned"
+
+    # The fake LLM's canned final reply ("ok") isn't what's under test here —
+    # what matters is which user each proposal actually landed under.
     pending = db.list_pending_proposals(session_id)
     by_description = {p["payload"]["description"]: p for p in pending}
     assert by_description["Alice's bill"]["proposed_by"] == alice["id"]
     assert by_description["Bob's bill"]["proposed_by"] == bob["id"]
-    assert "awaiting admin approval" in msg_alice
-    assert "awaiting admin approval" in msg_bob
 
 
 # ---------- Pending-proposal visibility in the system prompt ----------

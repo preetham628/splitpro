@@ -145,11 +145,19 @@ def _known_bill_ids(state: SessionState, session_id: str, user_id: Optional[int]
     bills plus, in DB-backed mode, still-pending proposals — otherwise a
     bill the model just proposed (and was told about via the tool's own
     return value) would vanish from this list on the very next tool call
-    that references it, since it's not in state.bills yet."""
+    that references it, since it's not in state.bills yet.
+
+    A pending correction proposal reuses its target bill's app-level
+    bill_id (that's how it's matched back up on approval — see
+    decide_proposal() in core/database.py), so the same id can legitimately
+    appear in both state.bills and the pending list at once; dict.fromkeys
+    dedupes while preserving order, since a caller-facing list showing the
+    same id twice would just be confusing, not more informative.
+    """
     ids = [b.bill_id for b in state.bills]
     if user_id is not None:
         ids += [p["payload"]["bill_id"] for p in db.list_pending_proposals(session_id)]
-    return ids
+    return list(dict.fromkeys(ids))
 
 
 def _pending_proposals_summary(session_id: str) -> str:
