@@ -252,13 +252,20 @@ def get_user_by_id(user_id: int) -> Optional[dict]:
 # ---------- Sessions ----------
 
 def list_sessions(user_id: int) -> list[dict]:
-    """Return all sessions for a user, newest first."""
+    """Return every session user_id is a member of (not just ones they
+    created), newest first. Membership, not chat_sessions.user_id, is the
+    access model now — every session gets a session_members row for its
+    creator (see create_session's caller in server.py, and _migrate_membership
+    for pre-existing rows), so this join always includes what the old
+    owner-only query returned, plus sessions the user was only invited to.
+    """
     with _connect() as conn:
         rows = conn.execute("""
-            SELECT id, name, created_at, updated_at
-            FROM chat_sessions
-            WHERE user_id = ?
-            ORDER BY updated_at DESC
+            SELECT cs.id, cs.name, cs.created_at, cs.updated_at
+            FROM chat_sessions cs
+            JOIN session_members sm ON sm.session_id = cs.id
+            WHERE sm.user_id = ?
+            ORDER BY cs.updated_at DESC
         """, (user_id,)).fetchall()
         return [dict(r) for r in rows]
 
