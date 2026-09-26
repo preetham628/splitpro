@@ -463,8 +463,15 @@ def session_belongs_to_user(session_id: str, user_id: int) -> bool:
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
+    """Case-insensitive lookup — email addresses aren't case-sensitive in
+    practice, and a plain `=` comparison here previously made inviting
+    "Bob@Example.com" fail to find an account stored as "bob@example.com",
+    surfacing as the same 404 as "this person has never signed in."
+    """
     with _connect() as conn:
-        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,)
+        ).fetchone()
         return dict(row) if row else None
 
 
