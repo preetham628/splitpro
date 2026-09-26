@@ -10,9 +10,11 @@ Usage:
 """
 
 import argparse
+import uuid
 from dotenv import load_dotenv
 from agents.chat_agent import ChatAgent
 from config import ChatAgentConfig, load_config
+from core import checkpointer
 
 load_dotenv()
 
@@ -50,8 +52,13 @@ def main():
     print(WELCOME)
     print(f"Using provider: {chat_config.provider}\n")
 
+    # ChatAgent's graph is checkpointed by session_id (thread_id) — the CLI
+    # has no real session of its own, so it mints a throwaway one backed by
+    # an in-memory checkpoint store that lives only for this process.
+    checkpointer.init_checkpointer(":memory:")
+
     try:
-        agent = ChatAgent(config=chat_config)
+        agent = ChatAgent(session_id=str(uuid.uuid4()), config=chat_config)
     except (ValueError, ImportError) as e:
         print(f"Error: {e}")
         return
