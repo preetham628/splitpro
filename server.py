@@ -312,6 +312,81 @@ def delete_session(session_id: str, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+# ---------- Session Membership Endpoints ----------
+
+@app.get("/api/sessions/{session_id}/members")
+def list_members(session_id: str, user: dict = Depends(get_current_user)):
+    """List a session's members. Any member may view the roster."""
+    _require_member(session_id, user)
+    return db.list_session_members(session_id)
+
+
+@app.post("/api/sessions/{session_id}/members", status_code=201)
+def add_member(
+    session_id: str,
+    req: AddMemberRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Add an existing user (by email) to a session. Admin only.
+
+    Idempotent: adding someone who's already a member is a 200 no-op
+    rather than a duplicate-row error.
+    """
+    _require_admin(session_id, user)
+
+    target = db.get_user_by_email(req.email)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found — they must sign in at least once before being added",
+        )
+
+    if db.is_session_member(session_id, target["id"]):
+        return JSONResponse(status_code=200, content={"ok": True, "already_member": True})
+
+    db.add_session_member(session_id, target["id"], role="member")
+    return {"ok": True, "already_member": False}
+
+
+@app.delete("/api/sessions/{session_id}/members/{target_user_id}")
+def remove_member(
+    session_id: str,
+    target_user_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Remove a member from a session. Admin only."""
+    _require_admin(session_id, user)
+
+    try:
+        removed = db.remove_session_member(session_id, target_user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not removed:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"ok": True}
+
+
+@app.patch("/api/sessions/{session_id}/members/{target_user_id}/role")
+def update_member_role(
+    session_id: str,
+    target_user_id: int,
+    req: UpdateRoleRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Change a member's role. Admin only."""
+    _require_admin(session_id, user)
+
+    try:
+        updated = db.update_member_role(session_id, target_user_id, req.role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"role": req.role}
+
+
 # ---------- Chat Endpoints ----------
 
 @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
