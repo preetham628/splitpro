@@ -5,6 +5,7 @@ Run with: uvicorn server:app --reload
 
 import base64
 import secrets
+import threading
 from typing import Literal, Optional
 from uuid import uuid4
 
@@ -60,6 +61,24 @@ app.add_middleware(
 # In-memory session cache: session_id -> ChatAgent (write-through with SQLite)
 sessions: dict[str, ChatAgent] = {}
 
+# Per-session lock guarding agent.chat() calls — a session can now have real
+# concurrent senders (multiple members messaging at once), and while Task 3's
+# speaker-identity fix means they can no longer misattribute proposals to the
+# wrong user, concurrent turns could still interleave against the same
+# SessionState/checkpoint thread (e.g. two turns reading/writing agent.state
+# at once). Serializing chat() per session_id avoids that.
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    with _session_locks_guard:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_id] = lock
+        return lock
+
 
 # ---------- Request / Response models ----------
 
@@ -100,10 +119,11 @@ def _chat_config(req: SessionRequest = None) -> ChatAgentConfig:
     )
 
 
-def _serialize_state(state: SessionState) -> dict:
+def _serialize_state(state: SessionState, session_id: str) -> dict:
     """Convert SessionState to a JSON-serializable dict for the UI."""
     return {
         "participants": state.participants,
+        "pending_proposals_count": len(db.list_pending_proposals(session_id)),
         "bills": [
             {
                 "bill_id": bill.bill_id,
@@ -455,25 +475,28 @@ def chat(
     user: dict = Depends(get_current_user),
 ):
     agent = _get_agent(session_id, user)
-    prev_bill_count = len(agent.state.bills)
+    speaker_name = user["name"] or user["email"]
 
-    response = agent.chat(req.message)
-    db.add_chat_message(session_id, "user", req.message)
-    db.add_chat_message(session_id, "agent", response)
+    with _get_session_lock(session_id):
+        prev_bill_count = len(agent.state.bills)
+        response = agent.chat(req.message, speaker_name=speaker_name, speaker_user_id=user["id"])
+        db.add_chat_message(session_id, "user", req.message, user_id=user["id"])
+        db.add_chat_message(session_id, "agent", response)
 
-    # Auto-rename session when first bill is added
-    new_name: Optional[str] = None
-    if len(agent.state.bills) > prev_bill_count:
-        new_name = _session_name_from_agent(agent)
+        # Auto-rename session when first bill is added
+        new_name: Optional[str] = None
+        if len(agent.state.bills) > prev_bill_count:
+            new_name = _session_name_from_agent(agent)
 
-    _save_agent(session_id, agent, name=new_name)
-    return ChatResponse(response=response, state=_serialize_state(agent.state))
+        _save_agent(session_id, agent, name=new_name)
+
+    return ChatResponse(response=response, state=_serialize_state(agent.state, session_id))
 
 
 @app.get("/sessions/{session_id}/state")
 def get_state(session_id: str, user: dict = Depends(get_current_user)):
     agent = _get_agent(session_id, user)
-    return _serialize_state(agent.state)
+    return _serialize_state(agent.state, session_id)
 
 
 @app.get("/sessions/{session_id}/messages")
@@ -507,8 +530,6 @@ async def upload_image(
     analyzer = ImageAnalyzer(app_config.image_analyzer)
     result = analyzer.analyze(image_bytes, media_type=content_type)
 
-    prev_bill_count = len(agent.state.bills)
-
     if result.is_bill:
         agent_message = (
             f"I've scanned a receipt image. Here are the contents:\n\n{result.bill_text}"
@@ -520,16 +541,24 @@ async def upload_image(
             f"Tell the user what you see and ask them to upload a receipt image instead."
         )
 
-    response = agent.chat(agent_message)
-    db.add_chat_message(session_id, "user", "", image_base64=image_b64, image_media_type=content_type)
-    db.add_chat_message(session_id, "agent", response)
+    speaker_name = user["name"] or user["email"]
 
-    new_name: Optional[str] = None
-    if len(agent.state.bills) > prev_bill_count:
-        new_name = _session_name_from_agent(agent)
+    with _get_session_lock(session_id):
+        prev_bill_count = len(agent.state.bills)
+        response = agent.chat(agent_message, speaker_name=speaker_name, speaker_user_id=user["id"])
+        db.add_chat_message(
+            session_id, "user", "", image_base64=image_b64, image_media_type=content_type,
+            user_id=user["id"],
+        )
+        db.add_chat_message(session_id, "agent", response)
 
-    _save_agent(session_id, agent, name=new_name)
-    return ChatResponse(response=response, state=_serialize_state(agent.state))
+        new_name: Optional[str] = None
+        if len(agent.state.bills) > prev_bill_count:
+            new_name = _session_name_from_agent(agent)
+
+        _save_agent(session_id, agent, name=new_name)
+
+    return ChatResponse(response=response, state=_serialize_state(agent.state, session_id))
 
 
 @app.get("/health")
