@@ -518,7 +518,7 @@ def approve_proposal(
     _require_proposal_in_session(session_id, proposal_id)
 
     try:
-        return db.decide_proposal(proposal_id, user["id"], "approved")
+        result = db.decide_proposal(proposal_id, user["id"], "approved")
     except ValueError as e:
         # _require_proposal_in_session already confirmed the proposal exists
         # in this session, so a ValueError here means decide_proposal's own
@@ -527,6 +527,18 @@ def approve_proposal(
         # conflict with the proposal's current state, not a missing
         # resource, so 409 rather than 404.
         raise HTTPException(status_code=409, detail=str(e))
+
+    # decide_proposal already wrote the bill straight to the DB, but the
+    # in-memory cached agent for this session still holds the pre-approval
+    # SessionState. Left alone, the next chat turn's normal write-through
+    # save (delete + reinsert from that stale cache) would wipe the bill we
+    # just approved. Evict so the next access rebuilds fresh from DB — same
+    # pattern delete_session uses — under the session lock so this can't
+    # race a concurrent in-flight chat turn's read/write of the same entry.
+    with _get_session_lock(session_id):
+        sessions.pop(session_id, None)
+
+    return result
 
 
 @app.post("/api/sessions/{session_id}/proposals/{proposal_id}/reject")
@@ -540,11 +552,19 @@ def reject_proposal(
     _require_proposal_in_session(session_id, proposal_id)
 
     try:
-        return db.decide_proposal(proposal_id, user["id"], "rejected")
+        result = db.decide_proposal(proposal_id, user["id"], "rejected")
     except ValueError as e:
         # See the matching comment in approve_proposal — already-decided is
         # a conflict (409), not a missing resource (404).
         raise HTTPException(status_code=409, detail=str(e))
+
+    # See the matching comment in approve_proposal — evict the stale cached
+    # agent so the next chat turn's write-through save doesn't clobber the
+    # decision we just persisted.
+    with _get_session_lock(session_id):
+        sessions.pop(session_id, None)
+
+    return result
 
 
 # ---------- Chat Endpoints ----------
@@ -555,7 +575,8 @@ def chat(
     req: ChatRequest,
     user: dict = Depends(get_current_user),
 ):
-    speaker_name = user["name"] or user["email"]
+    user_row = db.get_user_by_id(user["id"])
+    speaker_name = user_row["name"] or user_row["email"]
     response, state = _run_chat_turn(
         session_id,
         user,
@@ -631,7 +652,8 @@ async def upload_image(
             f"Tell the user what you see and ask them to upload a receipt image instead."
         )
 
-    speaker_name = user["name"] or user["email"]
+    user_row = db.get_user_by_id(user["id"])
+    speaker_name = user_row["name"] or user_row["email"]
 
     # _run_chat_turn is synchronous and holds a plain threading.Lock for its
     # duration — run it off the event loop thread so lock contention on a

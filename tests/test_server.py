@@ -16,15 +16,18 @@ framework, and `Depends(...)` default values are simply not triggered when a
 real value is passed explicitly.
 """
 
+import asyncio
+import io
 import threading
 import time
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 
 import server
 from agents.chat_agent import ChatAgent
+from agents.image_analyzer import ImageAnalysisResult, ImageAnalyzer
 from core import checkpointer, database as db
 from core.session_state import ParsedBill
 
@@ -56,6 +59,21 @@ def make_session_with_members(*users, admin_index=0):
     for i, u in enumerate(users):
         db.add_session_member(session_id, u["id"], role="admin" if i == admin_index else "member")
     return session_id
+
+
+def sample_payload(bill_id="bill_1", description="Dinner"):
+    return {
+        "bill_id": bill_id,
+        "description": description,
+        "raw_text": "raw text",
+        "items": [
+            {"name": "Burger", "price": 10.0, "qty": 1, "assigned_to": ["Alice"],
+             "shared": False, "unassigned": False, "qty_allocations": {}}
+        ],
+        "tax": 1.0,
+        "tip": 2.0,
+        "paid_by": "Alice",
+    }
 
 
 # ---------- Concurrent first-touch race (cache-miss check-then-act) ----------
@@ -174,3 +192,139 @@ def test_turn_after_delete_gets_clean_404(fresh_server):
     with pytest.raises(HTTPException) as exc_info:
         server.chat(session_id, server.ChatRequest(message="hello"), admin)
     assert exc_info.value.status_code == 404
+
+
+# ---------- get_current_user's real shape vs. chat()/upload_image() ----------
+#
+# get_current_user() only ever returns {"id": ...} (see core/auth.py) — it
+# never carries "name" or "email". make_user()'s dicts (used above) are
+# richer than that and would mask a regression here, so these tests build
+# the `user` dependency value the same minimal way the real dependency does.
+
+def _real_shaped_user(row: dict) -> dict:
+    return {"id": row["id"]}
+
+
+def test_chat_does_not_crash_on_get_current_user_shaped_dict(fresh_server, monkeypatch):
+    """chat() must not do user["name"]/user["email"] directly — the real
+    get_current_user() dependency returns only {"id": ...}, so that raises an
+    unhandled KeyError (a 500) for every real request. It must instead look
+    the full row up via db.get_user_by_id, like auth_me already does."""
+    captured = {}
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        captured["speaker_name"] = speaker_name
+        return f"echo: {user_message}"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+
+    alice_row = make_user("alice@example.com", "g-alice", "Alice")
+    session_id = make_session_with_members(alice_row)
+
+    result = server.chat(
+        session_id, server.ChatRequest(message="hi"), _real_shaped_user(alice_row)
+    )
+
+    assert result.response == "echo: hi"
+    assert captured["speaker_name"] == "Alice"
+
+
+def test_chat_falls_back_to_email_when_name_blank(fresh_server, monkeypatch):
+    captured = {}
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        captured["speaker_name"] = speaker_name
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+
+    row = db.upsert_user(google_id="g-noname", email="noname@example.com", name="", avatar_url="")
+    session_id = make_session_with_members(row)
+
+    server.chat(session_id, server.ChatRequest(message="hi"), _real_shaped_user(row))
+
+    assert captured["speaker_name"] == "noname@example.com"
+
+
+def test_upload_image_does_not_crash_on_get_current_user_shaped_dict(fresh_server, monkeypatch):
+    """Same KeyError hazard as chat(), for upload_image()'s identical
+    speaker_name = user["name"] or user["email"] line."""
+    captured = {}
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        captured["speaker_name"] = speaker_name
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+    monkeypatch.setattr(
+        ImageAnalyzer,
+        "analyze",
+        lambda self, image_bytes, media_type="image/jpeg": ImageAnalysisResult(
+            is_bill=False, description="a cat", message="not a bill", bill_text=""
+        ),
+    )
+
+    alice_row = make_user("alice2@example.com", "g-alice2", "Alice")
+    session_id = make_session_with_members(alice_row)
+
+    upload = UploadFile(filename="photo.jpg", file=io.BytesIO(b"fake-bytes"))
+
+    result = asyncio.run(
+        server.upload_image(session_id, upload, _real_shaped_user(alice_row))
+    )
+
+    assert result.response == "ok"
+    assert captured["speaker_name"] == "Alice"
+
+
+# ---------- Proposal approval must invalidate the cached agent ----------
+
+def test_approve_proposal_evicts_cache_so_next_turn_keeps_the_bill(fresh_server, monkeypatch):
+    """approve_proposal writes the bill straight to the DB but, before this
+    fix, left the in-memory cached agent (built pre-approval) untouched. The
+    next chat turn's normal write-through save then deleted+reinserted bills
+    from that stale, bill-less cache — silently destroying the just-approved
+    bill. Regression test for the full propose -> approve -> verify cycle."""
+
+    def noop_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", noop_chat)
+
+    admin = make_user("admin3@example.com", "g-admin3", "Admin3")
+    session_id = make_session_with_members(admin)
+
+    # Prime the cache with a pre-approval (bill-less) agent, exactly as a
+    # normal GET .../state or chat turn would before any proposal exists.
+    server.get_state(session_id, admin)
+    assert session_id in server.sessions
+    assert server.sessions[session_id].state.bills == []
+
+    pid = db.create_proposal(session_id, admin["id"], sample_payload())
+    server.approve_proposal(session_id, pid, admin)
+
+    # The bill must be immediately visible via the served state, not just
+    # in the DB underneath a stale cache.
+    state = server.get_state(session_id, admin)
+    assert [b["description"] for b in state["bills"]] == ["Dinner"]
+
+    # One more normal chat turn must not wipe it back out.
+    server.chat(session_id, server.ChatRequest(message="thanks"), admin)
+
+    persisted = db.load_session_state(session_id)
+    assert [b["description"] for b in persisted["bills"]] == ["Dinner"]
+
+
+def test_reject_proposal_evicts_cache(fresh_server, monkeypatch):
+    monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
+
+    admin = make_user("admin4@example.com", "g-admin4", "Admin4")
+    session_id = make_session_with_members(admin)
+
+    server.get_state(session_id, admin)
+    assert session_id in server.sessions
+
+    pid = db.create_proposal(session_id, admin["id"], sample_payload())
+    server.reject_proposal(session_id, pid, admin)
+
+    assert session_id not in server.sessions
