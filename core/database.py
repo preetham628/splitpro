@@ -594,6 +594,21 @@ def remove_session_member(session_id: str, user_id: int) -> bool:
 
 # ---------- Expense proposals ----------
 
+def get_bill_row_id(session_id: str, bill_id: str) -> Optional[int]:
+    """Look up a bill's DB surrogate row id (bills.id) by its app-level
+    bill_id, scoped to session_id. Needed when proposing a correction to an
+    already-approved bill: create_proposal()'s supersedes_bill_id wants that
+    row id, but SessionState/ParsedBill only ever carry the app-level
+    bill_id string, not the DB row id it was persisted under.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM bills WHERE session_id = ? AND bill_id = ?",
+            (session_id, bill_id),
+        ).fetchone()
+        return row["id"] if row else None
+
+
 def create_proposal(
     session_id: str,
     proposed_by: int,
