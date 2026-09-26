@@ -91,9 +91,34 @@
 
       <!-- Bill state sidebar -->
       <aside class="state-panel">
-        <h2>Session</h2>
-        <div id="state-content">
-          <p class="muted">No data yet.</p>
+        <div class="state-tabs" id="state-tabs">
+          <button class="state-tab active" data-tab="session">Session</button>
+          <button class="state-tab" data-tab="members">Members</button>
+          <button class="state-tab" data-tab="approvals" id="approvals-tab" hidden>
+            Approvals<span class="tab-badge" id="approvals-tab-badge" hidden></span>
+          </button>
+        </div>
+
+        <div class="state-tab-panel" id="tab-panel-session">
+          <div id="state-content">
+            <p class="muted">No data yet.</p>
+          </div>
+        </div>
+
+        <div class="state-tab-panel hidden" id="tab-panel-members">
+          <div id="members-content">
+            <p class="muted">No data yet.</p>
+          </div>
+          <div class="invite-row">
+            <input type="email" id="invite-email-input" placeholder="Invite by email…" />
+            <button id="invite-btn">Invite</button>
+          </div>
+        </div>
+
+        <div class="state-tab-panel hidden" id="tab-panel-approvals">
+          <div id="approvals-content">
+            <p class="muted">No pending proposals.</p>
+          </div>
         </div>
       </aside>
 
