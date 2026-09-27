@@ -8,6 +8,11 @@ let currentUser = null;
 let members     = new Map();  // user_id -> {user_id, name, email, avatar_url, role}
 let isCurrentUserAdmin = false;
 let activeTab   = 'session';
+// Bumped by every session-switch/create action (loadSession, createNewSession).
+// Lets a still-in-flight one of those detect a newer navigation has since
+// superseded it, even before the new session's id is known (createNewSession
+// has nothing to compare sessionId against until its POST resolves).
+let navSeq      = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -122,6 +127,7 @@ function renderSessionList(sessions) {
 }
 
 async function createNewSession() {
+  const mySeq = ++navSeq;
   const res = await fetch(`${API}/api/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -129,12 +135,19 @@ async function createNewSession() {
     body: JSON.stringify({}),
   });
   const data = await res.json();
+  // The user may have switched to (or created) a different session via
+  // loadSession/createNewSession while the POST above was in flight — in
+  // that case this call has nothing left to do; making its session active
+  // now would clobber whatever the user has since navigated to.
+  if (mySeq !== navSeq) return;
 
   sessionId = data.session_id;
   providerBadge.textContent = data.provider || '–';
   localStorage.setItem('lastSessionId', sessionId);
 
   await loadSessionList();
+  if (mySeq !== navSeq) return;
+
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">No data yet.</p>';
   membersContent.innerHTML = '<p class="muted">Loading…</p>';
@@ -142,10 +155,12 @@ async function createNewSession() {
 
   setActiveSession(sessionId);
   await loadMembers(sessionId);
+  if (mySeq !== navSeq) return;
   await sendToAgent("Hello, I'm ready to help split some bills.");
 }
 
 async function loadSession(id) {
+  navSeq++;  // supersede any in-flight createNewSession/loadSession call
   sessionId = id;
   localStorage.setItem('lastSessionId', id);
   setActiveSession(id);
@@ -466,9 +481,14 @@ function renderProposals(proposals) {
 }
 
 async function decideProposal(proposalId, decision) {
+  // The user can switch sessions while this is in flight (approve/reject
+  // isn't gated the way isLoading gates chat sends) — re-check before
+  // refreshing the approvals/state panels so a slow decision on a session
+  // the user has since left can't overwrite what's now on screen.
+  const requestSessionId = sessionId;
   try {
     const res = await fetch(
-      `${API}/api/sessions/${sessionId}/proposals/${proposalId}/${decision}`,
+      `${API}/api/sessions/${requestSessionId}/proposals/${proposalId}/${decision}`,
       { method: 'POST', credentials: 'include' },
     );
     if (!res.ok) {
@@ -476,11 +496,15 @@ async function decideProposal(proposalId, decision) {
       alert(err.detail || `Failed to ${decision} proposal.`);
       return;
     }
+    if (requestSessionId !== sessionId) return;
     // A decided proposal changes bills/settlement/pending_proposals_count —
     // refresh both the proposal list and the state panel.
     await loadProposals();
-    const stateRes = await fetch(`${API}/sessions/${sessionId}/state`, { credentials: 'include' });
-    if (stateRes.ok) renderState(await stateRes.json());
+    const stateRes = await fetch(`${API}/sessions/${requestSessionId}/state`, { credentials: 'include' });
+    if (stateRes.ok) {
+      const state = await stateRes.json();
+      if (requestSessionId === sessionId) renderState(state);
+    }
   } catch (err) {
     alert(`Error: ${err.message}`);
   }
@@ -553,10 +577,15 @@ newSessionBtn.addEventListener('click', createNewSession);
 // ── Send helpers ──────────────────────────────────────────────────────────────
 async function sendToAgent(text) {
   if (!sessionId || isLoading) return;
+  // loadSession() isn't gated by isLoading, so the user can switch sessions
+  // while this turn is in flight — capture which session this response
+  // belongs to and re-check before applying it to (what may now be a
+  // different session's) DOM.
+  const requestSessionId = sessionId;
   setLoading(true);
   const typing = appendTyping();
   try {
-    const res  = await fetch(`${API}/sessions/${sessionId}/chat`, {
+    const res  = await fetch(`${API}/sessions/${requestSessionId}/chat`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -564,6 +593,7 @@ async function sendToAgent(text) {
     });
     const data = await res.json();
     typing.remove();
+    if (requestSessionId !== sessionId) return;
     appendBubble('agent', data.response);
     renderState(data.state);
     // Refresh sidebar in case session was auto-renamed
@@ -571,7 +601,7 @@ async function sendToAgent(text) {
     setActiveSession(sessionId);
   } catch (err) {
     typing.remove();
-    appendBubble('agent', `⚠️ Error: ${err.message}`);
+    if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
   }
@@ -579,30 +609,37 @@ async function sendToAgent(text) {
 
 async function sendImageToAgent(file) {
   if (!sessionId || isLoading) return;
+  // See the matching comment in sendToAgent() — loadSession() can run
+  // concurrently with this (it isn't gated by isLoading), so every step
+  // below re-checks it's still acting on the session this upload started in.
+  const requestSessionId = sessionId;
   setLoading(true);
 
   const reader = new FileReader();
-  reader.onload = e => appendBubble('user', '', e.target.result, currentUser.id);
+  reader.onload = e => {
+    if (requestSessionId === sessionId) appendBubble('user', '', e.target.result, currentUser.id);
+  };
   reader.readAsDataURL(file);
 
   const typing = appendTyping();
   try {
     const form = new FormData();
     form.append('file', file);
-    const res  = await fetch(`${API}/sessions/${sessionId}/image`, {
+    const res  = await fetch(`${API}/sessions/${requestSessionId}/image`, {
       method: 'POST',
       credentials: 'include',
       body:   form,
     });
     const data = await res.json();
     typing.remove();
+    if (requestSessionId !== sessionId) return;
     appendBubble('agent', data.response);
     renderState(data.state);
     await loadSessionList();
     setActiveSession(sessionId);
   } catch (err) {
     typing.remove();
-    appendBubble('agent', `⚠️ Error: ${err.message}`);
+    if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
   }
