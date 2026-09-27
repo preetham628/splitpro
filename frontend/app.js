@@ -162,11 +162,19 @@ async function loadSession(id) {
   // tries to use it — re-fetched on every session load, not cached
   // indefinitely, in case the user's role changed since they last opened it.
   await loadMembers(id);
+  // The user may have switched to a different session while any of the
+  // awaits above/below were in flight — `sessionId` (global) would then
+  // point at that newer session while `id` (this call's own session) is
+  // stale. Applying a stale response here would overwrite the now-current
+  // session's messages/state/members with the abandoned one's, so every
+  // checkpoint below bails out instead once that's detected.
+  if (id !== sessionId) return;
 
   try {
     const res = await fetch(`${API}/sessions/${id}/messages`, { credentials: 'include' });
     if (res.ok) {
       const messages = await res.json();
+      if (id !== sessionId) return;
       messages.forEach(m => {
         const imageDataUrl = m.image_base64
           ? `data:${m.image_media_type};base64,${m.image_base64}`
@@ -178,31 +186,41 @@ async function loadSession(id) {
     // Transcript failed to load — chat panel just starts empty for this session.
   }
 
+  if (id !== sessionId) return;
+
   try {
     const res = await fetch(`${API}/sessions/${id}/state`, { credentials: 'include' });
     if (res.ok) {
       const state = await res.json();
+      if (id !== sessionId) return;
       renderState(state);
     }
   } catch {
-    stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+    if (id === sessionId) stateContent.innerHTML = '<p class="muted">No data yet.</p>';
   }
 }
 
 // ── Members / roles ──────────────────────────────────────────────────────────
 async function loadMembers(id) {
+  let list = null;
   try {
     const res = await fetch(`${API}/api/sessions/${id}/members`, { credentials: 'include' });
-    if (res.ok) {
-      const list = await res.json();
-      members = new Map(list.map(m => [m.user_id, m]));
-      const me = members.get(currentUser.id);
-      isCurrentUserAdmin = !!(me && me.role === 'admin');
-    } else {
-      members = new Map();
-      isCurrentUserAdmin = false;
-    }
+    if (res.ok) list = await res.json();
   } catch {
+    // list stays null — treated as a failed fetch below.
+  }
+
+  // Bail out without touching global state if the user has since switched
+  // to a different session — an in-flight fetch for a session that's no
+  // longer current must not clobber the now-current session's member list
+  // or admin flag (see the matching guard in loadSession()).
+  if (id !== sessionId) return;
+
+  if (list) {
+    members = new Map(list.map(m => [m.user_id, m]));
+    const me = members.get(currentUser.id);
+    isCurrentUserAdmin = !!(me && me.role === 'admin');
+  } else {
     members = new Map();
     isCurrentUserAdmin = false;
   }
@@ -383,17 +401,29 @@ function renderProposals(proposals) {
     const items = payload.items || [];
     const tax = payload.tax || 0;
     const tip = payload.tip || 0;
-    const total = items.reduce((sum, i) => sum + i.price * (i.qty || 1), 0) + tax + tip;
+    // item.price is already the line total for all of its qty units (see
+    // LineItem.unit_price / Bill.subtotal in core/session_state.py) — do
+    // not re-multiply by qty here, that double-counts.
+    const total = items.reduce((sum, i) => sum + i.price, 0) + tax + tip;
     const payer = payload.paid_by ? `Paid by ${payload.paid_by}` : 'Payer unknown';
 
     const card = document.createElement('div');
     card.className = 'bill-card proposal-card';
 
-    let html = `<div class="bill-title">${escapeHtml(payload.description || 'Untitled expense')}</div>
+    // p.is_correction (server-computed, freshly checked against live bills
+    // rather than trusted from the stale supersedes_bill_id FK — see
+    // core/database.py's _is_correction) marks a proposal that will
+    // overwrite an existing bill rather than create a new one. Falls back
+    // to false — and the badge just doesn't render — on any backend build
+    // that doesn't send the field yet.
+    const correctionBadge = p.is_correction
+      ? '<span class="proposal-badge">Correction</span>' : '';
+
+    let html = `<div class="bill-title">${escapeHtml(payload.description || 'Untitled expense')}${correctionBadge}</div>
       <div class="bill-meta">${escapeHtml(payer)} · $${total.toFixed(2)}</div>`;
 
     items.forEach(item => {
-      const isUnassigned = !item.assigned_to || item.assigned_to.length === 0;
+      const isUnassigned = item.unassigned || !item.assigned_to || item.assigned_to.length === 0;
       const assignText = isUnassigned
         ? 'unassigned'
         : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');
@@ -703,10 +733,10 @@ function renderState(state) {
       const payer = bill.paid_by ? `Paid by ${bill.paid_by}` : 'Payer unknown';
       html += `<div class="bill-card">
         <div class="bill-title">${escapeHtml(bill.description)}</div>
-        <div class="bill-meta">${payer} · $${bill.total.toFixed(2)}</div>`;
+        <div class="bill-meta">${escapeHtml(payer)} · $${bill.total.toFixed(2)}</div>`;
 
       bill.items.forEach(item => {
-        const isUnassigned = !item.assigned_to || item.assigned_to.length === 0;
+        const isUnassigned = item.unassigned || !item.assigned_to || item.assigned_to.length === 0;
         const assignText   = isUnassigned
           ? 'unassigned'
           : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');

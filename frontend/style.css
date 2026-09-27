@@ -364,6 +364,13 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
 }
 
 /* Proposal cards (approval view) */
+.proposal-badge {
+  display: inline-block; margin-left: 6px;
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .4px; color: var(--accent);
+  background: var(--accent-dim); border-radius: 10px; padding: 1px 7px;
+  vertical-align: middle;
+}
 .proposal-actions { display: flex; gap: 8px; margin-top: 10px; }
 .proposal-btn {
   flex: 1; font-size: 12px; font-weight: 600; padding: 7px 0;
