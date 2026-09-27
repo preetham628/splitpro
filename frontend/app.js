@@ -391,16 +391,29 @@ inviteEmailInput.addEventListener('keydown', e => {
 
 // ── Approval view ────────────────────────────────────────────────────────────
 async function loadProposals() {
+  // Capture-and-recheck rather than trusting the caller to have already
+  // guarded: this is called both from switchTab('approvals') and from
+  // decideProposal() after its own POST, and can itself go stale during
+  // this fetch regardless of whether the caller was current when it called
+  // in — e.g. approve in A, switch to B and open Approvals (resolves first,
+  // correctly shows B's list), then A's slower fetch here would otherwise
+  // land last and overwrite B's approvalsContent with A's proposals.
+  const requestSessionId = sessionId;
   approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const res = await fetch(`${API}/api/sessions/${sessionId}/proposals`, { credentials: 'include' });
+    const res = await fetch(`${API}/api/sessions/${requestSessionId}/proposals`, { credentials: 'include' });
+    if (requestSessionId !== sessionId) return;
     if (!res.ok) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
       return;
     }
-    renderProposals(await res.json());
+    const proposals = await res.json();
+    if (requestSessionId !== sessionId) return;
+    renderProposals(proposals);
   } catch {
-    approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
+    if (requestSessionId === sessionId) {
+      approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
+    }
   }
 }
 
