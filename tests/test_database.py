@@ -198,6 +198,74 @@ def test_create_update_get_list_proposal(fresh_db):
     assert db.get_proposal(999999) is None
 
 
+def test_is_correction_reflects_existing_bill_not_stale_fk(fresh_db):
+    """is_correction must be True for a proposal whose payload bill_id
+    matches an already-approved bill, even once the normal
+    delete-and-reinsert churn from a chat turn has nulled out
+    supersedes_bill_id via the FK's ON DELETE SET NULL — including when
+    that churn happens on the very same turn the proposal was created.
+    A brand-new (non-correction) proposal must report False.
+    """
+    admin = make_user("a5b@example.com", "g-a5b")
+    make_session("sess-5b", admin["id"])
+    db.add_session_member("sess-5b", admin["id"], "admin")
+
+    # Approve an initial bill.
+    pid1 = db.create_proposal(
+        "sess-5b", proposed_by=admin["id"],
+        payload=sample_payload(bill_id="bill_c", description="Original"),
+    )
+    db.decide_proposal(pid1, decided_by=admin["id"], decision="approved")
+    bill_row_id = db.get_bill_row_id("sess-5b", "bill_c")
+
+    # Propose a correction to that same bill.
+    pid2 = db.create_proposal(
+        "sess-5b", proposed_by=admin["id"],
+        payload=sample_payload(bill_id="bill_c", description="Corrected"),
+        supersedes_bill_id=bill_row_id,
+    )
+
+    # A normal chat turn re-saves bills, churning the surrogate id and
+    # nulling supersedes_bill_id via the FK — the exact churn this fix
+    # works around.
+    from core.session_state import LineItem, ParsedBill, SessionState
+    state = SessionState(
+        participants=["Alice"],
+        bills=[ParsedBill(
+            bill_id="bill_c", raw_text="raw text", description="Original",
+            items=[LineItem(name="Burger", price=10.0, assigned_to=["Alice"])],
+            tax=1.0, tip=2.0, paid_by="Alice",
+        )],
+        finalized=False,
+    )
+    db.save_session_state("sess-5b", state, settlements=[])
+
+    stored = sqlite3.connect(fresh_db)
+    stored.row_factory = sqlite3.Row
+    row = stored.execute(
+        "SELECT supersedes_bill_id FROM expense_proposals WHERE id = ?", (pid2,)
+    ).fetchone()
+    stored.close()
+    assert row["supersedes_bill_id"] is None, "FK should have nulled the stale reference"
+
+    fetched = db.get_proposal(pid2)
+    assert fetched["is_correction"] is True
+
+    pending = db.list_pending_proposals("sess-5b")
+    correction = next(p for p in pending if p["id"] == pid2)
+    assert correction["is_correction"] is True
+
+    # A brand-new proposal (different bill_id) is not a correction.
+    pid3 = db.create_proposal(
+        "sess-5b", proposed_by=admin["id"],
+        payload=sample_payload(bill_id="bill_new", description="New bill"),
+    )
+    assert db.get_proposal(pid3)["is_correction"] is False
+    pending = db.list_pending_proposals("sess-5b")
+    new_one = next(p for p in pending if p["id"] == pid3)
+    assert new_one["is_correction"] is False
+
+
 def test_decide_proposal_approved_creates_new_bill(fresh_db):
     admin = make_user("a6@example.com", "g-a6")
     make_session("sess-6", admin["id"])

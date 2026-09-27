@@ -657,6 +657,26 @@ def update_proposal_payload(proposal_id: int, payload: dict) -> None:
         """, (json.dumps(payload), now, proposal_id))
 
 
+def _is_correction(conn: sqlite3.Connection, session_id: str, bill_id: str) -> bool:
+    """Whether a proposal's payload bill_id matches a bill that already
+    exists for this session — i.e. approving it will overwrite that bill
+    rather than create a new one.
+
+    Computed fresh at read time rather than trusted from the stored
+    supersedes_bill_id column: that FK is ON DELETE SET NULL (see the
+    comment on decide_proposal), so it routinely goes stale/null well
+    before a proposal is decided, even within the same turn that created
+    it. (session_id, bill_id) is stable across that churn, and bills are
+    never independently deleted in this codebase, so this check holds for
+    as long as the proposal remains undecided.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM bills WHERE session_id = ? AND bill_id = ?",
+        (session_id, bill_id),
+    ).fetchone()
+    return row is not None
+
+
 def get_proposal(proposal_id: int) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute(
@@ -666,6 +686,9 @@ def get_proposal(proposal_id: int) -> Optional[dict]:
             return None
         result = dict(row)
         result["payload"] = json.loads(result["payload"])
+        result["is_correction"] = _is_correction(
+            conn, result["session_id"], result["payload"]["bill_id"]
+        )
         return result
 
 
@@ -691,6 +714,7 @@ def list_pending_proposals(session_id: str) -> list[dict]:
         for r in rows:
             d = dict(r)
             d["payload"] = json.loads(d["payload"])
+            d["is_correction"] = _is_correction(conn, d["session_id"], d["payload"]["bill_id"])
             results.append(d)
         return results
 
