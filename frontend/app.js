@@ -13,6 +13,13 @@ let activeTab   = 'session';
 // superseded it, even before the new session's id is known (createNewSession
 // has nothing to compare sessionId against until its POST resolves).
 let navSeq      = 0;
+// Same idea, scoped to loadProposals(): a plain sessionId-identity check
+// only catches a *different* session's response landing late, not a slower
+// same-session call being overtaken by a faster later one (e.g. reopening
+// the Approvals tab, or two decideProposal() calls fired back to back).
+// Bumping this on every loadProposals() invocation — regardless of session —
+// makes any earlier in-flight call stale the moment a newer one starts.
+let proposalsSeq = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -391,27 +398,27 @@ inviteEmailInput.addEventListener('keydown', e => {
 
 // ── Approval view ────────────────────────────────────────────────────────────
 async function loadProposals() {
-  // Capture-and-recheck rather than trusting the caller to have already
-  // guarded: this is called both from switchTab('approvals') and from
-  // decideProposal() after its own POST, and can itself go stale during
-  // this fetch regardless of whether the caller was current when it called
-  // in — e.g. approve in A, switch to B and open Approvals (resolves first,
-  // correctly shows B's list), then A's slower fetch here would otherwise
-  // land last and overwrite B's approvalsContent with A's proposals.
-  const requestSessionId = sessionId;
+  // A per-call sequence number rather than just a sessionId check: identity
+  // alone only catches a *different* session's response landing late, not a
+  // slower same-session call being overtaken by a faster later one (e.g.
+  // reopening the Approvals tab twice, or two decideProposal() calls fired
+  // back to back). Bumping proposalsSeq on every call — regardless of
+  // session — makes any earlier in-flight call stale the moment a newer one
+  // starts, covering both cases with one check.
+  const mySeq = ++proposalsSeq;
   approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const res = await fetch(`${API}/api/sessions/${requestSessionId}/proposals`, { credentials: 'include' });
-    if (requestSessionId !== sessionId) return;
+    const res = await fetch(`${API}/api/sessions/${sessionId}/proposals`, { credentials: 'include' });
+    if (mySeq !== proposalsSeq) return;
     if (!res.ok) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
       return;
     }
     const proposals = await res.json();
-    if (requestSessionId !== sessionId) return;
+    if (mySeq !== proposalsSeq) return;
     renderProposals(proposals);
   } catch {
-    if (requestSessionId === sessionId) {
+    if (mySeq === proposalsSeq) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
     }
   }
