@@ -8,18 +8,14 @@ let currentUser = null;
 let members     = new Map();  // user_id -> {user_id, name, email, avatar_url, role}
 let isCurrentUserAdmin = false;
 let activeTab   = 'session';
-// Bumped by every session-switch/create action (loadSession, createNewSession).
-// Lets a still-in-flight one of those detect a newer navigation has since
-// superseded it, even before the new session's id is known (createNewSession
-// has nothing to compare sessionId against until its POST resolves).
+// Bumped by every session-switch/create action (loadSession, createNewSession)
+// *and* by loadProposals() itself. A single shared token, not one per
+// function: that's what lets a genuine session switch invalidate an
+// in-flight loadProposals() call (a separate counter can't see navSeq
+// change), while loadProposals() bumping it too means a second same-session
+// call (reopening the tab, back-to-back decideProposal() calls) supersedes
+// the first the same way.
 let navSeq      = 0;
-// Same idea, scoped to loadProposals(): a plain sessionId-identity check
-// only catches a *different* session's response landing late, not a slower
-// same-session call being overtaken by a faster later one (e.g. reopening
-// the Approvals tab, or two decideProposal() calls fired back to back).
-// Bumping this on every loadProposals() invocation — regardless of session —
-// makes any earlier in-flight call stale the moment a newer one starts.
-let proposalsSeq = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -398,27 +394,26 @@ inviteEmailInput.addEventListener('keydown', e => {
 
 // ── Approval view ────────────────────────────────────────────────────────────
 async function loadProposals() {
-  // A per-call sequence number rather than just a sessionId check: identity
-  // alone only catches a *different* session's response landing late, not a
-  // slower same-session call being overtaken by a faster later one (e.g.
-  // reopening the Approvals tab twice, or two decideProposal() calls fired
-  // back to back). Bumping proposalsSeq on every call — regardless of
-  // session — makes any earlier in-flight call stale the moment a newer one
-  // starts, covering both cases with one check.
-  const mySeq = ++proposalsSeq;
+  // Reuses the same navSeq counter createNewSession/loadSession bump on
+  // every navigation — not a separate counter — so a genuine session
+  // switch (which only bumps navSeq) actually invalidates an in-flight
+  // call here. Bumping it on entry too means a second same-session call
+  // (reopening the tab, back-to-back decideProposal() calls) supersedes
+  // the first via the exact same check.
+  const mySeq = ++navSeq;
   approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
   try {
     const res = await fetch(`${API}/api/sessions/${sessionId}/proposals`, { credentials: 'include' });
-    if (mySeq !== proposalsSeq) return;
+    if (mySeq !== navSeq) return;
     if (!res.ok) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
       return;
     }
     const proposals = await res.json();
-    if (mySeq !== proposalsSeq) return;
+    if (mySeq !== navSeq) return;
     renderProposals(proposals);
   } catch {
-    if (mySeq === proposalsSeq) {
+    if (mySeq === navSeq) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
     }
   }
