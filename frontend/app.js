@@ -5,6 +5,22 @@ const API = '';
 let sessionId  = null;
 let isLoading  = false;
 let currentUser = null;
+let members     = new Map();  // user_id -> {user_id, name, email, avatar_url, role}
+let isCurrentUserAdmin = false;
+let activeTab   = 'session';
+// Bumped only by createNewSession/loadSession, checked only by
+// createNewSession — this is "did the active session change" and is a
+// distinct concern from loadProposals()'s own reentrancy guard below. They
+// must not share a counter: an unrelated loadProposals() call (opening the
+// Approvals tab, deciding a proposal) would otherwise falsely tell an
+// in-flight createNewSession() it had been superseded when nobody actually
+// navigated away.
+let navSeq      = 0;
+// Private to loadProposals() — "did a newer call to *this* function
+// supersede an older one" (same-session reentrancy: reopening the tab,
+// back-to-back decideProposal() calls). Combined with a sessionId-identity
+// check (the cross-session case) rather than folded into navSeq above.
+let proposalsLoadSeq = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -20,6 +36,19 @@ const newSessionBtn = document.getElementById('new-session-btn');
 const userAvatar    = document.getElementById('user-avatar');
 const userName      = document.getElementById('user-name');
 const logoutBtn     = document.getElementById('logout-btn');
+
+const stateTabButtons  = document.querySelectorAll('.state-tab');
+const tabPanels = {
+  session:   document.getElementById('tab-panel-session'),
+  members:   document.getElementById('tab-panel-members'),
+  approvals: document.getElementById('tab-panel-approvals'),
+};
+const approvalsTabBtn   = document.getElementById('approvals-tab');
+const approvalsTabBadge = document.getElementById('approvals-tab-badge');
+const membersContent    = document.getElementById('members-content');
+const inviteEmailInput  = document.getElementById('invite-email-input');
+const inviteBtn         = document.getElementById('invite-btn');
+const approvalsContent  = document.getElementById('approvals-content');
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
@@ -106,6 +135,7 @@ function renderSessionList(sessions) {
 }
 
 async function createNewSession() {
+  const mySeq = ++navSeq;
   const res = await fetch(`${API}/api/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -113,52 +143,409 @@ async function createNewSession() {
     body: JSON.stringify({}),
   });
   const data = await res.json();
+  // The user may have switched to (or created) a different session via
+  // loadSession/createNewSession while the POST above was in flight — in
+  // that case this call has nothing left to do; making its session active
+  // now would clobber whatever the user has since navigated to.
+  if (mySeq !== navSeq) return;
 
   sessionId = data.session_id;
   providerBadge.textContent = data.provider || '–';
   localStorage.setItem('lastSessionId', sessionId);
 
   await loadSessionList();
+  if (mySeq !== navSeq) return;
+
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+  membersContent.innerHTML = '<p class="muted">Loading…</p>';
+  switchTab('session');
 
   setActiveSession(sessionId);
+  await loadMembers(sessionId);
+  if (mySeq !== navSeq) return;
   await sendToAgent("Hello, I'm ready to help split some bills.");
 }
 
 async function loadSession(id) {
+  navSeq++;  // supersede any in-flight createNewSession/loadSession call
   sessionId = id;
   localStorage.setItem('lastSessionId', id);
   setActiveSession(id);
 
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">Loading…</p>';
+  membersContent.innerHTML = '<p class="muted">Loading…</p>';
+  approvalsContent.innerHTML = '<p class="muted">No pending proposals.</p>';
+  switchTab('session');
+
+  // Member list is loaded first (and awaited) so both message attribution
+  // (sender names) and the admin-only approval/member controls have the
+  // current user's role and the id→name map ready before anything below
+  // tries to use it — re-fetched on every session load, not cached
+  // indefinitely, in case the user's role changed since they last opened it.
+  await loadMembers(id);
+  // The user may have switched to a different session while any of the
+  // awaits above/below were in flight — `sessionId` (global) would then
+  // point at that newer session while `id` (this call's own session) is
+  // stale. Applying a stale response here would overwrite the now-current
+  // session's messages/state/members with the abandoned one's, so every
+  // checkpoint below bails out instead once that's detected.
+  if (id !== sessionId) return;
 
   try {
     const res = await fetch(`${API}/sessions/${id}/messages`, { credentials: 'include' });
     if (res.ok) {
       const messages = await res.json();
+      if (id !== sessionId) return;
       messages.forEach(m => {
         const imageDataUrl = m.image_base64
           ? `data:${m.image_media_type};base64,${m.image_base64}`
           : null;
-        appendBubble(m.role, m.content, imageDataUrl);
+        appendBubble(m.role, m.content, imageDataUrl, m.user_id);
       });
     }
   } catch {
     // Transcript failed to load — chat panel just starts empty for this session.
   }
 
+  if (id !== sessionId) return;
+
   try {
     const res = await fetch(`${API}/sessions/${id}/state`, { credentials: 'include' });
     if (res.ok) {
       const state = await res.json();
+      if (id !== sessionId) return;
       renderState(state);
     }
   } catch {
-    stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+    if (id === sessionId) stateContent.innerHTML = '<p class="muted">No data yet.</p>';
   }
 }
+
+// ── Members / roles ──────────────────────────────────────────────────────────
+async function loadMembers(id) {
+  let list = null;
+  try {
+    const res = await fetch(`${API}/api/sessions/${id}/members`, { credentials: 'include' });
+    if (res.ok) list = await res.json();
+  } catch {
+    // list stays null — treated as a failed fetch below.
+  }
+
+  // Bail out without touching global state if the user has since switched
+  // to a different session — an in-flight fetch for a session that's no
+  // longer current must not clobber the now-current session's member list
+  // or admin flag (see the matching guard in loadSession()).
+  if (id !== sessionId) return;
+
+  if (list) {
+    members = new Map(list.map(m => [m.user_id, m]));
+    const me = members.get(currentUser.id);
+    isCurrentUserAdmin = !!(me && me.role === 'admin');
+  } else {
+    members = new Map();
+    isCurrentUserAdmin = false;
+  }
+  renderMembers();
+  updateAdminVisibility();
+}
+
+function updateAdminVisibility() {
+  approvalsTabBtn.hidden = !isCurrentUserAdmin;
+  if (!isCurrentUserAdmin && activeTab === 'approvals') switchTab('session');
+}
+
+function senderName(userId) {
+  if (userId == null) return 'Someone';
+  const m = members.get(userId);
+  return m ? (m.name || m.email) : 'Unknown';
+}
+
+function renderMembers() {
+  membersContent.innerHTML = '';
+  if (members.size === 0) {
+    membersContent.innerHTML = '<p class="muted">No members.</p>';
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'member-list';
+
+  members.forEach(m => {
+    const row = document.createElement('div');
+    row.className = 'member-row';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    if (m.avatar_url) {
+      const img = document.createElement('img');
+      img.src = m.avatar_url;
+      img.alt = '';
+      avatar.appendChild(img);
+    } else {
+      avatar.textContent = (m.name || m.email || '?').charAt(0).toUpperCase();
+    }
+
+    const info = document.createElement('div');
+    info.className = 'member-info';
+    const nameLine = document.createElement('div');
+    nameLine.className = 'member-name';
+    const label = m.name || m.email;
+    nameLine.textContent = m.user_id === currentUser.id ? `${label} (you)` : label;
+    const roleLine = document.createElement('div');
+    roleLine.className = 'member-role';
+    roleLine.textContent = m.role;
+    info.appendChild(nameLine);
+    info.appendChild(roleLine);
+
+    row.appendChild(avatar);
+    row.appendChild(info);
+
+    if (isCurrentUserAdmin && m.user_id !== currentUser.id) {
+      const actions = document.createElement('div');
+      actions.className = 'member-actions';
+
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = 'member-action-btn';
+      toggleBtn.textContent = m.role === 'admin' ? 'Demote' : 'Promote';
+      toggleBtn.addEventListener('click', () =>
+        changeMemberRole(m.user_id, m.role === 'admin' ? 'member' : 'admin'));
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'member-action-btn danger';
+      removeBtn.textContent = 'Remove';
+      removeBtn.addEventListener('click', () => removeMember(m.user_id));
+
+      actions.appendChild(toggleBtn);
+      actions.appendChild(removeBtn);
+      row.appendChild(actions);
+    }
+
+    list.appendChild(row);
+  });
+
+  membersContent.appendChild(list);
+}
+
+async function changeMemberRole(userId, role) {
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/members/${userId}/role`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ role }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || 'Failed to update role.');
+      return;
+    }
+    await loadMembers(sessionId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+async function removeMember(userId) {
+  if (!confirm('Remove this member from the session?')) return;
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/members/${userId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      // Surface the backend's own message (e.g. "last admin") rather than
+      // pre-validating that rule client-side — the backend is the source
+      // of truth for it.
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || 'Failed to remove member.');
+      return;
+    }
+    await loadMembers(sessionId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+inviteBtn.addEventListener('click', async () => {
+  const email = inviteEmailInput.value.trim();
+  if (!email || !sessionId) return;
+  inviteBtn.disabled = true;
+  try {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/members`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.detail || 'Failed to invite member.');
+      return;
+    }
+    inviteEmailInput.value = '';
+    await loadMembers(sessionId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  } finally {
+    inviteBtn.disabled = false;
+  }
+});
+
+inviteEmailInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); inviteBtn.click(); }
+});
+
+// ── Approval view ────────────────────────────────────────────────────────────
+async function loadProposals() {
+  // Two independent checks for two independent kinds of staleness:
+  // requestSessionId catches a session switch (loadSession changed which
+  // session is active — doesn't necessarily call loadProposals() itself,
+  // e.g. it always resets to the Session tab, not Approvals); mySeq catches
+  // a newer loadProposals() call for the *same* session superseding an
+  // older, slower one (reopening the tab, back-to-back decideProposal()
+  // calls). Neither alone covers both cases, and this deliberately doesn't
+  // touch navSeq — that counter is for createNewSession/loadSession's own,
+  // different, purpose.
+  const requestSessionId = sessionId;
+  const mySeq = ++proposalsLoadSeq;
+  approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const res = await fetch(`${API}/api/sessions/${requestSessionId}/proposals`, { credentials: 'include' });
+    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
+    if (!res.ok) {
+      approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
+      return;
+    }
+    const proposals = await res.json();
+    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
+    renderProposals(proposals);
+  } catch {
+    if (requestSessionId === sessionId && mySeq === proposalsLoadSeq) {
+      approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
+    }
+  }
+}
+
+function renderProposals(proposals) {
+  if (!proposals.length) {
+    approvalsContent.innerHTML = '<p class="muted">No pending proposals.</p>';
+    return;
+  }
+
+  approvalsContent.innerHTML = '';
+  proposals.forEach(p => {
+    const payload = p.payload || {};
+    const items = payload.items || [];
+    const tax = payload.tax || 0;
+    const tip = payload.tip || 0;
+    // item.price is already the line total for all of its qty units (see
+    // LineItem.unit_price / Bill.subtotal in core/session_state.py) — do
+    // not re-multiply by qty here, that double-counts.
+    const total = items.reduce((sum, i) => sum + i.price, 0) + tax + tip;
+    const payer = payload.paid_by ? `Paid by ${payload.paid_by}` : 'Payer unknown';
+
+    const card = document.createElement('div');
+    card.className = 'bill-card proposal-card';
+
+    // p.is_correction (server-computed, freshly checked against live bills
+    // rather than trusted from the stale supersedes_bill_id FK — see
+    // core/database.py's _is_correction) marks a proposal that will
+    // overwrite an existing bill rather than create a new one. Falls back
+    // to false — and the badge just doesn't render — on any backend build
+    // that doesn't send the field yet.
+    const correctionBadge = p.is_correction
+      ? '<span class="proposal-badge">Correction</span>' : '';
+
+    let html = `<div class="bill-title">${escapeHtml(payload.description || 'Untitled expense')}${correctionBadge}</div>
+      <div class="bill-meta">${escapeHtml(payer)} · $${total.toFixed(2)}</div>`;
+
+    items.forEach(item => {
+      const isUnassigned = item.unassigned || !item.assigned_to || item.assigned_to.length === 0;
+      const assignText = isUnassigned
+        ? 'unassigned'
+        : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');
+      html += `<div class="item-row">
+        <span class="item-name">${escapeHtml(item.name)}</span>
+        <span class="item-price">$${item.price.toFixed(2)}</span>
+        <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
+      </div>`;
+    });
+
+    if (tax > 0 || tip > 0) {
+      html += `<div class="item-row">
+        <span class="item-name" style="color:var(--muted)">Tax + Tip</span>
+        <span class="item-price">$${(tax + tip).toFixed(2)}</span>
+        <span class="item-assign">proportional</span>
+      </div>`;
+    }
+
+    card.innerHTML = html;
+
+    const actions = document.createElement('div');
+    actions.className = 'proposal-actions';
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'proposal-btn approve';
+    approveBtn.textContent = 'Approve';
+    approveBtn.addEventListener('click', () => decideProposal(p.id, 'approve'));
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'proposal-btn reject';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', () => decideProposal(p.id, 'reject'));
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(rejectBtn);
+    card.appendChild(actions);
+
+    approvalsContent.appendChild(card);
+  });
+}
+
+async function decideProposal(proposalId, decision) {
+  // The user can switch sessions while this is in flight (approve/reject
+  // isn't gated the way isLoading gates chat sends) — re-check before
+  // refreshing the approvals/state panels so a slow decision on a session
+  // the user has since left can't overwrite what's now on screen.
+  const requestSessionId = sessionId;
+  try {
+    const res = await fetch(
+      `${API}/api/sessions/${requestSessionId}/proposals/${proposalId}/${decision}`,
+      { method: 'POST', credentials: 'include' },
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || `Failed to ${decision} proposal.`);
+      return;
+    }
+    if (requestSessionId !== sessionId) return;
+    // A decided proposal changes bills/settlement/pending_proposals_count —
+    // refresh both the proposal list and the state panel.
+    await loadProposals();
+    const stateRes = await fetch(`${API}/sessions/${requestSessionId}/state`, { credentials: 'include' });
+    if (stateRes.ok) {
+      const state = await stateRes.json();
+      if (requestSessionId === sessionId) renderState(state);
+    }
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  if (name === 'approvals' && !isCurrentUserAdmin) return;
+  activeTab = name;
+  stateTabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
+  Object.entries(tabPanels).forEach(([key, el]) => el.classList.toggle('hidden', key !== name));
+  if (name === 'approvals') loadProposals();
+}
+
+stateTabButtons.forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
 
 function setActiveSession(id) {
   document.querySelectorAll('.session-item').forEach(el => {
@@ -214,10 +601,15 @@ newSessionBtn.addEventListener('click', createNewSession);
 // ── Send helpers ──────────────────────────────────────────────────────────────
 async function sendToAgent(text) {
   if (!sessionId || isLoading) return;
+  // loadSession() isn't gated by isLoading, so the user can switch sessions
+  // while this turn is in flight — capture which session this response
+  // belongs to and re-check before applying it to (what may now be a
+  // different session's) DOM.
+  const requestSessionId = sessionId;
   setLoading(true);
   const typing = appendTyping();
   try {
-    const res  = await fetch(`${API}/sessions/${sessionId}/chat`, {
+    const res  = await fetch(`${API}/sessions/${requestSessionId}/chat`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -225,6 +617,7 @@ async function sendToAgent(text) {
     });
     const data = await res.json();
     typing.remove();
+    if (requestSessionId !== sessionId) return;
     appendBubble('agent', data.response);
     renderState(data.state);
     // Refresh sidebar in case session was auto-renamed
@@ -232,7 +625,7 @@ async function sendToAgent(text) {
     setActiveSession(sessionId);
   } catch (err) {
     typing.remove();
-    appendBubble('agent', `⚠️ Error: ${err.message}`);
+    if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
   }
@@ -240,43 +633,78 @@ async function sendToAgent(text) {
 
 async function sendImageToAgent(file) {
   if (!sessionId || isLoading) return;
+  // See the matching comment in sendToAgent() — loadSession() can run
+  // concurrently with this (it isn't gated by isLoading), so every step
+  // below re-checks it's still acting on the session this upload started in.
+  const requestSessionId = sessionId;
   setLoading(true);
 
   const reader = new FileReader();
-  reader.onload = e => appendBubble('user', '', e.target.result);
+  reader.onload = e => {
+    if (requestSessionId === sessionId) appendBubble('user', '', e.target.result, currentUser.id);
+  };
   reader.readAsDataURL(file);
 
   const typing = appendTyping();
   try {
     const form = new FormData();
     form.append('file', file);
-    const res  = await fetch(`${API}/sessions/${sessionId}/image`, {
+    const res  = await fetch(`${API}/sessions/${requestSessionId}/image`, {
       method: 'POST',
       credentials: 'include',
       body:   form,
     });
     const data = await res.json();
     typing.remove();
+    if (requestSessionId !== sessionId) return;
     appendBubble('agent', data.response);
     renderState(data.state);
     await loadSessionList();
     setActiveSession(sessionId);
   } catch (err) {
     typing.remove();
-    appendBubble('agent', `⚠️ Error: ${err.message}`);
+    if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
   }
 }
 
 // ── UI builders ───────────────────────────────────────────────────────────────
-function appendBubble(role, text, imageDataUrl = null) {
+function appendBubble(role, text, imageDataUrl = null, userId = null) {
+  const isOwn = role === 'user' && !!currentUser && userId === currentUser.id;
+
   const row = document.createElement('div');
-  row.className = `bubble-row ${role}`;
+  row.className = `bubble-row ${role}` + (isOwn ? ' own' : '');
 
   const avatar = document.createElement('div');
   avatar.className = 'avatar';
-  avatar.textContent = role === 'agent' ? '🤖' : '🙂';
+  if (role === 'agent') {
+    avatar.textContent = '🤖';
+  } else if (isOwn) {
+    avatar.textContent = '🙂';
+  } else {
+    const m = members.get(userId);
+    if (m && m.avatar_url) {
+      const img = document.createElement('img');
+      img.src = m.avatar_url;
+      img.alt = '';
+      avatar.appendChild(img);
+    } else {
+      avatar.textContent = ((m && (m.name || m.email)) || '?').charAt(0).toUpperCase();
+    }
+  }
+
+  const col = document.createElement('div');
+  col.className = 'bubble-col';
+
+  // Own messages are self-evident; label everyone else's (other members and
+  // the agent) so the transcript reads as a group chat, not a 1:1.
+  if (!isOwn) {
+    const label = document.createElement('div');
+    label.className = 'sender-label';
+    label.textContent = role === 'agent' ? 'SplitPro' : senderName(userId);
+    col.appendChild(label);
+  }
 
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
@@ -296,8 +724,9 @@ function appendBubble(role, text, imageDataUrl = null) {
     bubble.appendChild(content);
   }
 
+  col.appendChild(bubble);
   row.appendChild(avatar);
-  row.appendChild(bubble);
+  row.appendChild(col);
   messagesEl.appendChild(row);
   scrollToBottom();
   return row;
@@ -335,7 +764,18 @@ function escapeHtml(str) {
 function renderState(state) {
   if (!state) return;
 
+  const pendingCount = state.pending_proposals_count || 0;
+  approvalsTabBadge.textContent = String(pendingCount);
+  approvalsTabBadge.hidden = pendingCount === 0;
+
   let html = '';
+
+  if (pendingCount > 0) {
+    const plural = pendingCount === 1 ? '' : 's';
+    html += isCurrentUserAdmin
+      ? `<div class="pending-alert">⏳ <strong>${pendingCount}</strong> pending proposal${plural} — <button class="link-btn" id="review-proposals-btn">Review</button></div>`
+      : `<div class="pending-alert readonly">⏳ <strong>${pendingCount}</strong> pending proposal${plural} awaiting admin review</div>`;
+  }
 
   html += '<div class="section-label">Participants</div>';
   if (state.participants && state.participants.length) {
@@ -354,10 +794,10 @@ function renderState(state) {
       const payer = bill.paid_by ? `Paid by ${bill.paid_by}` : 'Payer unknown';
       html += `<div class="bill-card">
         <div class="bill-title">${escapeHtml(bill.description)}</div>
-        <div class="bill-meta">${payer} · $${bill.total.toFixed(2)}</div>`;
+        <div class="bill-meta">${escapeHtml(payer)} · $${bill.total.toFixed(2)}</div>`;
 
       bill.items.forEach(item => {
-        const isUnassigned = !item.assigned_to || item.assigned_to.length === 0;
+        const isUnassigned = item.unassigned || !item.assigned_to || item.assigned_to.length === 0;
         const assignText   = isUnassigned
           ? 'unassigned'
           : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');
@@ -392,6 +832,9 @@ function renderState(state) {
   }
 
   stateContent.innerHTML = html || '<p class="muted">No data yet.</p>';
+
+  const reviewBtn = document.getElementById('review-proposals-btn');
+  if (reviewBtn) reviewBtn.addEventListener('click', () => switchTab('approvals'));
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────
@@ -420,7 +863,7 @@ fileInput.addEventListener('change', () => {
 function handleSend() {
   const text = inputEl.value.trim();
   if (!text || isLoading) return;
-  appendBubble('user', text);
+  appendBubble('user', text, null, currentUser.id);
   inputEl.value = '';
   inputEl.style.height = 'auto';
   sendToAgent(text);
