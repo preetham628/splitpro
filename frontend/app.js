@@ -21,6 +21,13 @@ let navSeq      = 0;
 // back-to-back decideProposal() calls). Combined with a sessionId-identity
 // check (the cross-session case) rather than folded into navSeq above.
 let proposalsLoadSeq = 0;
+// Private to decideProposal() — guards its own post-decide state re-fetch
+// against an older decideProposal() call's response arriving after a newer
+// one's (e.g. approve one proposal, then immediately reject another). Kept
+// separate from proposalsLoadSeq/navSeq for the same reason those two are
+// kept separate from each other: each counter is scoped to exactly the calls
+// that can supersede one another, and no others.
+let decideProposalSeq = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -509,8 +516,12 @@ async function decideProposal(proposalId, decision) {
   // The user can switch sessions while this is in flight (approve/reject
   // isn't gated the way isLoading gates chat sends) — re-check before
   // refreshing the approvals/state panels so a slow decision on a session
-  // the user has since left can't overwrite what's now on screen.
+  // the user has since left can't overwrite what's now on screen. mySeq
+  // covers the same-session case: two decideProposal() calls in quick
+  // succession (e.g. approve one proposal, then immediately reject another)
+  // whose state re-fetches can resolve out of order.
   const requestSessionId = sessionId;
+  const mySeq = ++decideProposalSeq;
   try {
     const res = await fetch(
       `${API}/api/sessions/${requestSessionId}/proposals/${proposalId}/${decision}`,
@@ -521,14 +532,14 @@ async function decideProposal(proposalId, decision) {
       alert(err.detail || `Failed to ${decision} proposal.`);
       return;
     }
-    if (requestSessionId !== sessionId) return;
+    if (requestSessionId !== sessionId || mySeq !== decideProposalSeq) return;
     // A decided proposal changes bills/settlement/pending_proposals_count —
     // refresh both the proposal list and the state panel.
     await loadProposals();
     const stateRes = await fetch(`${API}/sessions/${requestSessionId}/state`, { credentials: 'include' });
     if (stateRes.ok) {
       const state = await stateRes.json();
-      if (requestSessionId === sessionId) renderState(state);
+      if (requestSessionId === sessionId && mySeq === decideProposalSeq) renderState(state);
     }
   } catch (err) {
     alert(`Error: ${err.message}`);
