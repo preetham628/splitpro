@@ -410,19 +410,20 @@ async function loadProposals() {
   // different, purpose.
   const requestSessionId = sessionId;
   const mySeq = ++proposalsLoadSeq;
+  const isStale = () => requestSessionId !== sessionId || mySeq !== proposalsLoadSeq;
   approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
   try {
     const res = await fetch(`${API}/api/sessions/${requestSessionId}/proposals`, { credentials: 'include' });
-    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
+    if (isStale()) return;
     if (!res.ok) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
       return;
     }
     const proposals = await res.json();
-    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
+    if (isStale()) return;
     renderProposals(proposals);
   } catch {
-    if (requestSessionId === sessionId && mySeq === proposalsLoadSeq) {
+    if (!isStale()) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
     }
   }
