@@ -8,14 +8,19 @@ let currentUser = null;
 let members     = new Map();  // user_id -> {user_id, name, email, avatar_url, role}
 let isCurrentUserAdmin = false;
 let activeTab   = 'session';
-// Bumped by every session-switch/create action (loadSession, createNewSession)
-// *and* by loadProposals() itself. A single shared token, not one per
-// function: that's what lets a genuine session switch invalidate an
-// in-flight loadProposals() call (a separate counter can't see navSeq
-// change), while loadProposals() bumping it too means a second same-session
-// call (reopening the tab, back-to-back decideProposal() calls) supersedes
-// the first the same way.
+// Bumped only by createNewSession/loadSession, checked only by
+// createNewSession — this is "did the active session change" and is a
+// distinct concern from loadProposals()'s own reentrancy guard below. They
+// must not share a counter: an unrelated loadProposals() call (opening the
+// Approvals tab, deciding a proposal) would otherwise falsely tell an
+// in-flight createNewSession() it had been superseded when nobody actually
+// navigated away.
 let navSeq      = 0;
+// Private to loadProposals() — "did a newer call to *this* function
+// supersede an older one" (same-session reentrancy: reopening the tab,
+// back-to-back decideProposal() calls). Combined with a sessionId-identity
+// check (the cross-session case) rather than folded into navSeq above.
+let proposalsLoadSeq = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -394,26 +399,30 @@ inviteEmailInput.addEventListener('keydown', e => {
 
 // ── Approval view ────────────────────────────────────────────────────────────
 async function loadProposals() {
-  // Reuses the same navSeq counter createNewSession/loadSession bump on
-  // every navigation — not a separate counter — so a genuine session
-  // switch (which only bumps navSeq) actually invalidates an in-flight
-  // call here. Bumping it on entry too means a second same-session call
-  // (reopening the tab, back-to-back decideProposal() calls) supersedes
-  // the first via the exact same check.
-  const mySeq = ++navSeq;
+  // Two independent checks for two independent kinds of staleness:
+  // requestSessionId catches a session switch (loadSession changed which
+  // session is active — doesn't necessarily call loadProposals() itself,
+  // e.g. it always resets to the Session tab, not Approvals); mySeq catches
+  // a newer loadProposals() call for the *same* session superseding an
+  // older, slower one (reopening the tab, back-to-back decideProposal()
+  // calls). Neither alone covers both cases, and this deliberately doesn't
+  // touch navSeq — that counter is for createNewSession/loadSession's own,
+  // different, purpose.
+  const requestSessionId = sessionId;
+  const mySeq = ++proposalsLoadSeq;
   approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const res = await fetch(`${API}/api/sessions/${sessionId}/proposals`, { credentials: 'include' });
-    if (mySeq !== navSeq) return;
+    const res = await fetch(`${API}/api/sessions/${requestSessionId}/proposals`, { credentials: 'include' });
+    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
     if (!res.ok) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
       return;
     }
     const proposals = await res.json();
-    if (mySeq !== navSeq) return;
+    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
     renderProposals(proposals);
   } catch {
-    if (mySeq === navSeq) {
+    if (requestSessionId === sessionId && mySeq === proposalsLoadSeq) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
     }
   }
