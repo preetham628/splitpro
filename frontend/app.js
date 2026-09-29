@@ -21,6 +21,21 @@ let navSeq      = 0;
 // back-to-back decideProposal() calls). Combined with a sessionId-identity
 // check (the cross-session case) rather than folded into navSeq above.
 let proposalsLoadSeq = 0;
+// Private to decideProposal() — guards only its final renderState() call
+// against an older decideProposal() call's response arriving after a newer
+// one's (e.g. approve one proposal, then immediately reject another). Bumped
+// right before each call's own state fetch is issued (not at call-start),
+// since issuance order — not call-start order — tracks actual data
+// freshness: the gap between call-start and state-fetch-issuance (waiting on
+// the decide POST and loadProposals()) has variable length per call, so a
+// call that started first can still issue its state fetch last. Each call's
+// own loadProposals()/state-fetch still runs to completion regardless of
+// this counter — only the render is skipped when stale — so an older call
+// isn't starved of its refresh just because a newer one has since started.
+// Kept separate from proposalsLoadSeq/navSeq for the same reason those two
+// are kept separate from each other: each counter is scoped to exactly the
+// calls that can supersede one another, and no others.
+let decideProposalSeq = 0;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -410,19 +425,20 @@ async function loadProposals() {
   // different, purpose.
   const requestSessionId = sessionId;
   const mySeq = ++proposalsLoadSeq;
+  const isStale = () => requestSessionId !== sessionId || mySeq !== proposalsLoadSeq;
   approvalsContent.innerHTML = '<p class="muted">Loading…</p>';
   try {
     const res = await fetch(`${API}/api/sessions/${requestSessionId}/proposals`, { credentials: 'include' });
-    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
+    if (isStale()) return;
     if (!res.ok) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
       return;
     }
     const proposals = await res.json();
-    if (requestSessionId !== sessionId || mySeq !== proposalsLoadSeq) return;
+    if (isStale()) return;
     renderProposals(proposals);
   } catch {
-    if (requestSessionId === sessionId && mySeq === proposalsLoadSeq) {
+    if (!isStale()) {
       approvalsContent.innerHTML = '<p class="muted">Failed to load proposals.</p>';
     }
   }
@@ -509,6 +525,22 @@ async function decideProposal(proposalId, decision) {
   // isn't gated the way isLoading gates chat sends) — re-check before
   // refreshing the approvals/state panels so a slow decision on a session
   // the user has since left can't overwrite what's now on screen.
+  //
+  // mySeq covers the same-session case: two decideProposal() calls in quick
+  // succession (e.g. approve one proposal, then immediately reject another)
+  // whose state re-fetches can resolve out of order. It's captured right
+  // before the state fetch is issued — not at the top of this function —
+  // because the gap between call-start and state-fetch-issuance (waiting on
+  // the decide POST and loadProposals()) has variable length per call, so
+  // issuance order (which tracks actual data freshness) can differ from
+  // call-start order. It only gates the final renderState() call, not
+  // loadProposals()/the state fetch themselves — an older call must still be
+  // allowed to run its own refresh to completion (loadProposals() already
+  // guards its own render internally), otherwise a newer call starting
+  // before the older call's POST even resolves would make the older call
+  // skip refreshing entirely, and if the newer call then failed before
+  // reaching its own refresh, nobody would refresh the UI at all despite the
+  // decision having committed server-side.
   const requestSessionId = sessionId;
   try {
     const res = await fetch(
@@ -524,10 +556,12 @@ async function decideProposal(proposalId, decision) {
     // A decided proposal changes bills/settlement/pending_proposals_count —
     // refresh both the proposal list and the state panel.
     await loadProposals();
+    const mySeq = ++decideProposalSeq;
+    const isStale = () => requestSessionId !== sessionId || mySeq !== decideProposalSeq;
     const stateRes = await fetch(`${API}/sessions/${requestSessionId}/state`, { credentials: 'include' });
     if (stateRes.ok) {
       const state = await stateRes.json();
-      if (requestSessionId === sessionId) renderState(state);
+      if (!isStale()) renderState(state);
     }
   } catch (err) {
     alert(`Error: ${err.message}`);
