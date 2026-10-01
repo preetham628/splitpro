@@ -220,16 +220,19 @@ def _migrate_split_model(conn: sqlite3.Connection) -> None:
        assumed to be an old-shape plain name and is rewritten to
        {"<name>": <bill total>}, preserving old single-payer behavior. The
        bill's total is computed fresh from its own bill_items (subtotal) plus
-       its tax/tip, since that total was never itself stored anywhere.
+       its tax/tip, since that total was never itself stored anywhere —
+       rounded to cents, since summing floats (e.g. 0.1 + 0.2) can otherwise
+       permanently persist a binary-float artifact like 10.299999999999999
+       into the database instead of 10.3.
        NULL/empty paid_by is left untouched (no payer recorded yet).
 
     2. bill_items.qty_allocations (JSON fractional-units-per-person map, only
        meaningful when qty > 1) is replaced by bill_items.cost_allocations
        (JSON dollar-amount-per-person map, same shape as paid_by). Existing
        qty_allocations data is converted (amount = units * item.price /
-       item.qty) into the new column before the old one is dropped — same
-       add-column-then-drop-column pattern _migrate_chat_sessions() uses for
-       session_state/message_history.
+       item.qty, also rounded to cents) into the new column before the old
+       one is dropped — same add-column-then-drop-column pattern
+       _migrate_chat_sessions() uses for session_state/message_history.
 
     Safe to call on every startup — checks columns/data shape first, so a
     database already on the new shape is a no-op.
@@ -250,7 +253,11 @@ def _migrate_split_model(conn: sqlite3.Connection) -> None:
         subtotal = conn.execute(
             "SELECT COALESCE(SUM(price), 0) AS s FROM bill_items WHERE bill_id = ?", (row["id"],)
         ).fetchone()["s"]
-        total = subtotal + row["tax"] + row["tip"]
+        # Rounded to cents — these are dollar amounts, and leaving the raw
+        # float sum unrounded persists binary-float artifacts like
+        # 10.299999999999999 permanently into the database (0.1 + 0.2 isn't
+        # exactly representable), not just a transient display glitch.
+        total = round(subtotal + row["tax"] + row["tip"], 2)
         conn.execute(
             "UPDATE bills SET paid_by = ? WHERE id = ?", (json.dumps({name: total}), row["id"])
         )
@@ -265,7 +272,7 @@ def _migrate_split_model(conn: sqlite3.Connection) -> None:
             if qty_allocations:
                 qty = item["qty"] or 1
                 cost_allocations = {
-                    person: units * item["price"] / qty
+                    person: round(units * item["price"] / qty, 2)
                     for person, units in qty_allocations.items()
                 }
                 conn.execute(
