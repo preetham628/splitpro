@@ -384,14 +384,30 @@ def test_chat_does_not_schedule_background_task_when_not_needed(fresh_server, mo
 
 
 def test_concurrent_turns_only_schedule_one_summarization(fresh_server, monkeypatch):
-    """Two concurrent turns that would each independently see "needs
+    """Two REAL concurrent threads that would each independently see "needs
     summarization" must not each schedule their own background task / fire
     their own (paid) LLM summarization call -- the in-flight guard
-    (_summarizing_sessions, checked-and-set under the per-session lock)
-    must let only the first one through."""
+    (_summarizing_sessions, guarded by its own dedicated lock) must let
+    only one of them through.
+
+    Uses a threading.Barrier to force genuine interleaving: both threads'
+    needs_context_summarization() calls release together, so both threads
+    actually race into _schedule_context_summarization_if_needed's
+    check-and-set at essentially the same instant, rather than one
+    trivially finishing before the other starts (which would pass even with
+    the locking removed entirely) -- same real-thread spirit as this file's
+    other two concurrency tests above.
+    """
     monkeypatch.setattr("agents.chat_agent.create_llm", lambda config: FakeLLM())
     monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
-    monkeypatch.setattr(ChatAgent, "needs_context_summarization", lambda self: True)
+
+    release_together = threading.Barrier(2, timeout=5)
+
+    def needs_summarization_after_barrier(self):
+        release_together.wait()
+        return True
+
+    monkeypatch.setattr(ChatAgent, "needs_context_summarization", needs_summarization_after_barrier)
 
     admin = make_user("admin@example.com", "g-dedupe-admin")
     session_id = make_session_with_members(admin)
@@ -402,11 +418,29 @@ def test_concurrent_turns_only_schedule_one_summarization(fresh_server, monkeypa
     server._get_agent(session_id, admin)
 
     bg1, bg2 = BackgroundTasks(), BackgroundTasks()
-    server._schedule_context_summarization_if_needed(session_id, bg1)
-    server._schedule_context_summarization_if_needed(session_id, bg2)
+    errors = []
 
-    assert len(bg1.tasks) == 1, "the first caller to see 'needs summarization' must schedule it"
-    assert len(bg2.tasks) == 0, "a second concurrent caller must not schedule a duplicate"
+    def run(background_tasks):
+        try:
+            server._schedule_context_summarization_if_needed(session_id, background_tasks)
+        except Exception as e:  # noqa: BLE001 - captured for the assertion below
+            errors.append(e)
+
+    t1 = threading.Thread(target=run, args=(bg1,))
+    t2 = threading.Thread(target=run, args=(bg2,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not t1.is_alive() and not t2.is_alive(), "a thread never returned -- deadlock?"
+    assert not errors, f"a thread raised: {errors}"
+
+    scheduled_counts = sorted([len(bg1.tasks), len(bg2.tasks)])
+    assert scheduled_counts == [0, 1], (
+        f"expected exactly one of the two concurrent callers to schedule a task, "
+        f"got bg1={len(bg1.tasks)} bg2={len(bg2.tasks)}"
+    )
     assert session_id in server._summarizing_sessions
 
 
@@ -520,6 +554,27 @@ def test_maybe_summarize_context_noop_when_session_not_cached(fresh_server):
     finishing and the background task running must be a clean no-op, not a
     crash."""
     server._maybe_summarize_context("some-session-id-not-in-cache")  # must not raise
+
+
+def test_maybe_summarize_context_does_not_leak_lock_entry_for_deleted_session(fresh_server):
+    """Regression test: _maybe_summarize_context's finally block must clear
+    _summarizing_sessions via its own dedicated guard, NOT _get_session_lock
+    -- a session can be deleted (its _session_locks entry dropped via
+    _drop_session_lock) while a previously-scheduled summarization task for
+    it is still pending. If that finally block called _get_session_lock(
+    session_id) in that case, it would silently recreate a _session_locks
+    entry for a session_id that will never be used again, leaking forever
+    in a long-running process. The agent-is-None early return below is
+    exactly the path a deleted session's pending task hits."""
+    session_id = "sess-never-cached-" + str(uuid.uuid4())
+    assert session_id not in server.sessions
+    assert session_id not in server._session_locks
+
+    server._maybe_summarize_context(session_id)
+
+    assert session_id not in server._session_locks, (
+        "finally block leaked a _session_locks entry for a deleted/never-cached session"
+    )
 
 
 # ---------- main.py's CLI path is completely unaffected ----------

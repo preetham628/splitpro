@@ -104,9 +104,18 @@ def _drop_session_lock(session_id: str) -> None:
 # each schedule their own task, both firing a real (paid) LLM summarization
 # call before either reaches the lock — wasted cost, even though the second
 # apply would safely no-op via apply_context_summarization's subset-id
-# guard. Checked-and-set under the session's existing per-session lock
-# (_get_session_lock) when scheduling — no second, different lock.
+# guard.
+#
+# Guarded by its own dedicated lock, _summarizing_sessions_guard, rather
+# than reusing a session's per-session lock (_get_session_lock) — that lock
+# is dropped (_drop_session_lock) once a session is deleted, and a pending
+# summarization task for that now-deleted session would otherwise silently
+# recreate (leak) a lock dict entry for a session_id that will never be
+# used again just to clear this trivial O(1) set-membership bookkeeping in
+# its finally block. This guard's own lifecycle is fully decoupled from
+# that, so it never resurrects a dead session's lock entry.
 _summarizing_sessions: set[str] = set()
+_summarizing_sessions_guard = threading.Lock()
 
 
 # ---------- Request / Response models ----------
@@ -297,11 +306,13 @@ def _schedule_context_summarization_if_needed(session_id: str, background_tasks:
     could each independently see "needs summarization" and each schedule
     their own task: the needs-check itself runs unlocked (cheap, and
     tolerating staleness is fine for a heuristic trigger), but the
-    check-and-set against _summarizing_sessions is done under this
-    session's existing per-session lock, so only the first of any such pair
-    actually schedules a task — the loser sees its own session_id already
-    marked in-flight and skips, saving a wasted (paid) LLM call for
-    something apply_context_summarization would've no-op'd anyway.
+    check-and-set against _summarizing_sessions is done under its own
+    dedicated _summarizing_sessions_guard (see that global's comment for
+    why this is deliberately NOT the per-session lock), so only the first
+    of any such pair actually schedules a task — the loser sees its own
+    session_id already marked in-flight and skips, saving a wasted (paid)
+    LLM call for something apply_context_summarization would've no-op'd
+    anyway.
     """
     agent = sessions.get(session_id)
     if agent is None:
@@ -309,7 +320,7 @@ def _schedule_context_summarization_if_needed(session_id: str, background_tasks:
     if not agent.needs_context_summarization():
         return
 
-    with _get_session_lock(session_id):
+    with _summarizing_sessions_guard:
         if session_id in _summarizing_sessions:
             return  # already scheduled/in flight -- don't duplicate the LLM call
         _summarizing_sessions.add(session_id)
@@ -335,10 +346,16 @@ def _maybe_summarize_context(session_id: str) -> None:
          per-session lock — the same one _run_chat_turn uses for a whole
          turn — and only for that brief step.
 
-    _summarizing_sessions is cleared in a finally, under the same
-    per-session lock it was set under in _schedule_context_summarization_
-    if_needed, so a session is never left permanently unable to schedule
-    again if anything above raises.
+    _summarizing_sessions is cleared in a finally, under its own dedicated
+    _summarizing_sessions_guard (NOT _get_session_lock) — deliberately
+    decoupled from the per-session lock's lifecycle. A session can be
+    deleted (dropping its _get_session_lock entry via _drop_session_lock)
+    while a summarization task scheduled for it is still pending; calling
+    _get_session_lock(session_id) here in that case would silently
+    recreate a lock dict entry for a session_id that will never be reused,
+    leaking forever in a long-running process. The dedicated guard has no
+    such lifecycle to collide with, so this is always safe to call
+    regardless of what happened to the session in the meantime.
     """
     try:
         agent = sessions.get(session_id)
@@ -359,7 +376,7 @@ def _maybe_summarize_context(session_id: str) -> None:
         with _get_session_lock(session_id):
             agent.apply_context_summarization(ids_to_remove, new_summary)
     finally:
-        with _get_session_lock(session_id):
+        with _summarizing_sessions_guard:
             _summarizing_sessions.discard(session_id)
 
 
