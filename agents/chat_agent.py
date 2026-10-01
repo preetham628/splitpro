@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, Dict, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -15,7 +15,7 @@ from agents.llm_factory import create_llm
 from config import ChatAgentConfig
 from core import database as db
 from core.checkpointer import get_checkpointer
-from core.session_state import LineItem, ParsedBill, SessionState
+from core.session_state import LineItem, ParsedBill, SessionState, validate_contribution_map
 from core.settlement import Settlement
 
 load_dotenv()
@@ -43,15 +43,21 @@ Guide the user through these steps in order:
 2. Confirm who the participants are — call set_participants
 3. For each bill, work through items asking who had what — call assign_items or mark_items_unassigned
 4. Confirm who paid for each bill — call set_payer
-5. When the user says they're done or asks for the final split — call calculate_split
+5. Call calculate_split any time to show the group the current settlement — it's always
+   computed fresh from the latest approved data, so there's no separate "finalize" step.
+   Call it whenever the user asks "who owes what" or "show me the split", even repeatedly
+   as more bills/corrections get approved — each call just reflects whatever is approved
+   as of that moment.
 
 The user can add more bills at any point. Always be ready to call add_bill again.
 
 ## Rules
 - Call tools proactively the moment you have the information. Do NOT say "let me know when ready."
 - When assigning items, if the user says "Alice and Bob shared the pasta", use assigned_to=["Alice","Bob"] and shared=true.
+- assign_items supports three allocation modes for a split that isn't equal — qty_per_person (units), percentage_per_person (0-100), or amount_per_person (dollars) — pick whichever matches how the user described it. See the assign_items tool description for worked examples of each. Anyone in assigned_to not given an explicit share splits whatever's left equally.
 - When a bill item has qty > 1 and the user specifies how many units each person had (e.g., "Alice had 1 out of 4 burgers"), use qty_per_person={{"Alice": 1}} in the assignment. Unspecified units are split equally among the remaining assigned_to.
 - Fractional units are allowed (e.g., "Alice had 25% of one burger" with item qty=4 → qty_per_person={{"Alice": 0.25}}).
+- set_payer supports multiple payers on one bill, each by exact amount, percentage (0-100) of the bill total, or equal share of the rest — see the set_payer tool description for worked examples.
 - Fuzzy-match item names: if the user says "the chicken thing", match to the closest item name.
 - Tax and tip are NOT assigned via assign_items — they are handled proportionally by calculate_split automatically.
 - For lump-sum bills with no line items, add one item called "Total" with the full amount and mark it as shared.
@@ -80,13 +86,13 @@ def _bill_to_payload(bill: ParsedBill) -> dict:
                 "assigned_to": list(item.assigned_to),
                 "shared": item.shared,
                 "unassigned": item.unassigned,
-                "qty_allocations": dict(item.qty_allocations),
+                "cost_allocations": dict(item.cost_allocations),
             }
             for item in bill.items
         ],
         "tax": bill.tax,
         "tip": bill.tip,
-        "paid_by": bill.paid_by,
+        "paid_by": dict(bill.paid_by),
     }
 
 
@@ -104,7 +110,7 @@ def _payload_to_bill(payload: dict) -> ParsedBill:
             assigned_to=list(i.get("assigned_to", [])),
             shared=i.get("shared", False),
             unassigned=i.get("unassigned", False),
-            qty_allocations=dict(i.get("qty_allocations", {})),
+            cost_allocations=dict(i.get("cost_allocations", {})),
         )
         for i in payload.get("items", [])
     ]
@@ -115,7 +121,7 @@ def _payload_to_bill(payload: dict) -> ParsedBill:
         items=items,
         tax=payload.get("tax", 0.0),
         tip=payload.get("tip", 0.0),
-        paid_by=payload.get("paid_by"),
+        paid_by=dict(payload.get("paid_by") or {}),
     )
 
 
@@ -241,12 +247,87 @@ def _persist_edit(
     return ""
 
 
+def _resolve_contribution_entries(
+    explicit: Dict[str, float],
+    is_percentage: bool,
+    equal_share_names: list,
+    total: float,
+) -> tuple:
+    """Shared math for set_payer and assign_items: turn a mix of
+    explicit-amount/explicit-percentage entries plus a list of
+    "whatever's left, split evenly" names into a canonical
+    name -> dollar-amount map summing to `total`.
+
+    `explicit` is name -> amount (if is_percentage is False) or name ->
+    percentage 0-100 (if is_percentage is True). Returns (resolved_map,
+    error) — error is a human-readable string when resolution isn't
+    possible; resolved_map is None in that case.
+
+    Deliberately does NOT reject here just because the explicit entries
+    alone already exceed `total` — validate_contribution_map, which every
+    caller runs against the fully resolved map (equal-share remainder
+    included), is the single source of truth for "does this add up," with
+    its N-way-scaled tolerance for legitimate rounding splits. An earlier
+    version had a flat `total + 0.01` check here that rejected exactly the
+    splits this feature exists for (e.g. three people at $33.34 each on a
+    $100 bill sums to $100.02, within validate_contribution_map's own
+    tolerance but over a flat one-cent epsilon).
+
+    Two separate non-negative checks are needed, not one: the first (below)
+    catches a blatantly-wrong *raw* explicit value before any math runs.
+    But explicit entries that individually look fine can still overshoot
+    `total` once summed (e.g. two 80%/90% percentage entries, or one
+    amount larger than `total`) — validate_contribution_map's sum-only
+    check can't catch this, because the equal-share remainder is defined
+    as `total - explicit_total`, so the final map always sums to `total`
+    exactly regardless of sign; an overshoot just pushes a negative share
+    onto whoever's left to absorb "the rest." So a second check runs again
+    at the very end, on the fully resolved map, after the remainder has
+    been distributed.
+    """
+    if is_percentage:
+        for name, pct in explicit.items():
+            if not (0 <= pct <= 100):
+                return None, f"percentage for '{name}' must be between 0 and 100, got {pct}."
+        resolved = {name: total * pct / 100.0 for name, pct in explicit.items()}
+    else:
+        for name, amount in explicit.items():
+            if amount < 0:
+                return None, f"amount for '{name}' must be non-negative, got {amount}."
+        resolved = dict(explicit)
+
+    if equal_share_names:
+        explicit_total = sum(resolved.values())
+        remainder = total - explicit_total
+        share = remainder / len(equal_share_names)
+        for name in equal_share_names:
+            resolved[name] = resolved.get(name, 0.0) + share
+
+    negative = {name: amount for name, amount in resolved.items() if amount < -1e-6}
+    if negative:
+        detail = ", ".join(f"{n}: ${a:.2f}" for n, a in negative.items())
+        return None, (
+            f"the explicit entries given leave a negative share for {detail} — "
+            f"they add up to more than the ${total:.2f} total, with nothing left "
+            f"for the rest to cover."
+        )
+
+    return resolved, None
+
+
 def _apply_assign_items(
     bill: ParsedBill, assignments: list[dict], participants: list[str]
 ) -> tuple[bool, str]:
     """Shared mutation logic for the assign_items tool — operates on any
     ParsedBill (live, or a temporary one rebuilt from a proposal payload).
-    Returns (changed, summary)."""
+    Returns (changed, summary).
+
+    Each assignment picks at most one allocation mode — qty_per_person,
+    percentage_per_person, or amount_per_person — which is resolved here,
+    together with any remaining `assigned_to` names (equal split of
+    whatever's left), into the item's canonical cost_allocations dollar
+    map. No allocation dict at all keeps the original equal-split-of-the-
+    full-price-among-assigned_to behavior (empty cost_allocations)."""
     results = []
     changed = False
     for a in assignments:
@@ -254,6 +335,16 @@ def _apply_assign_items(
         assigned_to = [n.strip().title() for n in a.get("assigned_to", [])]
         shared = bool(a.get("shared", len(assigned_to) > 1))
         qty_per_person_raw: dict = a.get("qty_per_person", {})
+        percentage_per_person_raw: dict = a.get("percentage_per_person", {})
+        amount_per_person_raw: dict = a.get("amount_per_person", {})
+
+        modes_given = sum(bool(m) for m in (qty_per_person_raw, percentage_per_person_raw, amount_per_person_raw))
+        if modes_given > 1:
+            results.append(
+                f"'{item_name}': specify only one of qty_per_person, percentage_per_person, "
+                f"or amount_per_person per item."
+            )
+            continue
 
         # Exact match first, then partial
         item = next((i for i in bill.items if i.name.lower() == item_name.lower()), None)
@@ -265,7 +356,8 @@ def _apply_assign_items(
             continue
 
         if qty_per_person_raw:
-            # Qty-based assignment
+            # Qty-based assignment: resolve units to dollars via unit_price,
+            # then fall through to the same dollar-remainder-split math.
             qty_per_person = {n.strip().title(): float(q) for n, q in qty_per_person_raw.items()}
             unknown = [p for p in qty_per_person if p not in participants]
             if unknown:
@@ -275,6 +367,17 @@ def _apply_assign_items(
                 )
                 continue
 
+            negative_qty = {p: q for p, q in qty_per_person.items() if q < 0}
+            if negative_qty:
+                # Caught here, against the actual qty values, rather than left to
+                # surface later as a dollar-amount error from
+                # _resolve_contribution_entries (after the unit_price conversion
+                # below) — that would blame "amount" with a converted number the
+                # caller never passed, instead of the qty they actually gave.
+                bad = ", ".join(f"{p}: {q}" for p, q in negative_qty.items())
+                results.append(f"'{item.name}': qty_per_person must be non-negative, got {bad}.")
+                continue
+
             allocated_qty = sum(qty_per_person.values())
             if allocated_qty > item.qty + 1e-9:
                 results.append(
@@ -282,12 +385,28 @@ def _apply_assign_items(
                 )
                 continue
 
-            item.qty_allocations = qty_per_person
-            # assigned_to = explicitly listed people + those in qty_per_person
             all_assigned = list(qty_per_person.keys())
             for p in assigned_to:
                 if p not in all_assigned:
                     all_assigned.append(p)
+            remainder_people = [p for p in all_assigned if p not in qty_per_person]
+
+            unit_price = item.unit_price
+            explicit_amounts = {name: unit_price * q for name, q in qty_per_person.items()}
+            cost_allocations, error = _resolve_contribution_entries(
+                explicit_amounts, is_percentage=False, equal_share_names=remainder_people, total=item.price
+            )
+            if error:
+                results.append(f"'{item.name}': {error}")
+                continue
+            if not validate_contribution_map(cost_allocations, item.price):
+                results.append(
+                    f"'{item.name}': resolved qty allocations don't add up to the item price "
+                    f"(${item.price:.2f})."
+                )
+                continue
+
+            item.cost_allocations = cost_allocations
             item.assigned_to = all_assigned
             item.shared = False
             item.unassigned = False
@@ -296,9 +415,55 @@ def _apply_assign_items(
             remaining_qty = item.qty - allocated_qty
             detail = ", ".join(f"{p}:{q}u" for p, q in qty_per_person.items())
             if remaining_qty > 1e-9:
-                remainder_people = [p for p in assigned_to if p not in qty_per_person]
-                detail += f" | {remaining_qty:.2f} units split among {remainder_people or 'all'}"
+                detail += f" | {remaining_qty:.2f} unit(s) split among {remainder_people or 'all'}"
             results.append(f"'{item.name}' (qty-based) -> {detail}")
+
+        elif percentage_per_person_raw or amount_per_person_raw:
+            is_percentage = bool(percentage_per_person_raw)
+            raw = percentage_per_person_raw if is_percentage else amount_per_person_raw
+            explicit = {n.strip().title(): float(v) for n, v in raw.items()}
+            unknown = [p for p in explicit if p not in participants]
+            if unknown:
+                results.append(
+                    f"Unknown participant(s) {unknown} for '{item.name}'. "
+                    f"Known: {participants}"
+                )
+                continue
+
+            all_assigned = list(explicit.keys())
+            for p in assigned_to:
+                if p not in all_assigned:
+                    all_assigned.append(p)
+            remainder_people = [p for p in all_assigned if p not in explicit]
+
+            cost_allocations, error = _resolve_contribution_entries(
+                explicit, is_percentage=is_percentage, equal_share_names=remainder_people, total=item.price
+            )
+            if error:
+                results.append(f"'{item.name}': {error}")
+                continue
+            if not validate_contribution_map(cost_allocations, item.price):
+                kind = "percentages" if is_percentage else "amounts"
+                alloc_str = ", ".join(f"{n}: ${v:.2f}" for n, v in cost_allocations.items())
+                results.append(
+                    f"'{item.name}': resolved {kind} ({alloc_str}) sum to "
+                    f"${sum(cost_allocations.values()):.2f}, which doesn't match the item "
+                    f"price of ${item.price:.2f}."
+                )
+                continue
+
+            item.cost_allocations = cost_allocations
+            item.assigned_to = all_assigned
+            item.shared = False
+            item.unassigned = False
+            changed = True
+
+            kind_label = "percentage-based" if is_percentage else "amount-based"
+            unit = "%" if is_percentage else "$"
+            detail = ", ".join(f"{p}:{v}{unit}" for p, v in explicit.items())
+            if remainder_people:
+                detail += f" | remainder split among {remainder_people}"
+            results.append(f"'{item.name}' ({kind_label}) -> {detail}")
         else:
             # Standard equal-split assignment
             unknown = [p for p in assigned_to if p not in participants]
@@ -312,7 +477,7 @@ def _apply_assign_items(
             item.assigned_to = assigned_to
             item.shared = shared
             item.unassigned = False
-            item.qty_allocations = {}
+            item.cost_allocations = {}
             changed = True
             tag = " (shared)" if shared else ""
             results.append(f"'{item.name}' -> {', '.join(assigned_to)}{tag}")
@@ -326,17 +491,71 @@ def _apply_assign_items(
     return changed, summary
 
 
-def _apply_set_payer(bill: ParsedBill, paid_by: str, participants: list[str]) -> tuple[bool, str]:
-    """Shared mutation logic for the set_payer tool."""
-    paid_by_normalized = paid_by.strip().title()
-    if paid_by_normalized not in participants:
+def _apply_set_payer(bill: ParsedBill, payers: list[dict], participants: list[str]) -> tuple[bool, str]:
+    """Shared mutation logic for the set_payer tool. Resolves a mix of
+    explicit-amount, explicit-percentage, and equal-share-of-remainder payer
+    entries into the bill's canonical paid_by dollar map, validating it sums
+    to the bill total before storing anything."""
+    explicit_amounts: Dict[str, float] = {}
+    explicit_percentages: Dict[str, float] = {}
+    equal_share_names = []
+    seen = set()
+
+    for entry in payers:
+        name = str(entry.get("name", "")).strip().title()
+        if not name:
+            return False, "Error: each payer entry needs a 'name'."
+        if name in seen:
+            return False, f"Error: duplicate payer entry for '{name}'."
+        seen.add(name)
+        if name not in participants:
+            return False, (
+                f"Error: '{name}' is not in the participant list. "
+                f"Known participants: {participants}"
+            )
+
+        has_amount = entry.get("amount") is not None
+        has_pct = entry.get("percentage") is not None
+        if has_amount and has_pct:
+            return False, f"Error: payer entry for '{name}' specifies both 'amount' and 'percentage' — use only one."
+
+        if has_amount:
+            explicit_amounts[name] = float(entry["amount"])
+        elif has_pct:
+            explicit_percentages[name] = float(entry["percentage"])
+        else:
+            equal_share_names.append(name)
+
+    total = bill.total()
+
+    # Resolve percentage entries to dollars first — via the shared helper,
+    # so the 0-100 bound is only checked in one place (_resolve_contribution_
+    # entries itself) rather than duplicated here — then merge them in with
+    # any explicit dollar entries for the remainder-splitting pass below.
+    if explicit_percentages:
+        pct_resolved, error = _resolve_contribution_entries(
+            explicit_percentages, is_percentage=True, equal_share_names=[], total=total
+        )
+        if error:
+            return False, f"Error: {error}"
+        explicit_amounts.update(pct_resolved)
+
+    resolved, error = _resolve_contribution_entries(
+        explicit_amounts, is_percentage=False, equal_share_names=equal_share_names, total=total
+    )
+    if error:
+        return False, f"Error: {error}"
+
+    if not validate_contribution_map(resolved, total):
+        amounts_str = ", ".join(f"{n}: ${a:.2f}" for n, a in resolved.items())
         return False, (
-            f"Error: '{paid_by_normalized}' is not in the participant list. "
-            f"Known participants: {participants}"
+            f"Error: resolved payer amounts ({amounts_str}) sum to ${sum(resolved.values()):.2f}, "
+            f"which doesn't match {bill.bill_id}'s total of ${total:.2f}. Adjust and try again."
         )
 
-    bill.paid_by = paid_by_normalized
-    return True, f"Recorded: {paid_by_normalized} paid for {bill.bill_id} ('{bill.description}')"
+    bill.paid_by = resolved
+    paid_by_str = ", ".join(f"{n}: ${a:.2f}" for n, a in resolved.items())
+    return True, f"Recorded payer(s) for {bill.bill_id} ('{bill.description}'): {paid_by_str}"
 
 
 def _apply_mark_unassigned(
@@ -352,6 +571,11 @@ def _apply_mark_unassigned(
             item.assigned_to = list(participants)
             item.shared = True
             item.unassigned = True
+            # Clear any prior amount/percentage/qty allocation — compute_balances
+            # checks cost_allocations before falling back to an equal split, so a
+            # stale map here would silently override the equal split this tool is
+            # supposed to produce.
+            item.cost_allocations = {}
             updated.append(item.name)
 
     if not updated:
@@ -408,7 +632,7 @@ def _build_tools(state: SessionState, session_id: str) -> list:
                 "assigned_to": [],
                 "shared": False,
                 "unassigned": False,
-                "qty_allocations": {},
+                "cost_allocations": {},
             }
             for it in items
         ]
@@ -438,7 +662,7 @@ def _build_tools(state: SessionState, session_id: str) -> list:
             "items": item_dicts,
             "tax": tax,
             "tip": tip,
-            "paid_by": None,
+            "paid_by": {},
         }
         db.create_proposal(session_id, proposed_by=user_id, payload=payload)
         return (
@@ -471,12 +695,46 @@ def _build_tools(state: SessionState, session_id: str) -> list:
             bill_id: The bill identifier, e.g. "bill_1".
             assignments: List of assignment objects. Each must have:
                 - item_name (str): Item name as it appears in the bill.
-                - assigned_to (list[str]): Participant names who had this item (equal split of full qty).
-                - shared (bool): True if cost splits equally among assigned_to.
-                - qty_per_person (dict, optional): Maps participant name -> number of units they consumed
-                  (can be fractional, e.g. 0.25 for a quarter unit). Use this for qty-based splits.
-                  Unallocated qty is split equally among the remaining assigned_to.
-                  Example: item qty=4, qty_per_person={"Alice": 1, "Bob": 3} => Alice pays 1/4, Bob pays 3/4.
+                - assigned_to (list[str]): Everyone who had this item, including anyone also
+                  named in qty_per_person/percentage_per_person/amount_per_person below.
+                - shared (bool): True if cost splits equally among assigned_to (only meaningful
+                  when none of the three allocation dicts below are used).
+
+              Pick AT MOST ONE of the following three allocation modes per item — they are
+              mutually exclusive with each other and with plain equal-split assigned_to. In all
+              three, anyone listed in assigned_to but NOT given an explicit share splits
+              whatever's left of the item price equally among themselves.
+
+                - qty_per_person (dict[str, float], optional): participant name -> number of
+                  units they consumed (fractional units allowed, e.g. 0.25 for a quarter unit).
+                  Resolves to dollars via the item's price / qty.
+                  Example: item "Burgers" has qty=4, price=$40 ($10/unit). "Alice had 1 burger,
+                  Bob had 3" ->
+                    assigned_to=["Alice", "Bob"], qty_per_person={"Alice": 1, "Bob": 3}
+                  (Alice pays $10, Bob pays $30.)
+
+                - percentage_per_person (dict[str, float], optional): participant name ->
+                  percentage (0-100, NOT 0-1) of this item's price.
+                  Example: item "Beer" costs $21, 8 people shared it, Alice had more than her
+                  share. "Alice had 30% of the beer, the other 7 split the rest equally" ->
+                    assigned_to=["Alice", "Bob", "Carol", "Dan", "Eve", "Frank", "Gina", "Hank"],
+                    percentage_per_person={"Alice": 30}
+                  (Alice pays $6.30; the other 7 split the remaining $14.70 -> $2.10 each.)
+
+                - amount_per_person (dict[str, float], optional): participant name -> exact
+                  dollar amount of this item's price they owe (must be non-negative).
+                  Example: item "Cake" costs $18. "Alice put in $12 for the cake, Bob covers
+                  the rest" ->
+                    assigned_to=["Alice", "Bob"], amount_per_person={"Alice": 12.0}
+                  (Alice pays $12, Bob pays the remaining $6.)
+
+              Omitting all three (just assigned_to + shared) keeps the original behavior: the
+              full item price splits equally among everyone in assigned_to.
+
+              Whichever mode is used, the resolved per-person dollar amounts must add up to the
+              item's price (within a small rounding tolerance) — if they don't (e.g. percentages
+              or amounts that overshoot), this call returns an error instead of assigning
+              anything for that item.
         """
         user_id = _speaker_user_id(config)
         mode, bill, ref = _load_bill_for_edit(state, session_id, bill_id, user_id)
@@ -488,21 +746,43 @@ def _build_tools(state: SessionState, session_id: str) -> list:
         return summary + _persist_edit(session_id, user_id, mode, bill, ref, changed)
 
     @tool
-    def set_payer(bill_id: str, paid_by: str, config: RunnableConfig) -> str:
+    def set_payer(bill_id: str, payers: list[dict], config: RunnableConfig) -> str:
         """
-        Record who paid for a specific bill.
+        Record who paid for a specific bill. Supports a single payer or multiple payers
+        splitting the payment itself (as opposed to splitting who owes what for the items).
+
         Call this when the user says who covered the tab.
 
         Args:
             bill_id: The bill identifier.
-            paid_by: Name of the participant who paid.
+            payers: List of payer entries, each a dict with a "name" (str) and AT MOST ONE of:
+                - "amount" (float, non-negative): the exact dollar amount this person paid.
+                - "percentage" (float, 0-100, NOT 0-1): the percentage of the bill's total
+                  (subtotal + tax + tip) this person paid.
+                - neither key: this person's payment is an equal share of whatever's left of
+                  the bill total after the explicit amount/percentage entries above are
+                  subtracted out.
+
+              Examples (bill total = $100):
+                - "Alice paid for everything":
+                  payers=[{"name": "Alice"}]
+                - "Alice paid $60, Bob paid $40":
+                  payers=[{"name": "Alice", "amount": 60.0}, {"name": "Bob", "amount": 40.0}]
+                - "Alice paid 73%, Bob paid the rest":
+                  payers=[{"name": "Alice", "percentage": 73.0}, {"name": "Bob"}]
+                - "Alice, Bob, and Carol split paying for it evenly":
+                  payers=[{"name": "Alice"}, {"name": "Bob"}, {"name": "Carol"}]
+
+              The resolved amounts must add up to the bill's total within a small rounding
+              tolerance — if they don't, this call returns an error instead of recording
+              anything.
         """
         user_id = _speaker_user_id(config)
         mode, bill, ref = _load_bill_for_edit(state, session_id, bill_id, user_id)
         if bill is None:
             return f"Error: bill '{bill_id}' not found."
 
-        changed, message = _apply_set_payer(bill, paid_by, state.participants)
+        changed, message = _apply_set_payer(bill, payers, state.participants)
         return message + _persist_edit(session_id, user_id, mode, bill, ref, changed)
 
     @tool
@@ -533,8 +813,13 @@ def _build_tools(state: SessionState, session_id: str) -> list:
     @tool
     def calculate_split() -> str:
         """
-        Compute the final settlement using all bills and assignments.
-        Call this when the user says they are done or asks for the final result.
+        Show the group the current settlement — who owes whom, based on all approved
+        bills/assignments/payers so far. A pure report: it reads state.bills and never
+        changes anything, so call it as often as you like (whenever the user asks "who
+        owes what" or "show me the split"), not just once at the end. There's no
+        "finalize" step — the numbers simply reflect whatever's been approved by the
+        time you call it, and will differ on a later call if more bills or corrections
+        get approved in between.
         Tax and tip are automatically distributed proportionally.
         Any unassigned items are split equally among all participants.
         """
@@ -543,7 +828,7 @@ def _build_tools(state: SessionState, session_id: str) -> list:
         if not state.bills:
             return "Error: no bills added yet."
 
-        missing_payers = [b.bill_id for b in state.bills if b.paid_by is None]
+        missing_payers = [b.bill_id for b in state.bills if not b.paid_by]
         if missing_payers:
             return f"Error: payer not set for {missing_payers}. Please set payers first."
 
@@ -555,7 +840,6 @@ def _build_tools(state: SessionState, session_id: str) -> list:
             warning_text = "Note: " + "; ".join(warnings) + "\n\n"
             report = warning_text + report
 
-        state.finalized = True
         return report
 
     return [add_bill, set_participants, assign_items, set_payer, mark_items_unassigned, calculate_split]

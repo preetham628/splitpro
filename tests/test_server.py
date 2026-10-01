@@ -68,11 +68,11 @@ def sample_payload(bill_id="bill_1", description="Dinner"):
         "raw_text": "raw text",
         "items": [
             {"name": "Burger", "price": 10.0, "qty": 1, "assigned_to": ["Alice"],
-             "shared": False, "unassigned": False, "qty_allocations": {}}
+             "shared": False, "unassigned": False, "cost_allocations": {}}
         ],
         "tax": 1.0,
         "tip": 2.0,
-        "paid_by": "Alice",
+        "paid_by": {"Alice": 13.0},
     }
 
 
@@ -313,6 +313,33 @@ def test_approve_proposal_evicts_cache_so_next_turn_keeps_the_bill(fresh_server,
 
     persisted = db.load_session_state(session_id)
     assert [b["description"] for b in persisted["bills"]] == ["Dinner"]
+
+
+def test_get_state_has_no_finalized_field_and_settlement_is_always_live(fresh_server, monkeypatch):
+    """task7: sessions are never "finalized" in this app, so the field is
+    dropped entirely; settlement is computed unconditionally (empty when
+    there isn't enough data yet, non-empty as soon as a bill has a payer —
+    no separate finalize action required)."""
+    monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
+
+    admin = make_user("admin-live@example.com", "g-admin-live", "AdminLive")
+    session_id = make_session_with_members(admin)
+
+    state = server.get_state(session_id, admin)
+    assert "finalized" not in state
+    assert state["settlement"] == []  # no bills yet
+
+    # assigned_to spans two people so the payer (Alice alone) isn't also the
+    # sole beneficiary — otherwise the net balance is a legitimate zero and
+    # settlement would be [] even though a payer is set.
+    payload = sample_payload()
+    payload["items"][0]["assigned_to"] = ["Alice", "Bob"]
+    pid = db.create_proposal(session_id, admin["id"], payload)
+    server.approve_proposal(session_id, pid, admin)
+
+    state = server.get_state(session_id, admin)
+    assert "finalized" not in state
+    assert state["settlement"] != []  # a bill with a payer exists now, no finalize needed
 
 
 def test_reject_proposal_evicts_cache(fresh_server, monkeypatch):

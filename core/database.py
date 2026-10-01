@@ -7,7 +7,10 @@ Tables (see schema.sql for the authoritative definitions):
   chat_messages         — UI-facing chat transcript (role, content, optional image)
   session_participants  — participant names per session
   bills / bill_items    — parsed bills, normalized (replaces the old session_state JSON blob)
-  settlements           — computed once a session is finalized
+  settlements           — unused legacy snapshot table; settlement is now computed
+                          on demand (see server.py's _compute_settlement) rather
+                          than persisted, but the table/column are left in place
+                          to avoid a migration out of scope for that change
   session_members       — per-user admin/member role on a session
   expense_proposals     — AI-drafted expenses staged for admin approval
 

@@ -19,8 +19,8 @@ class Settlement:
         The single source of truth for this math — previously duplicated
         between agents/chat_agent.py's calculate_split tool and server.py's
         state-panel preview, and the two copies had drifted: the server.py
-        one didn't handle qty_allocations (fractional/per-unit splits) at
-        all, so the live preview and the finalized report could disagree.
+        one didn't handle cost_allocations (per-person dollar splits) at
+        all, so the live preview and the settlement report could disagree.
 
         Returns (balances, warnings) — warnings flag items that had no
         explicit assignment and were split equally across all participants.
@@ -34,21 +34,35 @@ class Settlement:
             person_subtotal: Dict[str, float] = defaultdict(float)
 
             for item in bill.items:
-                if item.qty_allocations:
-                    # Qty-based: pay unit_price * units consumed
-                    unit_price = item.unit_price
-                    allocated_qty = sum(item.qty_allocations.values())
-                    for person, pqty in item.qty_allocations.items():
-                        person_subtotal[person] += unit_price * pqty
+                if item.unassigned:
+                    # Explicitly marked for an equal split among everyone — checked
+                    # before cost_allocations, as defense-in-depth independent of
+                    # whatever sets `unassigned`: a stale cost_allocations map left
+                    # behind by whatever previously split this item must never
+                    # silently override this intentional equal split (today the one
+                    # call site setting unassigned=True also clears
+                    # cost_allocations, but that's a second line of defense, not
+                    # something this ordering should have to rely on).
+                    recipients = item.assigned_to if item.assigned_to else participants
+                    if recipients:
+                        share = item.price / len(recipients)
+                        for person in recipients:
+                            person_subtotal[person] += share
+                elif item.cost_allocations:
+                    # Dollar-based: each person's share is already a dollar
+                    # amount — no unit-price conversion needed.
+                    allocated_amount = sum(item.cost_allocations.values())
+                    for person, amount in item.cost_allocations.items():
+                        person_subtotal[person] += amount
 
-                    # Unallocated remainder goes equally to assigned_to minus those with explicit qtys
-                    remaining_qty = item.qty - allocated_qty
-                    if remaining_qty > 1e-9:
-                        remainder_people = [p for p in item.assigned_to if p not in item.qty_allocations]
+                    # Unallocated remainder goes equally to assigned_to minus those with explicit amounts
+                    remaining_amount = item.price - allocated_amount
+                    if remaining_amount > 1e-9:
+                        remainder_people = [p for p in item.assigned_to if p not in item.cost_allocations]
                         if not remainder_people:
                             remainder_people = participants
                         if remainder_people:
-                            share = unit_price * remaining_qty / len(remainder_people)
+                            share = remaining_amount / len(remainder_people)
                             for person in remainder_people:
                                 person_subtotal[person] += share
                 else:
@@ -74,9 +88,11 @@ class Settlement:
                     for person in participants:
                         person_subtotal[person] += equal_share
 
-            # Accumulate into global balances
-            bill_total = sum(person_subtotal.values())
-            global_balances[bill.paid_by] += bill_total
+            # Accumulate into global balances. A bill can have multiple
+            # payers (bill.paid_by is a person -> dollar-amount-paid map) —
+            # credit each payer their own contribution, not the full total.
+            for payer, amount_paid in bill.paid_by.items():
+                global_balances[payer] += amount_paid
             for person, amount in person_subtotal.items():
                 global_balances[person] -= amount
 
