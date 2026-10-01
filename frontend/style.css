@@ -170,6 +170,47 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   overflow: hidden;
 }
 
+/* WhatsApp-style title bar: current session's name, double-click to rename
+   (reuses the sidebar's startRename()), and an auto-naming toggle. */
+.chat-title-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+.chat-title-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chat-title-name[contenteditable="true"] {
+  outline: none;
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+}
+.auto-name-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  user-select: none;
+}
+.auto-name-toggle input { cursor: pointer; }
+
 .messages {
   flex: 1;
   overflow-y: auto;

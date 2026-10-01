@@ -8,6 +8,10 @@ let currentUser = null;
 let members     = new Map();  // user_id -> {user_id, name, email, avatar_url, role}
 let isCurrentUserAdmin = false;
 let activeTab   = 'session';
+// Last list fetched by loadSessionList() — kept around so the title bar
+// (which needs just the *current* session's name/title_auto) doesn't need
+// its own fetch; it's refreshed every time the sidebar is.
+let sessionsCache = [];
 // Bumped only by createNewSession/loadSession, checked only by
 // createNewSession — this is "did the active session change" and is a
 // distinct concern from loadProposals()'s own reentrancy guard below. They
@@ -48,6 +52,8 @@ const loginOverlay  = document.getElementById('login-overlay');
 const appEl         = document.getElementById('app');
 const sessionList   = document.getElementById('session-list');
 const newSessionBtn = document.getElementById('new-session-btn');
+const chatTitleName  = document.getElementById('chat-title-name');
+const autoNameToggle = document.getElementById('auto-name-toggle');
 const userAvatar    = document.getElementById('user-avatar');
 const userName      = document.getElementById('user-name');
 const logoutBtn     = document.getElementById('logout-btn');
@@ -114,11 +120,48 @@ logoutBtn.addEventListener('click', async () => {
 // ── Session management ────────────────────────────────────────────────────────
 async function loadSessionList() {
   const res = await fetch(`${API}/api/sessions`, { credentials: 'include' });
-  const sessions = await res.json();
-  renderSessionList(sessions);
+  const sessionsData = await res.json();
+  sessionsCache = sessionsData;
+  renderSessionList(sessionsData);
+  updateChatTitleBar();
+}
+
+// Reflects the current session's name + auto-naming toggle in the title bar
+// above the chat panel. Reads from sessionsCache rather than issuing its own
+// fetch — it's refreshed everywhere the sidebar already is (loadSessionList
+// is the single source for both), including right after a manual rename
+// (startRename) or an auto-rename (sendToAgent/sendImageToAgent).
+function updateChatTitleBar() {
+  // Don't clobber an in-progress inline edit (startRename() flips this to
+  // 'true' while the user is actively typing a new name) — a sidebar
+  // refresh landing mid-edit would otherwise wipe out whatever they've
+  // typed so far out from under them.
+  if (chatTitleName.contentEditable === 'true') return;
+
+  const current = sessionsCache.find(s => s.id === sessionId);
+  if (!current) {
+    chatTitleName.textContent = '';
+    autoNameToggle.checked = false;
+    return;
+  }
+  chatTitleName.textContent = current.name;
+  chatTitleName.title = current.name;
+  autoNameToggle.checked = !!current.title_auto;
 }
 
 function renderSessionList(sessions) {
+  // Same bug class as updateChatTitleBar()'s guard, just on the sidebar's
+  // own rename path: this function unconditionally wipes and rebuilds every
+  // <li>, including whichever one's nameSpan startRename() just flipped to
+  // contentEditable — a refresh landing mid-edit (e.g. from loadSessionList()
+  // racing a dblclick-to-rename) would otherwise destroy that span and
+  // recreate it fresh with the old name, silently discarding whatever the
+  // user has typed so far. Bail out of the whole rebuild while any sidebar
+  // item is being edited; the next call (e.g. right after that rename's own
+  // finish() triggers loadSessionList()) picks up the latest data once the
+  // edit is no longer in progress.
+  if (sessionList.querySelector('.session-item-name[contenteditable="true"]')) return;
+
   sessionList.innerHTML = '';
   sessions.forEach(s => {
     const li = document.createElement('li');
@@ -193,6 +236,7 @@ async function loadSession(id) {
   membersContent.innerHTML = '<p class="muted">Loading…</p>';
   approvalsContent.innerHTML = '<p class="muted">No pending proposals.</p>';
   switchTab('session');
+  updateChatTitleBar();
 
   // Member list is loaded first (and awaited) so both message attribution
   // (sender names) and the admin-only approval/member controls have the
@@ -657,6 +701,10 @@ function startRename(id, nameSpan) {
       credentials: 'include',
       body: JSON.stringify({ name: newName }),
     });
+    // A manual rename also turns off auto-naming server-side (title_auto ->
+    // false) — refresh so both the sidebar and the title bar's toggle pick
+    // that up, regardless of which of the two UI spots started this edit.
+    await loadSessionList();
   };
 
   nameSpan.addEventListener('blur', finish, { once: true });
@@ -667,6 +715,29 @@ function startRename(id, nameSpan) {
 }
 
 newSessionBtn.addEventListener('click', createNewSession);
+
+// Title bar: double-click to rename, same wiring as the sidebar's own
+// session-name span — reuses startRename() rather than duplicating its
+// rename/PATCH logic.
+chatTitleName.addEventListener('dblclick', () => {
+  if (!sessionId) return;
+  startRename(sessionId, chatTitleName);
+});
+
+autoNameToggle.addEventListener('change', async () => {
+  if (!sessionId) return;
+  const auto = autoNameToggle.checked;
+  try {
+    await fetch(`${API}/api/sessions/${sessionId}/title-auto`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ auto }),
+    });
+  } finally {
+    await loadSessionList();
+  }
+});
 
 // ── Send helpers ──────────────────────────────────────────────────────────────
 async function sendToAgent(text) {
