@@ -261,8 +261,18 @@ def _resolve_contribution_entries(
     `explicit` is name -> amount (if is_percentage is False) or name ->
     percentage 0-100 (if is_percentage is True). Returns (resolved_map,
     error) — error is a human-readable string (percentage out of range, or
-    explicit entries alone already exceed the total) when resolution isn't
-    possible; resolved_map is None in that case.
+    a negative amount) when resolution isn't possible; resolved_map is None
+    in that case.
+
+    Deliberately does NOT reject here just because the explicit entries
+    alone already exceed `total` — validate_contribution_map, which every
+    caller runs against the fully resolved map (equal-share remainder
+    included), is the single source of truth for "does this add up," with
+    its N-way-scaled tolerance for legitimate rounding splits. An earlier
+    version had a flat `total + 0.01` check here that rejected exactly the
+    splits this feature exists for (e.g. three people at $33.34 each on a
+    $100 bill sums to $100.02, within validate_contribution_map's own
+    tolerance but over a flat one-cent epsilon).
     """
     if is_percentage:
         for name, pct in explicit.items():
@@ -270,16 +280,13 @@ def _resolve_contribution_entries(
                 return None, f"percentage for '{name}' must be between 0 and 100, got {pct}."
         resolved = {name: total * pct / 100.0 for name, pct in explicit.items()}
     else:
+        for name, amount in explicit.items():
+            if amount < 0:
+                return None, f"amount for '{name}' must be non-negative, got {amount}."
         resolved = dict(explicit)
 
-    explicit_total = sum(resolved.values())
-    if explicit_total > total + 0.01:
-        return None, (
-            f"the explicit amounts/percentages given already add up to ${explicit_total:.2f}, "
-            f"which exceeds the ${total:.2f} total."
-        )
-
     if equal_share_names:
+        explicit_total = sum(resolved.values())
         remainder = total - explicit_total
         share = remainder / len(equal_share_names)
         for name in equal_share_names:
@@ -490,13 +497,17 @@ def _apply_set_payer(bill: ParsedBill, payers: list[dict], participants: list[st
 
     total = bill.total()
 
-    # Resolve percentage entries to dollars first, then treat them exactly
-    # like explicit amounts for the remainder-splitting math.
+    # Resolve percentage entries to dollars first — via the shared helper,
+    # so the 0-100 bound is only checked in one place (_resolve_contribution_
+    # entries itself) rather than duplicated here — then merge them in with
+    # any explicit dollar entries for the remainder-splitting pass below.
     if explicit_percentages:
-        for name, pct in explicit_percentages.items():
-            if not (0 <= pct <= 100):
-                return False, f"Error: percentage for '{name}' must be between 0 and 100, got {pct}."
-        explicit_amounts.update({name: total * pct / 100.0 for name, pct in explicit_percentages.items()})
+        pct_resolved, error = _resolve_contribution_entries(
+            explicit_percentages, is_percentage=True, equal_share_names=[], total=total
+        )
+        if error:
+            return False, f"Error: {error}"
+        explicit_amounts.update(pct_resolved)
 
     resolved, error = _resolve_contribution_entries(
         explicit_amounts, is_percentage=False, equal_share_names=equal_share_names, total=total
@@ -529,6 +540,11 @@ def _apply_mark_unassigned(
             item.assigned_to = list(participants)
             item.shared = True
             item.unassigned = True
+            # Clear any prior amount/percentage/qty allocation — compute_balances
+            # checks cost_allocations before falling back to an equal split, so a
+            # stale map here would silently override the equal split this tool is
+            # supposed to produce.
+            item.cost_allocations = {}
             updated.append(item.name)
 
     if not updated:
@@ -675,7 +691,7 @@ def _build_tools(state: SessionState, session_id: str) -> list:
                   (Alice pays $6.30; the other 7 split the remaining $14.70 -> $2.10 each.)
 
                 - amount_per_person (dict[str, float], optional): participant name -> exact
-                  dollar amount of this item's price they owe.
+                  dollar amount of this item's price they owe (must be non-negative).
                   Example: item "Cake" costs $18. "Alice put in $12 for the cake, Bob covers
                   the rest" ->
                     assigned_to=["Alice", "Bob"], amount_per_person={"Alice": 12.0}
@@ -709,7 +725,7 @@ def _build_tools(state: SessionState, session_id: str) -> list:
         Args:
             bill_id: The bill identifier.
             payers: List of payer entries, each a dict with a "name" (str) and AT MOST ONE of:
-                - "amount" (float): the exact dollar amount this person paid.
+                - "amount" (float, non-negative): the exact dollar amount this person paid.
                 - "percentage" (float, 0-100, NOT 0-1): the percentage of the bill's total
                   (subtotal + tax + tip) this person paid.
                 - neither key: this person's payment is an equal share of whatever's left of

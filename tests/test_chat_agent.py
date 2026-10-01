@@ -521,6 +521,46 @@ def test_set_payer_rejects_unknown_participant():
     assert state.bills[0].paid_by == {}
 
 
+def test_set_payer_accepts_legitimate_n_way_rounding_split():
+    """Three people each paying $33.34 on a $100 bill sums to $100.02 — a
+    legitimate N-way rounding remainder validate_contribution_map's own
+    scaled tolerance accepts. A flat epsilon pre-check in
+    _resolve_contribution_entries used to reject this before
+    validate_contribution_map ever got a say; it must not anymore."""
+    state, _assign, set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob", "Carol"], one_item_bill(price=100.0)
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = set_payer.invoke({
+        "bill_id": bill_id,
+        "payers": [
+            {"name": "Alice", "amount": 33.34},
+            {"name": "Bob", "amount": 33.34},
+            {"name": "Carol", "amount": 33.34},
+        ],
+    })
+
+    assert "Error" not in msg
+    assert state.bills[0].paid_by == {"Alice": 33.34, "Bob": 33.34, "Carol": 33.34}
+
+
+def test_set_payer_rejects_negative_amount():
+    state, _assign, set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob"], one_item_bill(price=100.0)
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = set_payer.invoke({
+        "bill_id": bill_id,
+        "payers": [{"name": "Alice", "amount": 150.0}, {"name": "Bob", "amount": -50.0}],
+    })
+
+    assert "Error" in msg
+    assert "non-negative" in msg
+    assert state.bills[0].paid_by == {}
+
+
 # ---------- assign_items: percentage_per_person / amount_per_person modes ----------
 
 def test_assign_items_percentage_mode_splits_remainder_equally():
@@ -582,6 +622,32 @@ def test_assign_items_amount_mode_splits_remainder_equally():
     assert item.cost_allocations == {"Alice": 12.0, "Bob": 6.0}
 
 
+def test_assign_items_rejects_negative_amount_per_person():
+    state, assign_items, _set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob"],
+        {
+            "raw_text": "Cake $18",
+            "description": "Dessert",
+            "items": [{"name": "Cake", "price": 18.0, "qty": 1}],
+            "tax": 0.0,
+            "tip": 0.0,
+        },
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = assign_items.invoke({
+        "bill_id": bill_id,
+        "assignments": [{
+            "item_name": "Cake",
+            "assigned_to": ["Alice", "Bob"],
+            "amount_per_person": {"Alice": 25.0, "Bob": -7.0},
+        }],
+    })
+
+    assert "non-negative" in msg
+    assert state.bills[0].items[0].cost_allocations == {}
+
+
 def test_assign_items_rejects_more_than_one_allocation_mode():
     state, assign_items, _set_payer, _calc = _legacy_tools(["Alice", "Bob"])
     bill_id = state.bills[0].bill_id
@@ -633,6 +699,56 @@ def test_assign_items_default_equal_split_still_works():
     assert item.cost_allocations == {}
     assert item.assigned_to == ["Alice", "Bob"]
     assert item.shared is True
+
+
+def test_mark_items_unassigned_clears_stale_cost_allocations():
+    """Regression: compute_balances checks item.cost_allocations BEFORE
+    falling back to an equal split across assigned_to, so an item
+    previously split by percentage/amount and then marked "split evenly"
+    must have that stale map cleared — otherwise mark_items_unassigned
+    silently keeps charging the old per-person amounts instead of an
+    equal split, with no warning to the caller."""
+    state = SessionState()
+    state.participants = ["Alice", "Bob", "Carol"]
+    add_bill, _set_p, assign_items, set_payer, mark_items_unassigned, _calc = _build_tools(
+        state, "unused-session-id"
+    )
+    add_bill.invoke({
+        "raw_text": "Thing $30",
+        "description": "Test",
+        "items": [{"name": "Thing", "price": 30.0, "qty": 1}],
+        "tax": 0.0,
+        "tip": 0.0,
+    })
+    bill_id = state.bills[0].bill_id
+
+    # Stale allocation: Alice was on the hook for the whole item.
+    assign_items.invoke({
+        "bill_id": bill_id,
+        "assignments": [{
+            "item_name": "Thing",
+            "assigned_to": ["Alice", "Bob", "Carol"],
+            "percentage_per_person": {"Alice": 100},
+        }],
+    })
+    # Alice's 100% leaves Bob/Carol a $0 explicit share of this item — a
+    # stale allocation that, before mark_items_unassigned clears it, would
+    # keep charging them nothing instead of the equal 1/3 share they should
+    # get once the item is marked "split evenly."
+    assert state.bills[0].items[0].cost_allocations == {"Alice": 30.0, "Bob": 0.0, "Carol": 0.0}
+
+    mark_items_unassigned.invoke({"bill_id": bill_id, "item_names": ["Thing"]})
+
+    item = state.bills[0].items[0]
+    assert item.cost_allocations == {}, "stale allocation must be cleared, not left to override the equal split"
+    assert item.unassigned is True
+    assert item.assigned_to == ["Alice", "Bob", "Carol"]
+
+    set_payer.invoke({"bill_id": bill_id, "payers": [{"name": "Alice"}]})
+    balances, warnings = Settlement.compute_balances(state.participants, state.bills)
+    assert balances["Alice"] == pytest.approx(20.0)
+    assert balances["Bob"] == pytest.approx(-10.0)
+    assert balances["Carol"] == pytest.approx(-10.0)
 
 
 # ---------- calculate_split: live view, not a one-time finalize (task7) ----------
