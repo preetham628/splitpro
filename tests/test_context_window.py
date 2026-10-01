@@ -52,6 +52,7 @@ def fresh_server(fresh_db, monkeypatch):
     checkpointer.init_checkpointer(":memory:")
     monkeypatch.setattr(server, "sessions", {})
     monkeypatch.setattr(server, "_session_locks", {})
+    monkeypatch.setattr(server, "_summarizing_sessions", set())
     return fresh_db
 
 
@@ -259,8 +260,15 @@ def test_safety_net_triggers_with_round_count_under_window(fresh_db, monkeypatch
     assert 1 <= remaining_round_count < round_count
     assert len(remaining_messages) < len(messages)
 
-    # Applying it for real actually shrinks the checkpoint below the safety
-    # net, confirming this isn't just a planning no-op.
+    # Applying it for real actually drops the checkpoint by exactly the
+    # removed-round count, confirming this isn't just a planning no-op. Note
+    # this one pass does NOT necessarily drop back under MESSAGE_SAFETY_NET
+    # itself here -- the only round left standing is the oversized one that
+    # tripped the safety net in the first place, and plan_context_
+    # summarization deliberately never folds away the last remaining round
+    # (see its docstring). A later turn adding ordinary rounds on top would
+    # eventually let a further pass absorb it the same way the round-window
+    # path does.
     new_summary = summarize_rounds(agent.config, db.get_context_summary(session_id), _messages_to_summarize)
     assert agent.apply_context_summarization(ids_to_remove, new_summary) is True
     messages_after = agent.checkpoint_messages()
@@ -315,15 +323,19 @@ def test_context_summary_not_injected_for_cli_legacy_path(fresh_db, monkeypatch)
 # ---------- Background task orchestration + locking (server.py) ----------
 
 def test_chat_schedules_background_task_without_invoking_it_synchronously(fresh_server, monkeypatch):
-    """background_tasks.add_task must only register the summarization check
-    for FastAPI to run after the response is sent -- confirms chat() never
-    awaits/calls it inline, which is what actually guarantees zero added
-    latency on the triggering request."""
+    """When summarization IS needed, background_tasks.add_task must only
+    register the check for FastAPI to run after the response is sent --
+    confirms chat() never awaits/calls it inline, which is what actually
+    guarantees zero added latency on the triggering request."""
     # Avoid a real (unmocked) create_llm() call here -- the first-ever call
     # pays a one-time real-provider-SDK import cost unrelated to anything
     # under test here, which would make the timing assertion below flaky.
     monkeypatch.setattr("agents.chat_agent.create_llm", lambda config: FakeLLM())
     monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
+    # ChatAgent.chat is fully mocked out above (bypassing the real graph), so
+    # the checkpoint never actually grows -- force the needs-check itself so
+    # the scheduling path under test is actually exercised.
+    monkeypatch.setattr(ChatAgent, "needs_context_summarization", lambda self: True)
 
     summarize_called = threading.Event()
 
@@ -345,6 +357,57 @@ def test_chat_schedules_background_task_without_invoking_it_synchronously(fresh_
     assert elapsed < 0.5, f"chat() took {elapsed}s -- summarization must never run inline"
     assert not summarize_called.is_set(), "background task body ran synchronously instead of being scheduled"
     assert len(bg.tasks) == 1
+
+
+def test_chat_does_not_schedule_background_task_when_not_needed(fresh_server, monkeypatch):
+    """The common case -- most turns, most sessions -- must not schedule a
+    background task at all. A deviation from this was flagged in review:
+    the original implementation scheduled unconditionally on every single
+    turn and only checked inside the task, meaning even a session's very
+    first message paid for an extra background thread + checkpoint read
+    for nothing."""
+    monkeypatch.setattr("agents.chat_agent.create_llm", lambda config: FakeLLM())
+    monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
+    # ChatAgent.chat is mocked out, so the checkpoint never grows -- this is
+    # also naturally true for a session's first real message either way.
+    assert ChatAgent.needs_context_summarization  # sanity: not already removed/renamed
+
+    admin = make_user("admin@example.com", "g-noneed-admin")
+    session_id = make_session_with_members(admin)
+
+    bg = BackgroundTasks()
+    result = server.chat(session_id, server.ChatRequest(message="hi"), background_tasks=bg, user=admin)
+
+    assert result.response == "ok"
+    assert len(bg.tasks) == 0, "a background task was scheduled even though summarization wasn't needed"
+    assert session_id not in server._summarizing_sessions
+
+
+def test_concurrent_turns_only_schedule_one_summarization(fresh_server, monkeypatch):
+    """Two concurrent turns that would each independently see "needs
+    summarization" must not each schedule their own background task / fire
+    their own (paid) LLM summarization call -- the in-flight guard
+    (_summarizing_sessions, checked-and-set under the per-session lock)
+    must let only the first one through."""
+    monkeypatch.setattr("agents.chat_agent.create_llm", lambda config: FakeLLM())
+    monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
+    monkeypatch.setattr(ChatAgent, "needs_context_summarization", lambda self: True)
+
+    admin = make_user("admin@example.com", "g-dedupe-admin")
+    session_id = make_session_with_members(admin)
+
+    # Prime the cache with one agent shared by both "concurrent" turns, same
+    # as a real session would have (server.sessions caches one ChatAgent per
+    # session_id, reused across requests/users).
+    server._get_agent(session_id, admin)
+
+    bg1, bg2 = BackgroundTasks(), BackgroundTasks()
+    server._schedule_context_summarization_if_needed(session_id, bg1)
+    server._schedule_context_summarization_if_needed(session_id, bg2)
+
+    assert len(bg1.tasks) == 1, "the first caller to see 'needs summarization' must schedule it"
+    assert len(bg2.tasks) == 0, "a second concurrent caller must not schedule a duplicate"
+    assert session_id in server._summarizing_sessions
 
 
 def test_background_summarization_unlocked_phase_does_not_block_concurrent_chat_turn(fresh_server, monkeypatch):

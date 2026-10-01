@@ -1284,7 +1284,10 @@ class ChatAgent:
         if n <= 0:
             return None
 
-        cut = boundaries[n] if n < round_count else len(messages)
+        # n is always strictly less than round_count here: n <= round_count - 1
+        # by construction above, and the n <= 0 check already returned for
+        # round_count <= 1 — so boundaries[n] is always a valid index.
+        cut = boundaries[n]
         to_summarize = messages[:cut]
         if not to_summarize:
             return None
@@ -1303,8 +1306,21 @@ class ChatAgent:
         path today) race where the session was independently trimmed since
         the snapshot these ids came from was taken. Returns False (a no-op)
         if that guard fails or there's nothing to remove; True once the
-        checkpoint surgery and the context_summary persist have both
+        context_summary persist and the checkpoint surgery have both
         completed.
+
+        Persists the summary to the DB *before* removing the messages from
+        the checkpoint, deliberately — these two writes aren't transactional
+        (they're two different stores: core/database.py vs. the checkpointer),
+        so the order determines the failure mode if one side fails partway.
+        Persist-then-remove means a failure persisting leaves the checkpoint
+        untouched (nothing lost, safe to retry on the next trigger); removing
+        first would instead risk a successful removal followed by a failed
+        persist, permanently losing that part of the conversation with no
+        summary ever saved to cover for it. A failure removing *after* a
+        successful persist, by contrast, just leaves harmless redundant
+        overlap (the summary already covers messages still also present
+        verbatim) — a much safer failure mode than silent data loss.
         """
         if not message_ids_to_remove:
             return False
@@ -1315,12 +1331,12 @@ class ChatAgent:
         if not set(message_ids_to_remove).issubset(current_ids):
             return False
 
+        db.set_context_summary(self.session_id, new_summary)
         self._graph.update_state(
             config,
             {"messages": [RemoveMessage(id=mid) for mid in message_ids_to_remove]},
             as_node="agent",
         )
-        db.set_context_summary(self.session_id, new_summary)
         return True
 
     def set_state(self, state: SessionState) -> None:

@@ -35,8 +35,8 @@ from core.session_state import ParsedBill
 @pytest.fixture
 def fresh_server(tmp_path, monkeypatch):
     """Fresh DB + checkpointer per test, and a clean server-side cache —
-    server.sessions / server._session_locks are module-level globals shared
-    across the whole test session otherwise."""
+    server.sessions / server._session_locks / server._summarizing_sessions
+    are module-level globals shared across the whole test session otherwise."""
     path = str(tmp_path / "test.db")
     db.create_db(path)
     db.init_db(path)
@@ -44,6 +44,7 @@ def fresh_server(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server, "sessions", {})
     monkeypatch.setattr(server, "_session_locks", {})
+    monkeypatch.setattr(server, "_summarizing_sessions", set())
 
     return path
 
