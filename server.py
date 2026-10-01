@@ -156,6 +156,7 @@ def _serialize_state(state: SessionState, session_id: str) -> dict:
                         "price": item.price,
                         "assigned_to": item.assigned_to,
                         "shared": item.shared,
+                        "cost_allocations": item.cost_allocations,
                     }
                     for item in bill.items
                 ],
