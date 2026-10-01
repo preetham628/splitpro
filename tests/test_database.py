@@ -1099,6 +1099,28 @@ def test_validate_contribution_map_accepts_unavoidable_n_way_rounding_remainder(
     assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 20.0}, 100.0) is False
 
 
+def test_validate_contribution_map_tolerance_is_capped_at_large_group_sizes():
+    """The per-person tolerance scaling must not be unbounded: at ~100
+    contributors, an uncapped tolerance (0.01 * 100 = $1.00) would let a
+    genuine $1.00 error in one person's contribution slip through as
+    "valid". A capped tolerance must still reject that, while still
+    accepting a 100-person map whose total is only off by an ordinary
+    cent-rounding remainder (well under the cap).
+    """
+    from core.session_state import validate_contribution_map
+
+    hundred_people_exact = {f"person_{i}": 1.0 for i in range(100)}
+    assert validate_contribution_map(hundred_people_exact, 100.0) is True
+
+    hundred_people_off_by_a_dollar = dict(hundred_people_exact)
+    hundred_people_off_by_a_dollar["person_0"] = 2.0  # total is now 101.0
+    assert validate_contribution_map(hundred_people_off_by_a_dollar, 100.0) is False
+
+    hundred_people_rounding_remainder = dict(hundred_people_exact)
+    hundred_people_rounding_remainder["person_0"] = 0.95
+    assert validate_contribution_map(hundred_people_rounding_remainder, 100.0) is True
+
+
 # ---------- Concurrency ----------
 
 def test_concurrent_demotion_never_zeroes_admins(fresh_db):

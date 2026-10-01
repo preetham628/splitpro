@@ -158,24 +158,37 @@ class SessionState:
         return "\n".join(lines)
 
 
+MAX_CONTRIBUTION_TOLERANCE = 0.50  # dollars; see validate_contribution_map()
+
+
 def validate_contribution_map(amounts: Dict[str, float], total: float, epsilon: float = 0.01) -> bool:
     """True if a person -> dollar-amount contribution map (paid_by or a
     LineItem's cost_allocations) sums to `total` within tolerance.
 
     `epsilon` is a per-person cent-rounding allowance, not a flat tolerance:
-    the accepted discrepancy is `epsilon * max(len(amounts), 1)`. A flat
-    tolerance tight enough to catch real mistakes on a single contribution
-    (e.g. a typo) is too tight for a legitimate N-way split, since dividing a
-    total evenly to the cent is frequently impossible — a basic 3-way equal
-    split of $100.00 is {33.33, 33.33, 33.33}, which sums to $99.99, a $0.01
-    discrepancy that only grows with more people. Scaling by the number of
-    contributors keeps a 1-2 person map's tolerance tight while still
-    accepting the unavoidable rounding remainder on a larger split.
+    the accepted discrepancy is `epsilon * max(len(amounts), 1)`, capped at
+    `MAX_CONTRIBUTION_TOLERANCE`. A flat tolerance tight enough to catch real
+    mistakes on a single contribution (e.g. a typo) is too tight for a
+    legitimate N-way split, since dividing a total evenly to the cent is
+    frequently impossible — a basic 3-way equal split of $100.00 is
+    {33.33, 33.33, 33.33}, which sums to $99.99, a $0.01 discrepancy that
+    only grows with more people. Scaling by the number of contributors keeps
+    a 1-2 person map's tolerance tight while still accepting the unavoidable
+    rounding remainder on a larger split.
+
+    The cap exists because the scaling is otherwise unbounded: at ~100
+    contributors, an uncapped tolerance (0.01 * 100 = $1.00) would let a
+    genuine $1.00 error in one person's contribution slip through as
+    "valid". This app's realistic group sizes (2-20 people) never approach
+    the cap — true per-cent rounding error for an even split is at most
+    about 0.005 per person, so the cap (0.50) comfortably covers up to
+    ~100 people's worth of legitimate rounding while still catching a
+    dollar-scale mistake at that same size.
 
     A reusable building block for the tool-call layer's input validation
     (e.g. rejecting a set_payer/assign_item call whose percentages or
     absolute amounts don't actually add up to the bill/item total) — not
     called from anywhere in this module itself yet.
     """
-    tolerance = epsilon * max(len(amounts), 1)
+    tolerance = min(epsilon * max(len(amounts), 1), MAX_CONTRIBUTION_TOLERANCE)
     return abs(sum(amounts.values()) - total) <= tolerance
