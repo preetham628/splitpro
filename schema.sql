@@ -23,6 +23,16 @@
 -- added via ALTER TABLE ADD COLUMN in _migrate_membership() rather than being
 -- retrofitted into the CREATE TABLE statements below.
 --
+-- Same story again for the multi-payer / flexible-split model: bills.paid_by
+-- used to hold a plain person-name string and now holds a JSON dollar-amount-
+-- per-person map (e.g. {"Alice": 1800.0, "Sumit": 1200.0}), and
+-- bill_items.qty_allocations (JSON fractional-unit-per-person map, only
+-- meaningful when qty > 1) has been replaced by bill_items.cost_allocations
+-- (JSON dollar-amount-per-person map, the same shape as paid_by). Existing
+-- rows are converted in place and the old qty_allocations column is dropped —
+-- see _migrate_split_model() in core/database.py, which follows the same
+-- drop-and-reshape pattern as _migrate_chat_sessions().
+--
 -- Usage (local, requires the sqlite3 CLI — ships with macOS/most Linux):
 --   sqlite3 splitpro.db < schema.sql
 --
@@ -85,23 +95,23 @@ CREATE TABLE IF NOT EXISTS bills (
     raw_text    TEXT NOT NULL DEFAULT '',
     tax         REAL NOT NULL DEFAULT 0,
     tip         REAL NOT NULL DEFAULT 0,
-    paid_by     TEXT,
+    paid_by     TEXT,  -- JSON dollar-amount-per-person map, e.g. {"Alice": 1800.0, "Sumit": 1200.0}
     UNIQUE(session_id, bill_id)
 );
 
--- assigned_to / qty_allocations stay JSON columns rather than further
+-- assigned_to / cost_allocations stay JSON columns rather than further
 -- normalized tables — small, bounded, always read/written as a unit with
 -- their item, never queried independently.
 CREATE TABLE IF NOT EXISTS bill_items (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    bill_id         INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
-    name            TEXT NOT NULL,
-    price           REAL NOT NULL,
-    qty             INTEGER NOT NULL DEFAULT 1,
-    assigned_to     TEXT NOT NULL DEFAULT '[]',
-    shared          INTEGER NOT NULL DEFAULT 0,
-    unassigned      INTEGER NOT NULL DEFAULT 0,
-    qty_allocations TEXT NOT NULL DEFAULT '{}'
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id          INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+    name             TEXT NOT NULL,
+    price            REAL NOT NULL,
+    qty              INTEGER NOT NULL DEFAULT 1,
+    assigned_to      TEXT NOT NULL DEFAULT '[]',
+    shared           INTEGER NOT NULL DEFAULT 0,
+    unassigned       INTEGER NOT NULL DEFAULT 0,
+    cost_allocations TEXT NOT NULL DEFAULT '{}'  -- JSON dollar-amount-per-person map, e.g. {"Alice": 8.00, "Bob": 4.00}
 );
 CREATE INDEX IF NOT EXISTS idx_bill_items_bill ON bill_items(bill_id);
 
