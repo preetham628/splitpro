@@ -17,6 +17,7 @@
   --radius:      12px;
   --sidebar-w:   300px;
   --session-w:   220px;
+  --header-h:    56px;
 }
 
 body {
@@ -67,15 +68,34 @@ body {
 .header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 20px;
-  height: 56px;
+  height: var(--header-h);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.header-left  { display: flex; align-items: center; gap: 10px; }
-.header-right { display: flex; align-items: center; gap: 12px; }
-.logo         { font-size: 22px; }
-h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
+.header-left  { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.header-right { display: flex; align-items: center; gap: 12px; min-width: 0; flex-shrink: 1; }
+.logo         { font-size: 22px; flex-shrink: 0; }
+h1 {
+  font-size: 18px; font-weight: 700; letter-spacing: -.3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+
+/* Panel toggle buttons — live in the header (not inside the panels
+   themselves, and not the chat title bar) so they stay reachable at any
+   screen width: a panel collapsed below its responsive breakpoint, or
+   collapsed manually on a wide screen, can always be brought back, and
+   once reopened as a mobile overlay drawer it can't cover its own
+   toggle, since the header sits above where that overlay is positioned. */
+.panel-toggle-btn {
+  flex-shrink: 0;
+  background: none; border: none; cursor: pointer;
+  color: var(--muted); padding: 6px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s, color .15s;
+}
+.panel-toggle-btn:hover { background: var(--accent-dim); color: var(--accent); }
+.panel-toggle-btn.active { color: var(--accent); background: var(--accent-dim); }
 
 .provider-badge {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
@@ -83,16 +103,27 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   background: var(--accent-dim); padding: 3px 9px; border-radius: 20px;
 }
 
-.user-info { display: flex; align-items: center; gap: 8px; }
+.user-info { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .user-avatar {
   width: 28px; height: 28px; border-radius: 50%;
   object-fit: cover; border: 1px solid var(--border);
+  flex-shrink: 0;
 }
-.user-name { font-size: 13px; font-weight: 500; color: var(--text); }
+.user-name {
+  font-size: 13px; font-weight: 500; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 120px;
+}
 .logout-btn {
   font-size: 12px; font-weight: 500; color: var(--muted);
   background: none; border: 1px solid var(--border);
   border-radius: 6px; padding: 3px 9px; cursor: pointer;
+  /* As a flex item of .user-info, this would otherwise be shrunk below its
+     content width before .user-name (which already has overflow:hidden,
+     so its auto min-width is 0 and it can absorb the squeeze via its
+     ellipsis truncation) gives up any space — wrapping "Sign out" onto two
+     lines at narrow widths instead of just truncating the name further. */
+  white-space: nowrap; flex-shrink: 0;
   transition: color .15s, border-color .15s;
 }
 .logout-btn:hover { color: var(--danger); border-color: var(--danger); }
@@ -111,6 +142,17 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   display: flex; flex-direction: column;
   flex-shrink: 0;
   overflow: hidden;
+  transition: width .2s ease, border-color .2s ease;
+}
+/* Collapsed via the sidebar toggle button (frontend/app.js) — either
+   manually on a wide screen, or by default below the 900px breakpoint. A
+   real toggle (not a dead-end media query) always lets it come back.
+   border-right: none (not just a transparent color) so the collapsed
+   width is a true 0 — box-sizing: border-box would otherwise floor it at
+   the border's own width. */
+.session-sidebar.collapsed {
+  width: 0;
+  border-right: none;
 }
 .session-sidebar-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -190,6 +232,7 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
+  min-width: 0;
 }
 .chat-title-name[contenteditable="true"] {
   outline: none;
@@ -360,6 +403,16 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   overflow-y: auto;
   flex-shrink: 0;
   padding: 16px;
+  transition: width .2s ease, padding .2s ease, border-color .2s ease;
+}
+/* Collapsed via the state-panel toggle button (frontend/app.js) — either
+   manually on a wide screen, or by default below the 640px breakpoint. A
+   real toggle (not a dead-end media query) always lets it come back. */
+.state-panel.collapsed {
+  width: 0;
+  padding: 0;
+  overflow: hidden;
+  border-left: none;
 }
 .state-panel h2 {
   font-size: 13px; font-weight: 700; text-transform: uppercase;
@@ -491,7 +544,10 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   display: flex; align-items: baseline; gap: 6px;
   font-size: 12px;
 }
-.item-name  { flex: 1; color: var(--text); }
+.item-name  {
+  flex: 1; min-width: 0; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .item-price { color: var(--muted); flex-shrink: 0; }
 .item-assign {
   font-size: 11px; color: var(--accent); flex-shrink: 0;
@@ -519,10 +575,65 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
 
 .muted { color: var(--muted); font-size: 13px; }
 
-/* Responsive: hide sidebars on small screens */
+/* Responsive: the header has no flex-wrap, and at a phone width there
+   isn't room for the logo+title, both panel toggles, the provider badge,
+   and the user info all on one row — the provider badge is purely
+   decorative chrome (not interactive, not load-bearing for any task), so
+   it's the first thing to go. Combined with the user-name/h1 ellipsis
+   truncation above, this keeps both toggle buttons on-screen (and the
+   header itself non-scrolling, since body has overflow: hidden) down to
+   a real stock phone width with the app's actual default header content —
+   not just a contrived short name.
+
+   560px (not 480px) is deliberate: below 560px there isn't room for the
+   badge *and* a fully-readable h1 title at the same time — a worst-case
+   (120px-capped, i.e. ellipsis-truncating) user-name plus "anthropic" (the
+   longest provider id) plus a single-line Sign-out button only leaves the
+   h1 its full, non-truncated width starting at ~551px. Picking anything
+   below that (480px was too low) means the instant the badge reappears
+   just above the breakpoint, the h1 gets squeezed harder than it was with
+   the badge hidden — a visible regression right at the boundary. 560px
+   gives a few pixels of margin beyond that ~551px crossover so the
+   transition is seamless in both directions. */
+@media (max-width: 560px) {
+  .provider-badge { display: none; }
+}
+
+/* Responsive: below these widths the session sidebar / state panel start
+   collapsed (via the .collapsed class above, applied in frontend/app.js),
+   but the panel-toggle buttons in the header always remain available to
+   bring either one back on demand — unlike a blunt `display: none` media
+   query, this isn't a dead end at narrow widths.
+   When a panel is reopened below its breakpoint, it overlays the chat
+   panel (fixed position, like a Discord/Slack/WhatsApp Web mobile drawer)
+   instead of squeezing the chat column down to nothing — see the
+   `.panel-backdrop` rules below for the scrim behind it. */
 @media (max-width: 900px) {
-  .session-sidebar { display: none; }
+  .session-sidebar:not(.collapsed) {
+    position: fixed;
+    top: var(--header-h);
+    left: 0;
+    bottom: 0;
+    z-index: 60;
+    box-shadow: 4px 0 24px rgba(0,0,0,.18);
+  }
 }
 @media (max-width: 640px) {
-  .state-panel { display: none; }
+  .state-panel:not(.collapsed) {
+    position: fixed;
+    top: var(--header-h);
+    right: 0;
+    bottom: 0;
+    z-index: 60;
+    box-shadow: -4px 0 24px rgba(0,0,0,.18);
+  }
 }
+
+/* Scrim shown behind an overlaid (mobile-drawer) panel; tapping it closes
+   whichever panel(s) are currently open in overlay mode. */
+.panel-backdrop {
+  position: fixed; inset: var(--header-h) 0 0 0;
+  background: rgba(10,12,20,.35);
+  z-index: 50;
+}
+.panel-backdrop[hidden] { display: none; }

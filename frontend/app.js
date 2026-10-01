@@ -54,6 +54,11 @@ const sessionList   = document.getElementById('session-list');
 const newSessionBtn = document.getElementById('new-session-btn');
 const chatTitleName  = document.getElementById('chat-title-name');
 const autoNameToggle = document.getElementById('auto-name-toggle');
+const sessionSidebarEl = document.querySelector('.session-sidebar');
+const statePanelEl     = document.getElementById('state-panel');
+const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
+const toggleStateBtn   = document.getElementById('toggle-state-btn');
+const panelBackdrop    = document.getElementById('panel-backdrop');
 const userAvatar    = document.getElementById('user-avatar');
 const userName      = document.getElementById('user-name');
 const logoutBtn     = document.getElementById('logout-btn');
@@ -87,12 +92,20 @@ async function init() {
 
   // Show app
   loginOverlay.classList.add('hidden');
+  applyResponsivePanelDefaults();
   appEl.style.display = 'flex';
 
   // Populate user info in header
   userAvatar.src = currentUser.avatar_url || '';
   userAvatar.alt = currentUser.name || '';
-  userName.textContent = currentUser.name || currentUser.email;
+  const displayName = currentUser.name || currentUser.email;
+  userName.textContent = displayName;
+  // Note: unlike the item-name spans (set via innerHTML template strings,
+  // where title="${escapeHtml(...)}" is required so quotes/angle-brackets
+  // in the name don't break out of the attribute), this is a direct DOM
+  // property assignment — the string is used verbatim, so escaping it
+  // would corrupt the tooltip for names containing &, <, >, ' or ".
+  userName.title = displayName;
 
   await loadSessionList();
 
@@ -562,7 +575,7 @@ function renderProposals(proposals) {
       const splitText = formatItemSplit(item);
       html += `<div class="item-block">
         <div class="item-row">
-          <span class="item-name">${escapeHtml(item.name)}</span>
+          <span class="item-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
           <span class="item-price">$${item.price.toFixed(2)}</span>
           <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
         </div>${splitText ? `<div class="item-split">${escapeHtml(splitText)}</div>` : ''}
@@ -660,6 +673,113 @@ function switchTab(name) {
 stateTabButtons.forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
+
+// ── Collapsible panel toggles ────────────────────────────────────────────────
+// Standard drawer pattern: on a wide screen the toggle buttons just let the
+// user reclaim screen space from a panel they don't need; below the
+// responsive breakpoints (900px for the session sidebar, 640px for the
+// state panel) each panel starts collapsed, and these same buttons are the
+// *only* way to bring it back — there is no other dead-end `display: none`
+// left in style.css. Once a panel has been toggled by hand during this page
+// load, resizing the window no longer overrides that explicit choice.
+//
+// Below its breakpoint, a reopened panel overlays the chat panel (fixed
+// position, via the media queries in style.css) instead of sharing flex
+// space with it — pushing the layout instead would squeeze the chat column
+// down to near nothing on a phone-width screen. The toggle buttons live in
+// the top header (not the chat title bar, and not the panels themselves)
+// precisely so they're never covered by that overlay and stay reachable
+// the whole time. The backdrop below is the overlay's scrim.
+const sidebarOverlayMQ = window.matchMedia('(max-width: 900px)');
+const statePanelOverlayMQ = window.matchMedia('(max-width: 640px)');
+let sidebarManuallySet = false;
+let statePanelManuallySet = false;
+
+function setSidebarCollapsed(collapsed) {
+  sessionSidebarEl.classList.toggle('collapsed', collapsed);
+  toggleSidebarBtn.classList.toggle('active', !collapsed);
+  updatePanelBackdrop();
+}
+
+function setStatePanelCollapsed(collapsed) {
+  statePanelEl.classList.toggle('collapsed', collapsed);
+  toggleStateBtn.classList.toggle('active', !collapsed);
+  updatePanelBackdrop();
+}
+
+// Shows the scrim whenever a panel is open *and* currently in overlay mode
+// (i.e. narrow enough that style.css positions it fixed over the chat
+// panel) — never while a panel is merely sharing flex space on a wide
+// screen, where there's nothing behind it that needs dimming.
+function updatePanelBackdrop() {
+  const sidebarOverlayOpen = sidebarOverlayMQ.matches && !sessionSidebarEl.classList.contains('collapsed');
+  const stateOverlayOpen   = statePanelOverlayMQ.matches && !statePanelEl.classList.contains('collapsed');
+  panelBackdrop.hidden = !(sidebarOverlayOpen || stateOverlayOpen);
+}
+
+// Closes the *other* panel first when it's currently open as an overlay —
+// both panels can coexist fine side-by-side on a wide screen, but two
+// fixed-position overlays at a narrow width physically overlap each other
+// (see style.css's media queries), so only one overlay may be open at a
+// time. No-ops (and leaves manuallySet alone) when the other panel isn't
+// actually in overlay mode or isn't open, so this never fights the normal
+// wide-screen "both panels visible" case.
+function closeStatePanelOverlayIfOpen() {
+  if (statePanelOverlayMQ.matches && !statePanelEl.classList.contains('collapsed')) {
+    statePanelManuallySet = true;
+    setStatePanelCollapsed(true);
+  }
+}
+
+function closeSidebarOverlayIfOpen() {
+  if (sidebarOverlayMQ.matches && !sessionSidebarEl.classList.contains('collapsed')) {
+    sidebarManuallySet = true;
+    setSidebarCollapsed(true);
+  }
+}
+
+toggleSidebarBtn.addEventListener('click', () => {
+  sidebarManuallySet = true;
+  const willOpen = sessionSidebarEl.classList.contains('collapsed');
+  if (willOpen && sidebarOverlayMQ.matches) closeStatePanelOverlayIfOpen();
+  setSidebarCollapsed(!willOpen);
+});
+
+toggleStateBtn.addEventListener('click', () => {
+  statePanelManuallySet = true;
+  const willOpen = statePanelEl.classList.contains('collapsed');
+  if (willOpen && statePanelOverlayMQ.matches) closeSidebarOverlayIfOpen();
+  setStatePanelCollapsed(!willOpen);
+});
+
+// Tapping the scrim closes whichever overlay panel(s) are currently open —
+// same as tapping outside a mobile drawer in Discord/Slack/WhatsApp Web.
+panelBackdrop.addEventListener('click', () => {
+  closeSidebarOverlayIfOpen();
+  closeStatePanelOverlayIfOpen();
+});
+
+// Applies the default collapsed/expanded state for each panel based on the
+// current viewport width — but only for whichever panel the user hasn't
+// already overridden by hand via the toggle buttons above. Always
+// recomputes the backdrop afterwards, unconditionally: setSidebarCollapsed/
+// setStatePanelCollapsed only run (and so only update the backdrop) inside
+// their respective `if (!...ManuallySet)` branch, so once both panels have
+// been toggled by hand at least once, neither branch would otherwise fire
+// on a later resize — leaving a stale backdrop visible (e.g. open both as
+// overlays at a narrow width, then resize back to desktop: without this,
+// the backdrop would stay up and block every click across the whole app).
+function applyResponsivePanelDefaults() {
+  if (!sidebarManuallySet) {
+    setSidebarCollapsed(sidebarOverlayMQ.matches);
+  }
+  if (!statePanelManuallySet) {
+    setStatePanelCollapsed(statePanelOverlayMQ.matches);
+  }
+  updatePanelBackdrop();
+}
+
+window.addEventListener('resize', applyResponsivePanelDefaults);
 
 function setActiveSession(id) {
   document.querySelectorAll('.session-item').forEach(el => {
@@ -1031,7 +1151,7 @@ function renderState(state) {
         const splitText = formatItemSplit(item);
         html += `<div class="item-block">
           <div class="item-row">
-            <span class="item-name">${escapeHtml(item.name)}</span>
+            <span class="item-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
             <span class="item-price">$${item.price.toFixed(2)}</span>
             <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
           </div>${splitText ? `<div class="item-split">${escapeHtml(splitText)}</div>` : ''}
