@@ -710,32 +710,58 @@ function updatePanelBackdrop() {
   panelBackdrop.hidden = !(sidebarOverlayOpen || stateOverlayOpen);
 }
 
+// Closes the *other* panel first when it's currently open as an overlay —
+// both panels can coexist fine side-by-side on a wide screen, but two
+// fixed-position overlays at a narrow width physically overlap each other
+// (see style.css's media queries), so only one overlay may be open at a
+// time. No-ops (and leaves manuallySet alone) when the other panel isn't
+// actually in overlay mode or isn't open, so this never fights the normal
+// wide-screen "both panels visible" case.
+function closeStatePanelOverlayIfOpen() {
+  if (statePanelOverlayMQ.matches && !statePanelEl.classList.contains('collapsed')) {
+    statePanelManuallySet = true;
+    setStatePanelCollapsed(true);
+  }
+}
+
+function closeSidebarOverlayIfOpen() {
+  if (sidebarOverlayMQ.matches && !sessionSidebarEl.classList.contains('collapsed')) {
+    sidebarManuallySet = true;
+    setSidebarCollapsed(true);
+  }
+}
+
 toggleSidebarBtn.addEventListener('click', () => {
   sidebarManuallySet = true;
-  setSidebarCollapsed(!sessionSidebarEl.classList.contains('collapsed'));
+  const willOpen = sessionSidebarEl.classList.contains('collapsed');
+  if (willOpen && sidebarOverlayMQ.matches) closeStatePanelOverlayIfOpen();
+  setSidebarCollapsed(!willOpen);
 });
 
 toggleStateBtn.addEventListener('click', () => {
   statePanelManuallySet = true;
-  setStatePanelCollapsed(!statePanelEl.classList.contains('collapsed'));
+  const willOpen = statePanelEl.classList.contains('collapsed');
+  if (willOpen && statePanelOverlayMQ.matches) closeSidebarOverlayIfOpen();
+  setStatePanelCollapsed(!willOpen);
 });
 
 // Tapping the scrim closes whichever overlay panel(s) are currently open —
 // same as tapping outside a mobile drawer in Discord/Slack/WhatsApp Web.
 panelBackdrop.addEventListener('click', () => {
-  if (sidebarOverlayMQ.matches && !sessionSidebarEl.classList.contains('collapsed')) {
-    sidebarManuallySet = true;
-    setSidebarCollapsed(true);
-  }
-  if (statePanelOverlayMQ.matches && !statePanelEl.classList.contains('collapsed')) {
-    statePanelManuallySet = true;
-    setStatePanelCollapsed(true);
-  }
+  closeSidebarOverlayIfOpen();
+  closeStatePanelOverlayIfOpen();
 });
 
 // Applies the default collapsed/expanded state for each panel based on the
 // current viewport width — but only for whichever panel the user hasn't
-// already overridden by hand via the toggle buttons above.
+// already overridden by hand via the toggle buttons above. Always
+// recomputes the backdrop afterwards, unconditionally: setSidebarCollapsed/
+// setStatePanelCollapsed only run (and so only update the backdrop) inside
+// their respective `if (!...ManuallySet)` branch, so once both panels have
+// been toggled by hand at least once, neither branch would otherwise fire
+// on a later resize — leaving a stale backdrop visible (e.g. open both as
+// overlays at a narrow width, then resize back to desktop: without this,
+// the backdrop would stay up and block every click across the whole app).
 function applyResponsivePanelDefaults() {
   if (!sidebarManuallySet) {
     setSidebarCollapsed(sidebarOverlayMQ.matches);
@@ -743,6 +769,7 @@ function applyResponsivePanelDefaults() {
   if (!statePanelManuallySet) {
     setStatePanelCollapsed(statePanelOverlayMQ.matches);
   }
+  updatePanelBackdrop();
 }
 
 window.addEventListener('resize', applyResponsivePanelDefaults);

@@ -73,10 +73,13 @@ body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.header-left  { display: flex; align-items: center; gap: 10px; }
-.header-right { display: flex; align-items: center; gap: 12px; }
-.logo         { font-size: 22px; }
-h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
+.header-left  { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.header-right { display: flex; align-items: center; gap: 12px; min-width: 0; flex-shrink: 1; }
+.logo         { font-size: 22px; flex-shrink: 0; }
+h1 {
+  font-size: 18px; font-weight: 700; letter-spacing: -.3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
 
 /* Panel toggle buttons — live in the header (not inside the panels
    themselves, and not the chat title bar) so they stay reachable at any
@@ -100,12 +103,17 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   background: var(--accent-dim); padding: 3px 9px; border-radius: 20px;
 }
 
-.user-info { display: flex; align-items: center; gap: 8px; }
+.user-info { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .user-avatar {
   width: 28px; height: 28px; border-radius: 50%;
   object-fit: cover; border: 1px solid var(--border);
+  flex-shrink: 0;
 }
-.user-name { font-size: 13px; font-weight: 500; color: var(--text); }
+.user-name {
+  font-size: 13px; font-weight: 500; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 120px;
+}
 .logout-btn {
   font-size: 12px; font-weight: 500; color: var(--muted);
   background: none; border: 1px solid var(--border);
@@ -560,6 +568,19 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
 }
 
 .muted { color: var(--muted); font-size: 13px; }
+
+/* Responsive: the header has no flex-wrap, and at a phone width there
+   isn't room for the logo+title, both panel toggles, the provider badge,
+   and the user info all on one row — the provider badge is purely
+   decorative chrome (not interactive, not load-bearing for any task), so
+   it's the first thing to go. Combined with the user-name/h1 ellipsis
+   truncation above, this keeps both toggle buttons on-screen (and the
+   header itself non-scrolling, since body has overflow: hidden) down to
+   a real stock phone width with the app's actual default header content —
+   not just a contrived short name. */
+@media (max-width: 480px) {
+  .provider-badge { display: none; }
+}
 
 /* Responsive: below these widths the session sidebar / state panel start
    collapsed (via the .collapsed class above, applied in frontend/app.js),
