@@ -77,6 +77,7 @@ def init_db(db_path: str) -> None:
         _migrate_chat_sessions(conn)
         _migrate_membership(conn)
         _migrate_expense_proposals_fk(conn)
+        _migrate_split_model(conn)
 
 
 def create_db(db_path: str) -> None:
@@ -207,6 +208,73 @@ def _migrate_expense_proposals_fk(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_split_model(conn: sqlite3.Connection) -> None:
+    """One-time data migration for the multi-payer / flexible-split model.
+
+    Two independent shape changes, both handled here:
+
+    1. bills.paid_by used to hold a plain person-name string; it now holds a
+       JSON dollar-amount-per-person map (e.g. {"Alice": 1800.0}). The column
+       itself doesn't change (still TEXT, still nullable) — only its
+       contents do. Any row whose paid_by isn't already a JSON object is
+       assumed to be an old-shape plain name and is rewritten to
+       {"<name>": <bill total>}, preserving old single-payer behavior. The
+       bill's total is computed fresh from its own bill_items (subtotal) plus
+       its tax/tip, since that total was never itself stored anywhere.
+       NULL/empty paid_by is left untouched (no payer recorded yet).
+
+    2. bill_items.qty_allocations (JSON fractional-units-per-person map, only
+       meaningful when qty > 1) is replaced by bill_items.cost_allocations
+       (JSON dollar-amount-per-person map, same shape as paid_by). Existing
+       qty_allocations data is converted (amount = units * item.price /
+       item.qty) into the new column before the old one is dropped — same
+       add-column-then-drop-column pattern _migrate_chat_sessions() uses for
+       session_state/message_history.
+
+    Safe to call on every startup — checks columns/data shape first, so a
+    database already on the new shape is a no-op.
+    """
+    for row in conn.execute(
+        "SELECT id, tax, tip, paid_by FROM bills WHERE paid_by IS NOT NULL AND paid_by != ''"
+    ).fetchall():
+        raw = row["paid_by"]
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = raw  # not valid JSON at all -> a bare old-shape name string
+
+        if isinstance(parsed, dict):
+            continue  # already migrated to the new map shape
+
+        name = parsed if isinstance(parsed, str) else raw
+        subtotal = conn.execute(
+            "SELECT COALESCE(SUM(price), 0) AS s FROM bill_items WHERE bill_id = ?", (row["id"],)
+        ).fetchone()["s"]
+        total = subtotal + row["tax"] + row["tip"]
+        conn.execute(
+            "UPDATE bills SET paid_by = ? WHERE id = ?", (json.dumps({name: total}), row["id"])
+        )
+
+    bill_items_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bill_items)")}
+    if "cost_allocations" not in bill_items_cols:
+        conn.execute("ALTER TABLE bill_items ADD COLUMN cost_allocations TEXT NOT NULL DEFAULT '{}'")
+
+    if "qty_allocations" in bill_items_cols:
+        for item in conn.execute("SELECT id, price, qty, qty_allocations FROM bill_items").fetchall():
+            qty_allocations = json.loads(item["qty_allocations"] or "{}")
+            if qty_allocations:
+                qty = item["qty"] or 1
+                cost_allocations = {
+                    person: units * item["price"] / qty
+                    for person, units in qty_allocations.items()
+                }
+                conn.execute(
+                    "UPDATE bill_items SET cost_allocations = ? WHERE id = ?",
+                    (json.dumps(cost_allocations), item["id"]),
+                )
+        conn.execute("ALTER TABLE bill_items DROP COLUMN qty_allocations")
+
+
 @contextmanager
 def _connect():
     conn = sqlite3.connect(_db_path)
@@ -306,13 +374,13 @@ def save_session_state(
                 INSERT INTO bills (session_id, bill_id, description, raw_text, tax, tip, paid_by)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (session_id, bill.bill_id, bill.description, bill.raw_text,
-                  bill.tax, bill.tip, bill.paid_by))
+                  bill.tax, bill.tip, json.dumps(bill.paid_by)))
             bill_row_id = cursor.lastrowid
             _insert_bill_items(conn, bill_row_id, [
                 {
                     "name": item.name, "price": item.price, "qty": item.qty,
                     "assigned_to": item.assigned_to, "shared": item.shared,
-                    "unassigned": item.unassigned, "qty_allocations": item.qty_allocations,
+                    "unassigned": item.unassigned, "cost_allocations": item.cost_allocations,
                 }
                 for item in bill.items
             ])
@@ -360,7 +428,7 @@ def load_session_state(session_id: str) -> dict:
                     "assigned_to": json.loads(i["assigned_to"]),
                     "shared": bool(i["shared"]),
                     "unassigned": bool(i["unassigned"]),
-                    "qty_allocations": json.loads(i["qty_allocations"]),
+                    "cost_allocations": json.loads(i["cost_allocations"]),
                 }
                 for i in conn.execute(
                     "SELECT * FROM bill_items WHERE bill_id = ? ORDER BY id", (b["id"],)
@@ -372,7 +440,7 @@ def load_session_state(session_id: str) -> dict:
                 "raw_text": b["raw_text"],
                 "tax": b["tax"],
                 "tip": b["tip"],
-                "paid_by": b["paid_by"],
+                "paid_by": json.loads(b["paid_by"]) if b["paid_by"] else {},
                 "items": items,
             })
 
@@ -721,7 +789,7 @@ def list_pending_proposals(session_id: str) -> list[dict]:
 
 def _insert_bill_items(conn: sqlite3.Connection, bill_row_id: int, items: list[dict]) -> None:
     """Insert bill_items rows for one bill from plain dicts (keys: name,
-    price, qty, assigned_to, shared, unassigned, qty_allocations). Shared by
+    price, qty, assigned_to, shared, unassigned, cost_allocations). Shared by
     save_session_state() (converting LineItem dataclasses to dicts first)
     and decide_proposal()'s approval path (payload items are already dicts),
     so the insert shape only has to change in one place.
@@ -729,11 +797,11 @@ def _insert_bill_items(conn: sqlite3.Connection, bill_row_id: int, items: list[d
     for item in items:
         conn.execute("""
             INSERT INTO bill_items
-                (bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+                (bill_id, name, price, qty, assigned_to, shared, unassigned, cost_allocations)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (bill_row_id, item["name"], item["price"], item.get("qty", 1),
               json.dumps(item.get("assigned_to", [])), int(item.get("shared", False)),
-              int(item.get("unassigned", False)), json.dumps(item.get("qty_allocations", {}))))
+              int(item.get("unassigned", False)), json.dumps(item.get("cost_allocations", {}))))
 
 
 def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
@@ -807,7 +875,7 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (session_id, payload["bill_id"], payload.get("description", ""),
                       payload.get("raw_text", ""), payload.get("tax", 0), payload.get("tip", 0),
-                      payload.get("paid_by"), decided_by, now))
+                      json.dumps(payload.get("paid_by") or {}), decided_by, now))
                 bill_row_id = cursor.lastrowid
             else:
                 bill_row_id = existing_bill["id"]
@@ -817,7 +885,8 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
                         approved_by = ?, approved_at = ?
                     WHERE id = ?
                 """, (payload.get("description", ""), payload.get("raw_text", ""),
-                      payload.get("tax", 0), payload.get("tip", 0), payload.get("paid_by"),
+                      payload.get("tax", 0), payload.get("tip", 0),
+                      json.dumps(payload.get("paid_by") or {}),
                       decided_by, now, bill_row_id))
                 conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_row_id,))
 
