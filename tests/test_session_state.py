@@ -114,3 +114,13 @@ def test_validate_contribution_map():
     assert validate_contribution_map({"Alice": 10.0}, 10.0005) is True
     assert validate_contribution_map({"Alice": 10.0}, 11.0) is False
     assert validate_contribution_map({}, 0.0) is True
+
+
+def test_validate_contribution_map_accepts_unavoidable_n_way_rounding_remainder():
+    """A basic equal 3-way split of $100.00 is {33.33, 33.33, 33.33}, which
+    sums to $99.99 — a $0.01 discrepancy that's an unavoidable artifact of
+    dividing to the cent, not a real mistake, and must not be rejected. The
+    tolerance must still catch a genuinely wrong contribution map, though.
+    """
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 33.33}, 100.0) is True
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 20.0}, 100.0) is False

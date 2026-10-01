@@ -158,13 +158,24 @@ class SessionState:
         return "\n".join(lines)
 
 
-def validate_contribution_map(amounts: Dict[str, float], total: float, epsilon: float = 0.001) -> bool:
+def validate_contribution_map(amounts: Dict[str, float], total: float, epsilon: float = 0.01) -> bool:
     """True if a person -> dollar-amount contribution map (paid_by or a
-    LineItem's cost_allocations) sums to `total` within `epsilon`.
+    LineItem's cost_allocations) sums to `total` within tolerance.
+
+    `epsilon` is a per-person cent-rounding allowance, not a flat tolerance:
+    the accepted discrepancy is `epsilon * max(len(amounts), 1)`. A flat
+    tolerance tight enough to catch real mistakes on a single contribution
+    (e.g. a typo) is too tight for a legitimate N-way split, since dividing a
+    total evenly to the cent is frequently impossible — a basic 3-way equal
+    split of $100.00 is {33.33, 33.33, 33.33}, which sums to $99.99, a $0.01
+    discrepancy that only grows with more people. Scaling by the number of
+    contributors keeps a 1-2 person map's tolerance tight while still
+    accepting the unavoidable rounding remainder on a larger split.
 
     A reusable building block for the tool-call layer's input validation
     (e.g. rejecting a set_payer/assign_item call whose percentages or
     absolute amounts don't actually add up to the bill/item total) — not
     called from anywhere in this module itself yet.
     """
-    return abs(sum(amounts.values()) - total) <= epsilon
+    tolerance = epsilon * max(len(amounts), 1)
+    return abs(sum(amounts.values()) - total) <= tolerance

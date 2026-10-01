@@ -981,6 +981,103 @@ def test_migrate_split_model_converts_legacy_paid_by_and_qty_allocations(tmp_pat
         conn.close()
 
 
+def test_migrate_split_model_rounds_paid_by_total_to_cents(tmp_path):
+    """subtotal=10.0, tax=0.1, tip=0.2 sums in raw binary float to
+    10.299999999999999 (0.1 + 0.2 isn't exactly representable) — the
+    migration must round that to 10.3 before writing it into paid_by, not
+    persist the float artifact permanently into the database.
+    """
+    path = str(tmp_path / "legacy_rounding.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, google_id TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL, name TEXT, avatar_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+            name TEXT NOT NULL DEFAULT 'New Session', finalized INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('user','agent')), content TEXT NOT NULL DEFAULT '',
+            image_base64 TEXT, image_media_type TEXT, user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE session_participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, UNIQUE(session_id, name)
+        );
+        CREATE TABLE bills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            bill_id TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            raw_text TEXT NOT NULL DEFAULT '', tax REAL NOT NULL DEFAULT 0,
+            tip REAL NOT NULL DEFAULT 0, paid_by TEXT,
+            approved_by INTEGER REFERENCES users(id), approved_at TIMESTAMP,
+            UNIQUE(session_id, bill_id)
+        );
+        CREATE TABLE bill_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL DEFAULT 1,
+            assigned_to TEXT NOT NULL DEFAULT '[]', shared INTEGER NOT NULL DEFAULT 0,
+            unassigned INTEGER NOT NULL DEFAULT 0, qty_allocations TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            from_person TEXT NOT NULL, to_person TEXT NOT NULL, amount REAL NOT NULL
+        );
+        CREATE TABLE session_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            role TEXT NOT NULL CHECK (role IN ('admin','member')),
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(session_id, user_id)
+        );
+        CREATE TABLE expense_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            proposed_by INTEGER NOT NULL REFERENCES users(id),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+            supersedes_bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
+            payload TEXT NOT NULL, decided_by INTEGER REFERENCES users(id), decided_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO users (id, google_id, email, name, avatar_url) VALUES (1, 'g1', 'a@example.com', 'A', '');
+        INSERT INTO chat_sessions (id, user_id, name) VALUES ('legacy-round', 1, 'Legacy Round');
+        INSERT INTO session_members (session_id, user_id, role) VALUES ('legacy-round', 1, 'admin');
+
+        INSERT INTO bills (id, session_id, bill_id, description, raw_text, tax, tip, paid_by)
+            VALUES (300, 'legacy-round', 'bill_1', 'Snack', 'raw', 0.1, 0.2, 'Bob');
+        INSERT INTO bill_items (id, bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+            VALUES (400, 300, 'Chips', 10.0, 1, '["Bob"]', 0, 0, '{}');
+    """)
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        bill = conn.execute("SELECT paid_by FROM bills WHERE id = 300").fetchone()
+        # Must be the exact JSON text '{"Bob": 10.3}', not a float-artifact
+        # like 10.299999999999999.
+        assert bill["paid_by"] == '{"Bob": 10.3}', bill["paid_by"]
+        assert json.loads(bill["paid_by"]) == {"Bob": 10.3}
+    finally:
+        conn.close()
+
+
 def test_validate_contribution_map():
     from core.session_state import validate_contribution_map
 
@@ -988,6 +1085,18 @@ def test_validate_contribution_map():
     assert validate_contribution_map({"Alice": 10.0}, 10.0005) is True  # within default epsilon
     assert validate_contribution_map({"Alice": 10.0}, 11.0) is False
     assert validate_contribution_map({}, 0.0) is True
+
+
+def test_validate_contribution_map_accepts_unavoidable_n_way_rounding_remainder():
+    """A basic equal 3-way split of $100.00 is {33.33, 33.33, 33.33}, which
+    sums to $99.99 — a $0.01 discrepancy that's an unavoidable artifact of
+    dividing to the cent, not a real mistake, and must not be rejected. The
+    tolerance must still catch a genuinely wrong contribution map, though.
+    """
+    from core.session_state import validate_contribution_map
+
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 33.33}, 100.0) is True
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 20.0}, 100.0) is False
 
 
 # ---------- Concurrency ----------
