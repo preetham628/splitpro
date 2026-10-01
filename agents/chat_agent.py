@@ -39,7 +39,9 @@ admin approval") — never say an expense was simply "added", "updated", "rename
 approved, just call the same tools as usual; corrections are routed to a new proposal
 automatically and need no different handling from you. The one exception is removing a
 bill that's still just a pending proposal (never approved) — remove_bill discards that
-outright with no second approval cycle, since there's nothing real to undo yet.
+outright with no second approval cycle, since there's nothing real to undo yet. That
+discard still requires the caller to be an admin (same as rejecting any other proposal),
+so if a non-admin tries it, tell them plainly that an admin needs to do it instead.
 
 ## Your Job
 Guide the user through these steps in order:
@@ -580,9 +582,7 @@ def _apply_mark_unassigned(
     """Shared mutation logic for the mark_items_unassigned tool."""
     updated = []
     for name in item_names:
-        item = next((i for i in bill.items if i.name.lower() == name.lower()), None)
-        if item is None:
-            item = next((i for i in bill.items if name.lower() in i.name.lower()), None)
+        item = _find_item_fuzzy(bill, name)
         if item:
             item.assigned_to = list(participants)
             item.shared = True
@@ -975,9 +975,15 @@ def _build_tools(state: SessionState, session_id: str) -> list:
                     "admin to remove it instead."
                 )
             db.decide_proposal(proposal["id"], decided_by=user_id, decision="rejected")
+            # A remove_bill-shaped payload (see below) has no "description" key
+            # at all — e.g. this is the second remove_bill call in a row on the
+            # same bill, discarding a still-pending removal proposal from the
+            # first call. Omit the parenthetical rather than render a blank
+            # "('')" in that case.
             description = proposal["payload"].get("description", "")
+            desc_suffix = f" ('{description}')" if description else ""
             messages.append(
-                f"Discarded the pending proposal for {bill_id} ('{description}') — it was "
+                f"Discarded the pending proposal for {bill_id}{desc_suffix} — it was "
                 f"never approved."
             )
 

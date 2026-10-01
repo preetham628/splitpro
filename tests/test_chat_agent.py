@@ -1424,6 +1424,44 @@ def test_remove_bill_dual_existence_rejects_stale_correction_and_proposes_remova
     assert db.list_pending_proposals(session_id) == []
 
 
+def test_remove_bill_twice_in_a_row_discards_stale_removal_proposal_without_blank_description(fresh_db):
+    """Regression test: a remove_bill proposal's payload is just
+    {"action": "remove_bill", "bill_id": ...} — no "description" key at all.
+    Calling remove_bill a second time on the same already-approved bill,
+    before the first removal proposal is decided, is itself a dual-existence
+    case (approved bill + a pending proposal, this time a remove_bill one) —
+    it discards that stale removal proposal and proposes a fresh one. The
+    message must not render a blank "('')" for the discarded proposal's
+    missing description."""
+    admin = make_user("admin@example.com", "g-rbtwice-admin")
+    alice = make_user("alice@example.com", "g-rbtwice-alice")
+    session_id = "sess-rmbill-twice"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    first_msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(alice["id"]))
+    assert "already approved" in first_msg
+    first_pending = db.list_pending_proposals(session_id)
+    assert len(first_pending) == 1
+    assert first_pending[0]["payload"].get("action") == "remove_bill"
+    assert "description" not in first_pending[0]["payload"]
+
+    # A pending proposal now exists, so this second call needs an admin.
+    second_msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(admin["id"]))
+    assert "('')" not in second_msg  # no blank description rendered
+    assert "discarded" in second_msg.lower()
+    assert "already approved" in second_msg.lower()  # a fresh removal proposal is also created
+
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["id"] != first_pending[0]["id"]  # stale one discarded, a new one created
+    assert pending[0]["payload"].get("action") == "remove_bill"
+
+
 def test_remove_bill_not_found_error(fresh_db):
     admin = make_user("admin@example.com", "g-rb4-admin")
     alice = make_user("alice@example.com", "g-rb4-alice")
