@@ -460,7 +460,7 @@ function renderProposals(proposals) {
     // LineItem.unit_price / Bill.subtotal in core/session_state.py) — do
     // not re-multiply by qty here, that double-counts.
     const total = items.reduce((sum, i) => sum + i.price, 0) + tax + tip;
-    const payer = payload.paid_by ? `Paid by ${payload.paid_by}` : 'Payer unknown';
+    const payer = formatPaidBy(payload.paid_by);
 
     const card = document.createElement('div');
     card.className = 'bill-card proposal-card';
@@ -482,19 +482,22 @@ function renderProposals(proposals) {
       const assignText = isUnassigned
         ? 'unassigned'
         : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');
-      html += `<div class="item-row">
-        <span class="item-name">${escapeHtml(item.name)}</span>
-        <span class="item-price">$${item.price.toFixed(2)}</span>
-        <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
+      const splitText = formatItemSplit(item);
+      html += `<div class="item-block">
+        <div class="item-row">
+          <span class="item-name">${escapeHtml(item.name)}</span>
+          <span class="item-price">$${item.price.toFixed(2)}</span>
+          <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
+        </div>${splitText ? `<div class="item-split">${escapeHtml(splitText)}</div>` : ''}
       </div>`;
     });
 
     if (tax > 0 || tip > 0) {
-      html += `<div class="item-row">
+      html += `<div class="item-block"><div class="item-row">
         <span class="item-name" style="color:var(--muted)">Tax + Tip</span>
         <span class="item-price">$${(tax + tip).toFixed(2)}</span>
         <span class="item-assign">proportional</span>
-      </div>`;
+      </div></div>`;
     }
 
     card.innerHTML = html;
@@ -794,6 +797,63 @@ function escapeHtml(str) {
             .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// paid_by is always a dict (person -> dollar amount, possibly empty), never
+// a plain string — returns plain (unescaped) text; callers are responsible
+// for passing the result through escapeHtml(), same as the old plain-string
+// `payer` variable this replaces.
+function formatPaidBy(paidBy) {
+  const entries = Object.entries(paidBy || {});
+  if (entries.length === 0) return 'Payer unknown';
+  if (entries.length === 1) return `Paid by ${entries[0][0]}`;
+  return 'Paid by ' + entries.map(([name, amount]) => `${name} ($${amount.toFixed(2)})`).join(', ');
+}
+
+// Mirrors core/settlement.py's compute_balances cost_allocations handling
+// (explicit per-person dollar amounts, remainder split equally among the
+// rest of assigned_to) so the displayed per-item breakdown matches what the
+// settlement actually charges each person. Returns null when the item has
+// no cost_allocations to show (plain equal split, nothing to break down).
+function computeItemShares(item) {
+  const assigned = item.assigned_to || [];
+  const allocations = item.cost_allocations || {};
+  if (!assigned.length || !Object.keys(allocations).length) return null;
+
+  const shares = {};
+  let allocatedAmount = 0;
+  for (const [person, amount] of Object.entries(allocations)) {
+    shares[person] = amount;
+    allocatedAmount += amount;
+  }
+
+  const remaining = item.price - allocatedAmount;
+  const remainderPeople = assigned.filter(p => !(p in allocations));
+  if (remaining > 1e-9 && remainderPeople.length) {
+    const share = remaining / remainderPeople.length;
+    remainderPeople.forEach(p => { shares[p] = (shares[p] || 0) + share; });
+  }
+  return shares;
+}
+
+// Returns plain (unescaped) "Name: $X.XX, Name: $Y.YY" text for an item's
+// per-person breakdown, or null when there's nothing worth showing — either
+// no cost_allocations at all, or the resulting shares are indistinguishable
+// from a plain equal split (price / number of assigned people), which the
+// item-assign text already conveys without a redundant number.
+function formatItemSplit(item) {
+  const shares = computeItemShares(item);
+  if (!shares) return null;
+
+  const assigned = item.assigned_to || [];
+  const n = assigned.length;
+  if (!n) return null;
+
+  const equalShare = item.price / n;
+  const isEqual = assigned.every(p => Math.abs((shares[p] || 0) - equalShare) < 0.005);
+  if (isEqual) return null;
+
+  return assigned.map(p => `${p}: $${(shares[p] || 0).toFixed(2)}`).join(', ');
+}
+
 // ── State panel renderer ──────────────────────────────────────────────────────
 function renderState(state) {
   if (!state) return;
@@ -825,7 +885,7 @@ function renderState(state) {
   if (state.bills && state.bills.length) {
     html += '<div class="section-label" style="margin-top:16px">Bills</div>';
     state.bills.forEach(bill => {
-      const payer = bill.paid_by ? `Paid by ${bill.paid_by}` : 'Payer unknown';
+      const payer = formatPaidBy(bill.paid_by);
       html += `<div class="bill-card">
         <div class="bill-title">${escapeHtml(bill.description)}</div>
         <div class="bill-meta">${escapeHtml(payer)} · $${bill.total.toFixed(2)}</div>`;
@@ -835,28 +895,35 @@ function renderState(state) {
         const assignText   = isUnassigned
           ? 'unassigned'
           : item.assigned_to.join(', ') + (item.shared ? ' (shared)' : '');
-        html += `<div class="item-row">
-          <span class="item-name">${escapeHtml(item.name)}</span>
-          <span class="item-price">$${item.price.toFixed(2)}</span>
-          <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
+        const splitText = formatItemSplit(item);
+        html += `<div class="item-block">
+          <div class="item-row">
+            <span class="item-name">${escapeHtml(item.name)}</span>
+            <span class="item-price">$${item.price.toFixed(2)}</span>
+            <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
+          </div>${splitText ? `<div class="item-split">${escapeHtml(splitText)}</div>` : ''}
         </div>`;
       });
 
       if (bill.tax > 0 || bill.tip > 0) {
-        html += `<div class="item-row">
+        html += `<div class="item-block"><div class="item-row">
           <span class="item-name" style="color:var(--muted)">Tax + Tip</span>
           <span class="item-price">$${(bill.tax + bill.tip).toFixed(2)}</span>
           <span class="item-assign">proportional</span>
-        </div>`;
+        </div></div>`;
       }
 
       html += '</div>';
     });
   }
 
-  if (state.finalized && state.settlement && state.settlement.length) {
+  // Settlement is a live view, recomputed from current bills/payers on every
+  // state fetch (see server.py's _serialize_state) — there's no "finalize"
+  // step anymore, so this renders as soon as there's anything to settle.
+  if (state.settlement && state.settlement.length) {
     html += `<div class="settlement-card">
-      <h3>✅ Settlement</h3>`;
+      <h3>✅ Settlement</h3>
+      <p class="settlement-subtitle">Updates live as bills and payers change</p>`;
     state.settlement.forEach(txn => {
       html += `<div class="txn-row">
         ${escapeHtml(txn.from)} → ${escapeHtml(txn.to)}: <strong>$${txn.amount.toFixed(2)}</strong>
