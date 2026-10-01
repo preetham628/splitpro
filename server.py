@@ -163,17 +163,23 @@ def _serialize_state(state: SessionState, session_id: str) -> dict:
             }
             for bill in state.bills
         ],
-        "finalized": state.finalized,
         "all_bills_ready": state.all_bills_ready(),
-        "settlement": _compute_settlement(state) if state.finalized else [],
+        "settlement": _compute_settlement(state),
     }
 
 
 def _compute_settlement(state: SessionState) -> list:
     """Thin wrapper over the shared balance math (core/settlement.py) — this
     used to duplicate that logic inline and had drifted out of sync with the
-    calculate_split tool (missing qty_allocations handling entirely), so the
-    state panel and the finalized report could disagree. Not anymore."""
+    calculate_split tool (missing cost_allocations handling entirely), so the
+    state panel and the settlement report could disagree. Not anymore.
+
+    Settlement is a live view, not a one-time "finalize" action — there's no
+    precondition to check here. Settlement.compute_balances() already skips
+    bills with no payer set (bill.paid_by empty) and tolerates empty
+    participants/bills lists, so this naturally returns [] rather than
+    crashing when there isn't enough data yet (e.g. no bills, or a bill
+    with no payer recorded)."""
     balances, _warnings = Settlement.compute_balances(state.participants, state.bills)
     return Settlement.generate_settlements(balances)
 
@@ -205,9 +211,14 @@ def _save_agent(session_id: str, agent: ChatAgent, name: Optional[str] = None) -
 
     Conversation messages are already persisted by the checkpointer during
     agent.chat()'s graph.invoke() call — nothing to do for those here.
+
+    Settlement is now a purely derived/computed view (see _serialize_state /
+    _compute_settlement above) rather than a snapshot that needs persisting
+    once a session is "finalized" — there's no such state anymore — so this
+    no longer writes anything to the `settlements` table. The table itself
+    is left in the schema (unused) rather than migrating it away here.
     """
-    settlements = _compute_settlement(agent.state) if agent.state.finalized else []
-    db.save_session_state(session_id, agent.state, settlements, name=name)
+    db.save_session_state(session_id, agent.state, settlements=[], name=name)
 
 
 def _run_chat_turn(
