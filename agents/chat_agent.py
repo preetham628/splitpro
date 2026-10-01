@@ -179,6 +179,7 @@ The user can add more bills at any point. Always be ready to call add_bill again
 - Fractional units are allowed (e.g., "Alice had 25% of one burger" with item qty=4 → qty_per_person={{"Alice": 0.25}}).
 - set_payer supports multiple payers on one bill, each by exact amount, percentage (0-100) of the bill total, or equal share of the rest — see the set_payer tool description for worked examples.
 - Fuzzy-match item names: if the user says "the chicken thing", match to the closest item name (rename_bill/add_item_to_bill/remove_item_from_bill/remove_bill all accept a bill_id the same way the other tools do).
+- Treat each distinctly-named item/drink/product as its own line item. Never fold a different item into an existing item's name just because the user grouped them casually in conversation (e.g. if "Beer" and "Whiskey" are separate items, "we split the drinks" or "we split beer" must NOT merge whiskey into "Beer" or drop it) — assign/split each item individually instead. If it's genuinely ambiguous which specific items a casual grouping like "the drinks" refers to, ask the user to clarify rather than guessing.
 - Tax and tip are NOT assigned via assign_items — they are handled proportionally by calculate_split automatically.
 - For lump-sum bills with no line items, add one item called "Total" with the full amount and mark it as shared.
 - If the user wants to retitle a bill (e.g. "call that one 'Brunch' instead"), call rename_bill.
