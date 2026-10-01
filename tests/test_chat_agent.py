@@ -29,7 +29,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from agents.chat_agent import ChatAgent, _build_tools, _pending_proposals_summary
 from config import ChatAgentConfig
 from core import checkpointer, database as db
-from core.session_state import SessionState
+from core.session_state import LineItem, ParsedBill, SessionState
 from core.settlement import Settlement
 
 
@@ -561,6 +561,51 @@ def test_set_payer_rejects_negative_amount():
     assert state.bills[0].paid_by == {}
 
 
+def test_set_payer_rejects_overshoot_that_only_appears_after_remainder_resolution():
+    """A single overshooting explicit amount plus a bare equal-share entry
+    passes the raw non-negative check (1000.0 is itself non-negative) and
+    validate_contribution_map's sum check (the remainder is defined as
+    total - explicit_total, so the final map always sums to the total by
+    construction, regardless of sign) — only visible once the remainder is
+    actually distributed and comes out negative. Must still be rejected,
+    and paid_by must stay untouched rather than storing
+    {"Alice": 1000.0, "Bob": -900.0}."""
+    state, _assign, set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob"], one_item_bill(price=100.0)
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = set_payer.invoke({
+        "bill_id": bill_id,
+        "payers": [{"name": "Alice", "amount": 1000.0}, {"name": "Bob"}],
+    })
+
+    assert "Error" in msg
+    assert "negative" in msg
+    assert state.bills[0].paid_by == {}
+
+
+def test_set_payer_rejects_percentage_overshoot_that_only_appears_after_remainder_resolution():
+    """Same class of bug as above, via two individually-in-range (0-100)
+    percentage entries whose sum still exceeds 100%."""
+    state, _assign, set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob", "Carol"], one_item_bill(price=100.0)
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = set_payer.invoke({
+        "bill_id": bill_id,
+        "payers": [
+            {"name": "Alice", "percentage": 80},
+            {"name": "Bob", "percentage": 90},
+            {"name": "Carol"},
+        ],
+    })
+
+    assert "Error" in msg
+    assert state.bills[0].paid_by == {}
+
+
 # ---------- assign_items: percentage_per_person / amount_per_person modes ----------
 
 def test_assign_items_percentage_mode_splits_remainder_equally():
@@ -645,6 +690,67 @@ def test_assign_items_rejects_negative_amount_per_person():
     })
 
     assert "non-negative" in msg
+    assert state.bills[0].items[0].cost_allocations == {}
+
+
+def test_assign_items_rejects_amount_overshoot_that_only_appears_after_remainder_resolution():
+    """Same overshoot-with-remainder class of bug as set_payer's, via
+    amount_per_person: one person given more than the item's price, with
+    the rest left to split "whatever's left" — which resolves to a
+    negative share only after the remainder is distributed."""
+    state, assign_items, _set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob"],
+        {
+            "raw_text": "Thing $100",
+            "description": "Test",
+            "items": [{"name": "Thing", "price": 100.0, "qty": 1}],
+            "tax": 0.0,
+            "tip": 0.0,
+        },
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = assign_items.invoke({
+        "bill_id": bill_id,
+        "assignments": [{
+            "item_name": "Thing",
+            "assigned_to": ["Alice", "Bob"],
+            "amount_per_person": {"Alice": 1000.0},
+        }],
+    })
+
+    assert "negative" in msg
+    assert state.bills[0].items[0].cost_allocations == {}
+
+
+def test_assign_items_qty_negative_error_blames_qty_not_converted_dollars():
+    """Cosmetic: a negative qty_per_person value must be rejected with an
+    error about the qty the caller actually passed, not a dollar amount
+    converted from it (which _resolve_contribution_entries' generic
+    non-negative-amount check would otherwise report)."""
+    state, assign_items, _set_payer, _calc = _legacy_tools(
+        ["Alice", "Bob"],
+        {
+            "raw_text": "Burger $40",
+            "description": "Test",
+            "items": [{"name": "Burger", "price": 40.0, "qty": 4}],
+            "tax": 0.0,
+            "tip": 0.0,
+        },
+    )
+    bill_id = state.bills[0].bill_id
+
+    msg = assign_items.invoke({
+        "bill_id": bill_id,
+        "assignments": [{
+            "item_name": "Burger",
+            "assigned_to": ["Alice", "Bob"],
+            "qty_per_person": {"Alice": -1},
+        }],
+    })
+
+    assert "qty_per_person must be non-negative" in msg
+    assert "Alice: -1" in msg
     assert state.bills[0].items[0].cost_allocations == {}
 
 
@@ -773,6 +879,36 @@ def test_calculate_split_does_not_set_finalized_and_is_repeatable():
     state.bills.append(state.bills[0])  # duplicate bill -> balances must change
     report3 = calculate_split.invoke({})
     assert report3 != report1
+
+
+# ---------- core/settlement.py: item.unassigned defense-in-depth (code review) ----------
+
+def test_compute_balances_unassigned_flag_overrides_stale_cost_allocations():
+    """compute_balances must check item.unassigned BEFORE item.cost_allocations,
+    as defense-in-depth independent of whatever sets `unassigned` elsewhere —
+    not rely solely on the convention that the one call site setting
+    unassigned=True (mark_items_unassigned) also happens to clear
+    cost_allocations. Construct a ParsedBill directly (bypassing the tool
+    layer entirely) with both unassigned=True AND a stale, non-empty
+    cost_allocations map, and confirm compute_balances still produces the
+    equal split, not the stale per-person amounts."""
+    item = LineItem(
+        name="Thing", price=30.0, qty=1,
+        assigned_to=["Alice", "Bob", "Carol"],
+        unassigned=True,
+        cost_allocations={"Alice": 30.0},  # stale — must be ignored
+    )
+    bill = ParsedBill(
+        bill_id="b1", raw_text="", description="d",
+        items=[item], paid_by={"Alice": 30.0},
+    )
+
+    balances, warnings = Settlement.compute_balances(["Alice", "Bob", "Carol"], [bill])
+
+    assert warnings == []
+    assert balances["Alice"] == pytest.approx(20.0)
+    assert balances["Bob"] == pytest.approx(-10.0)
+    assert balances["Carol"] == pytest.approx(-10.0)
 
 
 def test_calculate_split_end_to_end_across_all_three_allocation_modes():

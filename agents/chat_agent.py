@@ -260,9 +260,8 @@ def _resolve_contribution_entries(
 
     `explicit` is name -> amount (if is_percentage is False) or name ->
     percentage 0-100 (if is_percentage is True). Returns (resolved_map,
-    error) — error is a human-readable string (percentage out of range, or
-    a negative amount) when resolution isn't possible; resolved_map is None
-    in that case.
+    error) — error is a human-readable string when resolution isn't
+    possible; resolved_map is None in that case.
 
     Deliberately does NOT reject here just because the explicit entries
     alone already exceed `total` — validate_contribution_map, which every
@@ -273,6 +272,18 @@ def _resolve_contribution_entries(
     splits this feature exists for (e.g. three people at $33.34 each on a
     $100 bill sums to $100.02, within validate_contribution_map's own
     tolerance but over a flat one-cent epsilon).
+
+    Two separate non-negative checks are needed, not one: the first (below)
+    catches a blatantly-wrong *raw* explicit value before any math runs.
+    But explicit entries that individually look fine can still overshoot
+    `total` once summed (e.g. two 80%/90% percentage entries, or one
+    amount larger than `total`) — validate_contribution_map's sum-only
+    check can't catch this, because the equal-share remainder is defined
+    as `total - explicit_total`, so the final map always sums to `total`
+    exactly regardless of sign; an overshoot just pushes a negative share
+    onto whoever's left to absorb "the rest." So a second check runs again
+    at the very end, on the fully resolved map, after the remainder has
+    been distributed.
     """
     if is_percentage:
         for name, pct in explicit.items():
@@ -291,6 +302,15 @@ def _resolve_contribution_entries(
         share = remainder / len(equal_share_names)
         for name in equal_share_names:
             resolved[name] = resolved.get(name, 0.0) + share
+
+    negative = {name: amount for name, amount in resolved.items() if amount < -1e-6}
+    if negative:
+        detail = ", ".join(f"{n}: ${a:.2f}" for n, a in negative.items())
+        return None, (
+            f"the explicit entries given leave a negative share for {detail} — "
+            f"they add up to more than the ${total:.2f} total, with nothing left "
+            f"for the rest to cover."
+        )
 
     return resolved, None
 
@@ -345,6 +365,17 @@ def _apply_assign_items(
                     f"Unknown participant(s) {unknown} for '{item.name}'. "
                     f"Known: {participants}"
                 )
+                continue
+
+            negative_qty = {p: q for p, q in qty_per_person.items() if q < 0}
+            if negative_qty:
+                # Caught here, against the actual qty values, rather than left to
+                # surface later as a dollar-amount error from
+                # _resolve_contribution_entries (after the unit_price conversion
+                # below) — that would blame "amount" with a converted number the
+                # caller never passed, instead of the qty they actually gave.
+                bad = ", ".join(f"{p}: {q}" for p, q in negative_qty.items())
+                results.append(f"'{item.name}': qty_per_person must be non-negative, got {bad}.")
                 continue
 
             allocated_qty = sum(qty_per_person.values())

@@ -34,7 +34,21 @@ class Settlement:
             person_subtotal: Dict[str, float] = defaultdict(float)
 
             for item in bill.items:
-                if item.cost_allocations:
+                if item.unassigned:
+                    # Explicitly marked for an equal split among everyone — checked
+                    # before cost_allocations, as defense-in-depth independent of
+                    # whatever sets `unassigned`: a stale cost_allocations map left
+                    # behind by whatever previously split this item must never
+                    # silently override this intentional equal split (today the one
+                    # call site setting unassigned=True also clears
+                    # cost_allocations, but that's a second line of defense, not
+                    # something this ordering should have to rely on).
+                    recipients = item.assigned_to if item.assigned_to else participants
+                    if recipients:
+                        share = item.price / len(recipients)
+                        for person in recipients:
+                            person_subtotal[person] += share
+                elif item.cost_allocations:
                     # Dollar-based: each person's share is already a dollar
                     # amount — no unit-price conversion needed.
                     allocated_amount = sum(item.cost_allocations.values())
