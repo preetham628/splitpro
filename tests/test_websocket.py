@@ -74,6 +74,31 @@ def make_session_with_members(*users, admin_index=0):
     return session_id
 
 
+def _wait_until(predicate, timeout=2, interval=0.01):
+    """Poll `predicate` until it's truthy or `timeout` elapses, returning its
+    final value either way (so a caller can still assert on it for a clear
+    failure message).
+
+    Needed since task14's round-2 fix for the TOCTOU dangling-socket bug
+    moved socket registration behind an extra asyncio.to_thread hop (the
+    atomic re-check-and-register against delete_session's lock — see
+    server._register_socket_if_alive), so it's no longer guaranteed to have
+    completed by the moment TestClient's websocket_connect() context manager
+    returns (that only waits for the ASGI "websocket.accept" message, one
+    `await` earlier in the route). Same spirit as this suite's
+    _receive_with_timeout and the rest of this file's threading.Event().
+    wait(timeout=...)/join(timeout=...) pattern for anything that could
+    otherwise race or hang.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    return predicate()
+
+
 def _receive_with_timeout(ws, timeout=5):
     """ws.receive_json() blocks with no timeout of its own — if a broadcast
     never arrives (e.g. a regression silently breaks the fan-out), the test
@@ -99,15 +124,31 @@ def _receive_with_timeout(ws, timeout=5):
 
 
 # ---------- Handshake rejection ----------
+#
+# All three rejections below now accept() the connection before closing it
+# with 1008, rather than closing pre-accept — see session_websocket's
+# docstring for why: verified empirically against a real uvicorn server
+# with a real WebSocket client, a pre-accept close() never reaches the
+# client as an actual WebSocket close frame at all (the handshake's HTTP
+# Upgrade never completes, so the client just sees a bare HTTP error, which
+# a real browser's WebSocket API reports as a generic code-1006 abnormal
+# closure with no information about why — indistinguishable from a dropped
+# connection). TestClient's in-process ASGI transport doesn't reproduce
+# that distinction (a pre-accept close still raised WebSocketDisconnect
+# with the right code locally, which is what let this gap slip through
+# round-1 review's tests), so these now connect successfully first (same
+# as a real accepted-then-rejected browser connection would) and only see
+# the disconnect on the next receive, exactly like app.js's `ws.onmessage`/
+# `ws.onclose` would.
 
 def test_websocket_rejects_missing_cookie(fresh_server):
     alice = make_user("alice-ws@example.com", "g-alice-ws", "Alice")
     session_id = make_session_with_members(alice)
 
     with TestClient(server.app) as client:
-        with pytest.raises(WebSocketDisconnect) as exc_info:
-            with client.websocket_connect(f"/ws/sessions/{session_id}"):
-                pass
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
         assert exc_info.value.code == 1008
 
 
@@ -116,9 +157,9 @@ def test_websocket_rejects_invalid_cookie(fresh_server):
     session_id = make_session_with_members(alice)
 
     with TestClient(server.app, cookies={"access_token": "not-a-real-jwt"}) as client:
-        with pytest.raises(WebSocketDisconnect) as exc_info:
-            with client.websocket_connect(f"/ws/sessions/{session_id}"):
-                pass
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
         assert exc_info.value.code == 1008
 
 
@@ -129,9 +170,9 @@ def test_websocket_rejects_non_member(fresh_server):
 
     token = auth_module.create_jwt(mallory["id"])
     with TestClient(server.app, cookies={"access_token": token}) as client:
-        with pytest.raises(WebSocketDisconnect) as exc_info:
-            with client.websocket_connect(f"/ws/sessions/{session_id}"):
-                pass
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
         assert exc_info.value.code == 1008
 
 
@@ -147,8 +188,11 @@ def test_websocket_accepts_valid_member(fresh_server):
             # (The registered object is the server-side starlette.websockets.
             # WebSocket the ASGI app sees, not the client-side
             # WebSocketTestSession handle this test holds, so this checks
-            # the registry's shape rather than identity with `ws`.)
-            assert session_id in server._session_sockets
+            # the registry's shape rather than identity with `ws`.) Polled
+            # rather than asserted immediately — see _wait_until's docstring
+            # for why registration isn't guaranteed to have landed yet at
+            # this exact point.
+            assert _wait_until(lambda: session_id in server._session_sockets)
             assert len(server._session_sockets[session_id]) == 1
     # Disconnected cleanly — receive loop's finally should have unregistered it.
     assert session_id not in server._session_sockets
@@ -228,7 +272,8 @@ def test_two_sockets_on_same_session_both_receive_the_broadcast(fresh_server, mo
         ws_bob_ctx = client.websocket_connect(f"/ws/sessions/{session_id}")
 
         with ws_alice_ctx as ws_alice, ws_bob_ctx as ws_bob:
-            assert len(server._session_sockets[session_id]) == 2
+            # Polled, not asserted immediately — see _wait_until's docstring.
+            assert _wait_until(lambda: len(server._session_sockets.get(session_id, [])) == 2)
 
             def send_chat():
                 time.sleep(0.1)
@@ -325,7 +370,13 @@ def test_delete_session_closes_and_forgets_sockets(fresh_server):
 
     with TestClient(server.app, cookies={"access_token": token}) as client:
         with client.websocket_connect(f"/ws/sessions/{session_id}") as ws:
-            assert session_id in server._session_sockets
+            # Polled, not asserted immediately — see _wait_until's docstring.
+            # Also makes sure delete_session (started below) can't win the
+            # race and run its _drop_session_sockets sweep before this
+            # socket has even registered — that'd trivially "pass" today
+            # even with the dangling-socket bug reintroduced, since there'd
+            # be nothing to clean up either way.
+            assert _wait_until(lambda: session_id in server._session_sockets)
 
             def do_delete():
                 time.sleep(0.1)
@@ -340,3 +391,147 @@ def test_delete_session_closes_and_forgets_sockets(fresh_server):
                 t.join(timeout=5)
 
     assert session_id not in server._session_sockets
+
+
+# ---------- Round-2 review fixes ----------
+
+def test_concurrent_delete_does_not_leave_dangling_socket(fresh_server, monkeypatch):
+    """Reproduces the exact TOCTOU race round-1 review found: a websocket
+    handshake passes its early (unsynchronized, cheap) membership check,
+    and delete_session — including its _drop_session_sockets sweep — runs
+    to completion *before* this connection reaches registration. Pre-fix,
+    the handshake would then go ahead and register a socket for a session
+    that's already gone, with delete_session's sweep having already run
+    and found nothing to clean up — nothing left would ever close it.
+
+    The early check's answer is forced to True regardless of actual DB
+    state, simulating "the real check happened to run and pass in the
+    instant just before the concurrent delete" — the whole premise of a
+    TOCTOU race. The second call, inside _register_socket_if_alive's
+    atomic re-check (round-2's fix), is left to hit the real
+    db.is_session_member, which by the time it runs will correctly see
+    the session — and, via session_members' ON DELETE CASCADE, this user's
+    membership row — as gone.
+
+    Run this against the pre-fix code (session_websocket registering
+    unconditionally after accept(), with no re-check) and it fails: the
+    socket ends up registered for session_id even though delete_session
+    has already completed and swept an empty registry.
+    """
+    admin = make_user("admin-ws-race@example.com", "g-admin-ws-race", "Admin")
+    session_id = make_session_with_members(admin)
+    token = auth_module.create_jwt(admin["id"])
+
+    real_is_member = db.is_session_member
+    call_count = {"n": 0}
+    early_check_started = threading.Event()
+    delete_done = threading.Event()
+
+    def patched_is_member(sid, uid):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # This is session_websocket's early, unsynchronized check.
+            # Signal the main thread, then block until the concurrent
+            # delete_session (below) has fully completed, and report the
+            # stale "yes, still a member" answer anyway — exactly what a
+            # real check that happened to run a moment earlier would have
+            # seen.
+            early_check_started.set()
+            assert delete_done.wait(timeout=5), "delete_session never completed"
+            return True
+        # Every later call is the atomic re-check inside
+        # _register_socket_if_alive — let it see reality.
+        return real_is_member(sid, uid)
+
+    monkeypatch.setattr(db, "is_session_member", patched_is_member)
+
+    outcome = {}
+
+    def connect_attempt():
+        try:
+            with TestClient(server.app, cookies={"access_token": token}) as client:
+                with client.websocket_connect(f"/ws/sessions/{session_id}") as ws:
+                    try:
+                        ws.receive_text()
+                        outcome["result"] = "unexpected-message"
+                    except WebSocketDisconnect:
+                        outcome["result"] = "disconnected-after-accept"
+        except WebSocketDisconnect:
+            outcome["result"] = "disconnected-on-connect"
+        except Exception as e:  # noqa: BLE001 - surfaced via the assert below
+            outcome["result"] = f"error: {e!r}"
+
+    t = threading.Thread(target=connect_attempt)
+    t.start()
+    try:
+        assert early_check_started.wait(timeout=5), "early membership check never ran"
+        # Runs to completion while the connecting socket is still blocked
+        # on the (forced-stale) early check above -- this is round-1's
+        # exact repro: _drop_session_sockets' sweep finds nothing, because
+        # nothing has registered yet.
+        server.delete_session(session_id, admin)
+        delete_done.set()
+    finally:
+        t.join(timeout=5)
+
+    assert outcome.get("result") in ("disconnected-after-accept", "disconnected-on-connect"), outcome
+    # The actual bug: no socket should be left registered for a session
+    # that's already deleted.
+    assert session_id not in server._session_sockets
+
+
+def test_slow_membership_check_does_not_stall_other_sockets(fresh_server, monkeypatch):
+    """Bug #4 regression test: db.is_session_member's blocking sqlite call
+    inside session_websocket must run via asyncio.to_thread, not directly
+    on the event loop -- a slow/contended lookup for one handshake must not
+    stall every other open (or connecting) socket on this process.
+
+    Forces the membership check for session_a to sleep for a second (a
+    stand-in for a slow/contended query), then opens a second, unrelated
+    connection to session_b while that's in flight and times it — which can
+    only land well under a second if the slow check genuinely isn't running
+    on the loop thread. Pre-fix (a direct, unwrapped db.is_session_member
+    call), session_b's handshake would queue up behind session_a's sleep on
+    the one event loop thread and take just as long.
+    """
+    alice = make_user("alice-ws-slow@example.com", "g-alice-ws-slow", "Alice")
+    session_a = make_session_with_members(alice)
+    session_b = make_session_with_members(alice)
+    token = auth_module.create_jwt(alice["id"])
+
+    real_is_member = db.is_session_member
+
+    def slow_is_member(sid, uid):
+        if sid == session_a:
+            time.sleep(1.0)
+        return real_is_member(sid, uid)
+
+    monkeypatch.setattr(db, "is_session_member", slow_is_member)
+
+    with TestClient(server.app, cookies={"access_token": token}) as client:
+        slow_ctx = client.websocket_connect(f"/ws/sessions/{session_a}")
+        slow_opened = threading.Event()
+
+        def open_slow():
+            with slow_ctx:
+                slow_opened.set()
+
+        t = threading.Thread(target=open_slow)
+        t.start()
+        # Give the slow handshake a moment to actually enter its
+        # asyncio.to_thread(db.is_session_member, ...) sleep before racing
+        # the second connection against it.
+        time.sleep(0.2)
+
+        start = time.time()
+        with client.websocket_connect(f"/ws/sessions/{session_b}"):
+            elapsed = time.time() - start
+
+        assert slow_opened.wait(timeout=5), "slow connection for session_a never completed"
+        t.join(timeout=5)
+
+    assert elapsed < 0.5, (
+        f"second handshake took {elapsed}s while session_a's membership "
+        f"check was sleeping -- the event loop was stalled by a blocking "
+        f"DB call instead of that call running off-loop via asyncio.to_thread"
+    )

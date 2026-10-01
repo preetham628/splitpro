@@ -64,6 +64,21 @@ let socketReconnectAttempts = 0;
 // doesn't block navigation) — a global flag would then also suppress the
 // new session's unrelated incoming messages until that stale turn resolved.
 let awaitingOwnTurnSessions = new Set();
+// DB-assigned ids (ChatMessage.id, globally unique) of every chat message
+// already rendered into the current session's DOM — the second, more
+// robust layer against the same duplicate-bubble problem
+// awaitingOwnTurnSessions guards above. That flag only covers the common
+// timing case (a WS broadcast arriving *during* this tab's own in-flight
+// turn); it does nothing once sendToAgent/sendImageToAgent's `finally`
+// clears it right as their own fetch() resolves, and the WS broadcast for
+// that exact turn is scheduled fire-and-forget with no guarantee it won't
+// land after that point (see _run_chat_turn's docstring in server.py).
+// handleSocketPayload skips appending any message id already in this set;
+// sendToAgent/sendImageToAgent populate it (via ChatResponse.message_ids)
+// for the two rows their own REST response just rendered. Reset whenever
+// loadSession() reloads a session's history from scratch, alongside
+// clearing messagesEl itself.
+let renderedMessageIds = new Set();
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
@@ -77,6 +92,7 @@ const appEl         = document.getElementById('app');
 const sessionList   = document.getElementById('session-list');
 const newSessionBtn = document.getElementById('new-session-btn');
 const chatTitleName  = document.getElementById('chat-title-name');
+const liveUpdatesWarningEl = document.getElementById('live-updates-warning');
 const autoNameToggle = document.getElementById('auto-name-toggle');
 const sessionSidebarEl = document.querySelector('.session-sidebar');
 const statePanelEl     = document.getElementById('state-panel');
@@ -275,6 +291,8 @@ async function loadSession(id) {
   connectSessionSocket(id);
 
   messagesEl.innerHTML = '';
+  // Fresh transcript, fresh de-dup set — see renderedMessageIds' own comment.
+  renderedMessageIds = new Set();
   stateContent.innerHTML = '<p class="muted">Loading…</p>';
   membersContent.innerHTML = '<p class="muted">Loading…</p>';
   approvalsContent.innerHTML = '<p class="muted">No pending proposals.</p>';
@@ -305,6 +323,7 @@ async function loadSession(id) {
           ? `data:${m.image_media_type};base64,${m.image_base64}`
           : null;
         appendBubble(m.role, m.content, imageDataUrl, m.user_id);
+        renderedMessageIds.add(m.id);
       });
     }
   } catch {
@@ -332,6 +351,11 @@ async function loadSession(id) {
 // session it's currently looking at.
 function connectSessionSocket(id) {
   disconnectSessionSocket();
+  // A fresh connection attempt for (possibly) a different session —
+  // whatever a *previous* session's terminal rejection left showing
+  // shouldn't bleed into this one. A real rejection for this session will
+  // reinstate it soon enough via onclose below.
+  setLiveUpdatesUnavailable(false);
   socketSessionId = id;
   socketReconnectAttempts = 0;
   openSessionSocket(id);
@@ -340,6 +364,10 @@ function connectSessionSocket(id) {
 function openSessionSocket(id) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws/sessions/${id}`);
+
+  ws.onopen = () => {
+    if (id === socketSessionId && id === sessionId) setLiveUpdatesUnavailable(false);
+  };
 
   ws.onmessage = ev => {
     // Guards the same staleness the REST catch-up fetches in loadSession()
@@ -358,9 +386,50 @@ function openSessionSocket(id) {
   // Both a clean close (e.g. the server restarting) and a transport error
   // surface here — WebSocket always fires 'close' after 'error', so a single
   // reconnect path off onclose covers both without double-scheduling.
-  ws.onclose = () => scheduleSocketReconnect(id);
+  //
+  // event.code is only usable here at all because session_websocket now
+  // accepts the connection *before* closing it on a rejection, rather than
+  // closing pre-accept (see its docstring in server.py). Verified
+  // empirically against a real running uvicorn server with a real
+  // WebSocket client (Python's `websockets` library, same tool this
+  // project's own backend tests reach for): a close() sent before accept()
+  // never produces a WebSocket close frame at all — the client just sees
+  // the opening HTTP handshake itself fail (an HTTP 403), which the
+  // WebSocket browser API reports as a generic code-1006 "abnormal
+  // closure" CloseEvent with no further information, indistinguishable
+  // from a dropped connection or a server restart. Only once
+  // session_websocket accepts first does the close that follows travel
+  // over an established connection, with its real code intact — confirmed
+  // by the same real-client test actually observing code 1008 come back
+  // for both of session_websocket's rejection cases (invalid/expired auth,
+  // and no-longer-a-member) once that fix was in place. 1008 (policy
+  // violation) is the one code session_websocket sends for both — a
+  // terminal outcome that retrying on a fixed delay can never fix, unlike a
+  // dropped connection or a server restart. Reconnecting after that would
+  // just hammer the server with the same rejection every 1-15s forever,
+  // which is the exact bug round-1 review found. Every other close code
+  // keeps the existing capped-backoff retry via scheduleSocketReconnect.
+  ws.onclose = event => {
+    if (event.code === 1008) {
+      console.warn(
+        `Live updates for session ${id} were rejected (code 1008 — invalid `
+        + `session or no longer a member) — giving up on reconnecting.`
+      );
+      if (id === socketSessionId && id === sessionId) setLiveUpdatesUnavailable(true);
+      return;
+    }
+    scheduleSocketReconnect(id);
+  };
 
   socket = ws;
+}
+
+// Minimal, non-blocking visual cue for a terminal (gave-up) WebSocket
+// rejection — the chat panel otherwise still works as a plain
+// request/response UI without live push, so this is a warning, not an
+// error state blocking anything.
+function setLiveUpdatesUnavailable(unavailable) {
+  liveUpdatesWarningEl.hidden = !unavailable;
 }
 
 function disconnectSessionSocket() {
@@ -388,11 +457,14 @@ function scheduleSocketReconnect(id) {
   if (id !== socketSessionId || id !== sessionId) return;
   socketReconnectAttempts++;
   // Capped exponential backoff (1s, 2s, 4s, ... up to 15s) rather than
-  // hammering the server through an outage, but never gives up outright —
-  // per task14's acceptance bar, silently going stale forever isn't an
-  // option, so this keeps trying indefinitely at a bounded rate. A page
-  // reload (which re-runs init()/loadSession() from scratch) remains the
-  // immediate fallback if this is somehow still reconnecting.
+  // hammering the server through an outage, but never gives up on its own
+  // for this kind of (transient) close — per task14's acceptance bar,
+  // silently going stale forever isn't an option, so this keeps trying
+  // indefinitely at a bounded rate. A page reload (which re-runs
+  // init()/loadSession() from scratch) remains the immediate fallback if
+  // this is somehow still reconnecting. Terminal, non-retriable rejections
+  // (code 1008) never reach this function at all — see ws.onclose above,
+  // which branches on that before calling this.
   const delay = Math.min(1000 * 2 ** (socketReconnectAttempts - 1), 15000);
   socketReconnectTimer = setTimeout(() => {
     if (id === socketSessionId && id === sessionId) openSessionSocket(id);
@@ -406,6 +478,19 @@ function handleSocketPayload(id, payload) {
 
   if (payload.messages && !awaitingOwnTurnSessions.has(id)) {
     payload.messages.forEach(m => {
+      // Belt-and-suspenders against the duplicate-bubble bug
+      // awaitingOwnTurnSessions above only half-covers: the server's WS
+      // broadcast is fire-and-forget with no ordering guarantee relative
+      // to this same tab's own REST response for the turn that produced
+      // these exact messages (see server.py's _run_chat_turn docstring),
+      // so it can still arrive here *after* sendToAgent/sendImageToAgent's
+      // `finally` has already cleared awaitingOwnTurnSessions for this
+      // session — at which point this id is already in renderedMessageIds
+      // (sendToAgent/sendImageToAgent add it there from
+      // ChatResponse.message_ids the moment they render it themselves), so
+      // skip it instead of appending a second bubble for the same message.
+      if (renderedMessageIds.has(m.id)) return;
+      renderedMessageIds.add(m.id);
       const imageDataUrl = m.image_base64
         ? `data:${m.image_media_type};base64,${m.image_base64}`
         : null;
@@ -1011,6 +1096,13 @@ async function sendToAgent(text) {
     const data = await res.json();
     typing.remove();
     if (requestSessionId !== sessionId) return;
+    // Mark the [user_message_id, agent_message_id] this turn just
+    // persisted as already-rendered *before* appending the agent bubble
+    // below — see handleSocketPayload's comment for why: the WS broadcast
+    // of these same two rows can still arrive after awaitingOwnTurnSessions
+    // is cleared in `finally`, and this is what lets that late echo get
+    // skipped instead of duplicating both bubbles.
+    (data.message_ids || []).forEach(id => renderedMessageIds.add(id));
     appendBubble('agent', data.response);
     renderState(data.state);
     // Refresh sidebar in case session was auto-renamed
@@ -1054,6 +1146,8 @@ async function sendImageToAgent(file) {
     const data = await res.json();
     typing.remove();
     if (requestSessionId !== sessionId) return;
+    // See the matching comment in sendToAgent().
+    (data.message_ids || []).forEach(id => renderedMessageIds.add(id));
     appendBubble('agent', data.response);
     renderState(data.state);
     await loadSessionList();

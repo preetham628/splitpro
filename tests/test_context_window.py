@@ -481,7 +481,7 @@ def test_background_summarization_unlocked_phase_does_not_block_concurrent_chat_
     monkeypatch.setattr(ChatAgent, "chat", lambda self, m, speaker_name=None, speaker_user_id=None: "ok")
 
     start = time.time()
-    response, _state = server._run_chat_turn(
+    response, _state, _message_ids = server._run_chat_turn(
         session_id, admin, "hello", admin["name"],
         persist_user_message=lambda: db.add_chat_message(session_id, "user", "hello", user_id=admin["id"]),
     )
