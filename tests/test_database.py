@@ -6,6 +6,7 @@ users are created through the module's own public functions rather than raw
 SQL, so these tests exercise the same paths the app itself uses.
 """
 
+import json
 import sqlite3
 import threading
 
@@ -31,18 +32,21 @@ def make_session(session_id, user_id, name="Test Session"):
 
 
 def sample_payload(bill_id="bill_1", description="Dinner", item_names=("Burger",)):
+    items = [
+        {"name": name, "price": 10.0, "qty": 1, "assigned_to": ["Alice"],
+         "shared": False, "unassigned": False, "cost_allocations": {"Alice": 10.0}}
+        for name in item_names
+    ]
+    tax, tip = 1.0, 2.0
+    total = sum(i["price"] for i in items) + tax + tip
     return {
         "bill_id": bill_id,
         "description": description,
         "raw_text": "raw text",
-        "items": [
-            {"name": name, "price": 10.0, "qty": 1, "assigned_to": ["Alice"],
-             "shared": False, "unassigned": False, "qty_allocations": {}}
-            for name in item_names
-        ],
-        "tax": 1.0,
-        "tip": 2.0,
-        "paid_by": "Alice",
+        "items": items,
+        "tax": tax,
+        "tip": tip,
+        "paid_by": {"Alice": total},
     }
 
 
@@ -234,7 +238,7 @@ def test_is_correction_reflects_existing_bill_not_stale_fk(fresh_db):
         bills=[ParsedBill(
             bill_id="bill_c", raw_text="raw text", description="Original",
             items=[LineItem(name="Burger", price=10.0, assigned_to=["Alice"])],
-            tax=1.0, tip=2.0, paid_by="Alice",
+            tax=1.0, tip=2.0, paid_by={"Alice": 13.0},
         )],
         finalized=False,
     )
@@ -540,7 +544,7 @@ def test_decide_proposal_survives_intervening_resave_of_superseded_bill(fresh_db
             bills=[ParsedBill(
                 bill_id="bill_1", raw_text="raw text", description="Original",
                 items=[LineItem(name="Burger", price=10.0, assigned_to=["Alice"])],
-                tax=1.0, tip=2.0, paid_by="Alice",
+                tax=1.0, tip=2.0, paid_by={"Alice": 13.0},
             )],
             finalized=False,
         )
@@ -772,6 +776,343 @@ def test_migrate_expense_proposals_fk_rebuilds_stale_table(tmp_path):
     assert row[0] is None
 
     db.init_db(path)  # idempotent re-run — must not error or re-rebuild again
+
+
+# ---------- Multi-payer / flexible-split model ----------
+
+def test_save_and_load_session_state_round_trips_paid_by_and_cost_allocations(fresh_db):
+    """save_session_state()/load_session_state() must round-trip the new
+    canonical shapes unchanged: bills.paid_by as a multi-payer
+    name -> dollar-amount map, and bill_items.cost_allocations as a
+    name -> dollar-amount map (replacing the old fractional-unit
+    qty_allocations).
+    """
+    from core.session_state import LineItem, ParsedBill, SessionState
+
+    admin = make_user("split1@example.com", "g-split1")
+    make_session("sess-split-1", admin["id"])
+
+    state = SessionState(
+        participants=["Alice", "Sumit"],
+        bills=[ParsedBill(
+            bill_id="bill_1", raw_text="raw", description="Dinner",
+            items=[LineItem(
+                name="Burger", price=12.0, qty=2, assigned_to=["Alice", "Sumit"],
+                cost_allocations={"Alice": 8.0, "Sumit": 4.0},
+            )],
+            tax=1.0, tip=2.0,
+            paid_by={"Alice": 1800.0, "Sumit": 1200.0},
+        )],
+        finalized=False,
+    )
+    db.save_session_state("sess-split-1", state, settlements=[])
+
+    loaded = db.load_session_state("sess-split-1")
+    assert loaded["bills"][0]["paid_by"] == {"Alice": 1800.0, "Sumit": 1200.0}
+    assert loaded["bills"][0]["items"][0]["cost_allocations"] == {"Alice": 8.0, "Sumit": 4.0}
+
+    reconstructed = SessionState.from_dict(loaded)
+    assert reconstructed.bills[0].paid_by == {"Alice": 1800.0, "Sumit": 1200.0}
+    assert reconstructed.bills[0].items[0].cost_allocations == {"Alice": 8.0, "Sumit": 4.0}
+
+
+def test_save_and_load_session_state_handles_unset_paid_by(fresh_db):
+    """A bill with no payer recorded yet round-trips as an empty dict, not
+    None or a stored string, matching ParsedBill.paid_by's new
+    default_factory=dict."""
+    from core.session_state import LineItem, ParsedBill, SessionState
+
+    admin = make_user("split2@example.com", "g-split2")
+    make_session("sess-split-2", admin["id"])
+
+    state = SessionState(
+        participants=["Alice"],
+        bills=[ParsedBill(
+            bill_id="bill_1", raw_text="raw", description="Drinks",
+            items=[LineItem(name="Soda", price=3.0, unassigned=True)],
+        )],
+        finalized=False,
+    )
+    db.save_session_state("sess-split-2", state, settlements=[])
+
+    loaded = db.load_session_state("sess-split-2")
+    assert loaded["bills"][0]["paid_by"] == {}
+    assert loaded["bills"][0]["items"][0]["cost_allocations"] == {}
+
+    reconstructed = SessionState.from_dict(loaded)
+    assert reconstructed.bills[0].paid_by == {}
+    assert reconstructed.all_bills_ready() is False
+
+
+def test_migrate_split_model_converts_legacy_paid_by_and_qty_allocations(tmp_path):
+    """Simulate a pre-existing DB with the old split-model shape (bills.paid_by
+    as a bare person-name string, bill_items.qty_allocations as a JSON
+    fractional-units-per-person map, no cost_allocations column yet) and
+    confirm init_db()'s _migrate_split_model():
+
+    - converts a string paid_by into {"<name>": <bill total>}, where the
+      total is computed fresh from the bill's own items' prices plus its
+      tax/tip (since the old schema never stored a bill total directly);
+    - leaves a NULL paid_by (no payer recorded) untouched;
+    - converts each item's qty_allocations (fractional units) into
+      cost_allocations (dollar amounts, amount = units * price / qty) and
+      then drops the old qty_allocations column entirely;
+    - is idempotent on re-run.
+    """
+    path = str(tmp_path / "legacy_split.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, google_id TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL, name TEXT, avatar_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+            name TEXT NOT NULL DEFAULT 'New Session', finalized INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('user','agent')), content TEXT NOT NULL DEFAULT '',
+            image_base64 TEXT, image_media_type TEXT, user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE session_participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, UNIQUE(session_id, name)
+        );
+        CREATE TABLE bills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            bill_id TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            raw_text TEXT NOT NULL DEFAULT '', tax REAL NOT NULL DEFAULT 0,
+            tip REAL NOT NULL DEFAULT 0, paid_by TEXT,
+            approved_by INTEGER REFERENCES users(id), approved_at TIMESTAMP,
+            UNIQUE(session_id, bill_id)
+        );
+        CREATE TABLE bill_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL DEFAULT 1,
+            assigned_to TEXT NOT NULL DEFAULT '[]', shared INTEGER NOT NULL DEFAULT 0,
+            unassigned INTEGER NOT NULL DEFAULT 0, qty_allocations TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            from_person TEXT NOT NULL, to_person TEXT NOT NULL, amount REAL NOT NULL
+        );
+        CREATE TABLE session_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            role TEXT NOT NULL CHECK (role IN ('admin','member')),
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(session_id, user_id)
+        );
+        CREATE TABLE expense_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            proposed_by INTEGER NOT NULL REFERENCES users(id),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+            supersedes_bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
+            payload TEXT NOT NULL, decided_by INTEGER REFERENCES users(id), decided_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO users (id, google_id, email, name, avatar_url) VALUES (1, 'g1', 'a@example.com', 'A', '');
+        INSERT INTO chat_sessions (id, user_id, name) VALUES ('legacy-split', 1, 'Legacy Split');
+        INSERT INTO session_members (session_id, user_id, role) VALUES ('legacy-split', 1, 'admin');
+
+        INSERT INTO bills (id, session_id, bill_id, description, raw_text, tax, tip, paid_by)
+            VALUES (100, 'legacy-split', 'bill_1', 'Dinner', 'raw', 1.0, 2.0, 'Alice');
+        INSERT INTO bill_items (id, bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+            VALUES (200, 100, 'Burger', 12.0, 2, '["Alice","Sumit"]', 0, 0, '{"Alice": 1.5, "Sumit": 0.5}');
+        INSERT INTO bill_items (id, bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+            VALUES (201, 100, 'Fries', 5.0, 1, '["Sumit"]', 0, 0, '{}');
+
+        INSERT INTO bills (id, session_id, bill_id, description, raw_text, tax, tip, paid_by)
+            VALUES (101, 'legacy-split', 'bill_2', 'Drinks', 'raw2', 0, 0, NULL);
+        INSERT INTO bill_items (id, bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+            VALUES (202, 101, 'Soda', 3.0, 1, '[]', 0, 1, '{}');
+    """)
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        bill1 = conn.execute("SELECT * FROM bills WHERE id = 100").fetchone()
+        assert json.loads(bill1["paid_by"]) == {"Alice": 20.0}  # 12 + 5 + 1(tax) + 2(tip)
+
+        bill2 = conn.execute("SELECT * FROM bills WHERE id = 101").fetchone()
+        assert bill2["paid_by"] is None, "a bill with no payer must stay untouched"
+
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(bill_items)")}
+        assert "qty_allocations" not in cols
+        assert "cost_allocations" in cols
+
+        burger = conn.execute("SELECT * FROM bill_items WHERE id = 200").fetchone()
+        assert json.loads(burger["cost_allocations"]) == {"Alice": 9.0, "Sumit": 3.0}
+
+        fries = conn.execute("SELECT * FROM bill_items WHERE id = 201").fetchone()
+        assert json.loads(fries["cost_allocations"]) == {}
+
+        soda = conn.execute("SELECT * FROM bill_items WHERE id = 202").fetchone()
+        assert json.loads(soda["cost_allocations"]) == {}
+    finally:
+        conn.close()
+
+    # Idempotent re-run: already-migrated data must not be converted again
+    # (e.g. {"Alice": 20.0} must not be mistaken for an old-shape value).
+    db.init_db(path)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        bill1_again = conn.execute("SELECT paid_by FROM bills WHERE id = 100").fetchone()
+        assert json.loads(bill1_again["paid_by"]) == {"Alice": 20.0}
+    finally:
+        conn.close()
+
+
+def test_migrate_split_model_rounds_paid_by_total_to_cents(tmp_path):
+    """subtotal=10.0, tax=0.1, tip=0.2 sums in raw binary float to
+    10.299999999999999 (0.1 + 0.2 isn't exactly representable) — the
+    migration must round that to 10.3 before writing it into paid_by, not
+    persist the float artifact permanently into the database.
+    """
+    path = str(tmp_path / "legacy_rounding.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, google_id TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL, name TEXT, avatar_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+            name TEXT NOT NULL DEFAULT 'New Session', finalized INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('user','agent')), content TEXT NOT NULL DEFAULT '',
+            image_base64 TEXT, image_media_type TEXT, user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE session_participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, UNIQUE(session_id, name)
+        );
+        CREATE TABLE bills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            bill_id TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            raw_text TEXT NOT NULL DEFAULT '', tax REAL NOT NULL DEFAULT 0,
+            tip REAL NOT NULL DEFAULT 0, paid_by TEXT,
+            approved_by INTEGER REFERENCES users(id), approved_at TIMESTAMP,
+            UNIQUE(session_id, bill_id)
+        );
+        CREATE TABLE bill_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL DEFAULT 1,
+            assigned_to TEXT NOT NULL DEFAULT '[]', shared INTEGER NOT NULL DEFAULT 0,
+            unassigned INTEGER NOT NULL DEFAULT 0, qty_allocations TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            from_person TEXT NOT NULL, to_person TEXT NOT NULL, amount REAL NOT NULL
+        );
+        CREATE TABLE session_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            role TEXT NOT NULL CHECK (role IN ('admin','member')),
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(session_id, user_id)
+        );
+        CREATE TABLE expense_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            proposed_by INTEGER NOT NULL REFERENCES users(id),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+            supersedes_bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
+            payload TEXT NOT NULL, decided_by INTEGER REFERENCES users(id), decided_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO users (id, google_id, email, name, avatar_url) VALUES (1, 'g1', 'a@example.com', 'A', '');
+        INSERT INTO chat_sessions (id, user_id, name) VALUES ('legacy-round', 1, 'Legacy Round');
+        INSERT INTO session_members (session_id, user_id, role) VALUES ('legacy-round', 1, 'admin');
+
+        INSERT INTO bills (id, session_id, bill_id, description, raw_text, tax, tip, paid_by)
+            VALUES (300, 'legacy-round', 'bill_1', 'Snack', 'raw', 0.1, 0.2, 'Bob');
+        INSERT INTO bill_items (id, bill_id, name, price, qty, assigned_to, shared, unassigned, qty_allocations)
+            VALUES (400, 300, 'Chips', 10.0, 1, '["Bob"]', 0, 0, '{}');
+    """)
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        bill = conn.execute("SELECT paid_by FROM bills WHERE id = 300").fetchone()
+        # Must be the exact JSON text '{"Bob": 10.3}', not a float-artifact
+        # like 10.299999999999999.
+        assert bill["paid_by"] == '{"Bob": 10.3}', bill["paid_by"]
+        assert json.loads(bill["paid_by"]) == {"Bob": 10.3}
+    finally:
+        conn.close()
+
+
+def test_validate_contribution_map():
+    from core.session_state import validate_contribution_map
+
+    assert validate_contribution_map({"Alice": 1800.0, "Sumit": 1200.0}, 3000.0) is True
+    assert validate_contribution_map({"Alice": 10.0}, 10.0005) is True  # within default epsilon
+    assert validate_contribution_map({"Alice": 10.0}, 11.0) is False
+    assert validate_contribution_map({}, 0.0) is True
+
+
+def test_validate_contribution_map_accepts_unavoidable_n_way_rounding_remainder():
+    """A basic equal 3-way split of $100.00 is {33.33, 33.33, 33.33}, which
+    sums to $99.99 — a $0.01 discrepancy that's an unavoidable artifact of
+    dividing to the cent, not a real mistake, and must not be rejected. The
+    tolerance must still catch a genuinely wrong contribution map, though.
+    """
+    from core.session_state import validate_contribution_map
+
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 33.33}, 100.0) is True
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 20.0}, 100.0) is False
+
+
+def test_validate_contribution_map_accepts_legitimate_large_group_half_up_rounding():
+    """A flat tolerance cap was tried (and reverted) here: it sat exactly at
+    the true worst-case rounding remainder for a 100-person split, so a
+    completely legitimate split — 100 people each owing $1.005, rounded
+    half-up to $1.01 — produced a ~$0.50 discrepancy that was *just* over a
+    flat $0.50 cap and got wrongly rejected. The per-person (uncapped)
+    tolerance must accept this: 100 * epsilon (0.01) = $1.00 of allowance,
+    comfortably covering the ~$0.50 remainder.
+    """
+    from core.session_state import validate_contribution_map
+
+    amounts = {f"person_{i}": 1.01 for i in range(100)}  # each rounded up from 1.005
+    total = 100.50
+    assert validate_contribution_map(amounts, total) is True
 
 
 # ---------- Concurrency ----------

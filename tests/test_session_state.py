@@ -5,7 +5,7 @@ data-layer consequences of bill_id collisions (decide_proposal matches
 proposals to bills by (session_id, bill_id)).
 """
 
-from core.session_state import ParsedBill, SessionState
+from core.session_state import LineItem, ParsedBill, SessionState, validate_contribution_map
 
 
 def test_next_bill_id_is_never_reused():
@@ -27,3 +27,114 @@ def test_next_bill_id_survives_shrinking_bill_list():
     state.bills.clear()  # simulate a future "remove bill" capability
     second = state.next_bill_id()
     assert second != first
+
+
+# ---------- Multi-payer / flexible-split model ----------
+
+def test_parsed_bill_paid_by_defaults_to_empty_dict_not_none():
+    """paid_by's default changed from None to an empty dict (empty dict is
+    now the "not set yet" sentinel) — all_bills_ready() relies on this via
+    bool(b.paid_by)."""
+    bill = ParsedBill(bill_id="bill_1", raw_text="", description="")
+    assert bill.paid_by == {}
+
+    state = SessionState(participants=["Alice"], bills=[bill])
+    assert state.all_bills_ready() is False  # no payer recorded yet
+
+    bill.paid_by = {"Alice": 10.0}
+    assert state.all_bills_ready() is True
+
+
+def test_line_item_cost_allocations_default_and_unit_price():
+    item = LineItem(name="Burger", price=12.0, qty=2)
+    assert item.cost_allocations == {}
+    assert item.unit_price == 6.0  # display-only; allocation math uses cost_allocations
+
+
+def test_from_dict_round_trips_paid_by_and_cost_allocations():
+    state = SessionState.from_dict({
+        "participants": ["Alice", "Sumit"],
+        "bills": [{
+            "bill_id": "bill_1",
+            "description": "Dinner",
+            "raw_text": "raw",
+            "tax": 1.0,
+            "tip": 2.0,
+            "paid_by": {"Alice": 1800.0, "Sumit": 1200.0},
+            "items": [{
+                "name": "Burger", "price": 12.0, "qty": 2,
+                "assigned_to": ["Alice", "Sumit"],
+                "cost_allocations": {"Alice": 8.0, "Sumit": 4.0},
+            }],
+        }],
+        "finalized": False,
+    })
+    bill = state.bills[0]
+    assert bill.paid_by == {"Alice": 1800.0, "Sumit": 1200.0}
+    assert bill.items[0].cost_allocations == {"Alice": 8.0, "Sumit": 4.0}
+
+
+def test_from_dict_defaults_missing_paid_by_to_empty_dict():
+    state = SessionState.from_dict({
+        "participants": [],
+        "bills": [{"bill_id": "bill_1", "description": "", "raw_text": ""}],
+    })
+    assert state.bills[0].paid_by == {}
+
+
+def test_state_summary_renders_multi_payer_map():
+    state = SessionState(
+        participants=["Alice", "Sumit"],
+        bills=[ParsedBill(
+            bill_id="bill_1", raw_text="", description="Dinner",
+            items=[LineItem(
+                name="Burger", price=12.0, qty=2, assigned_to=["Alice", "Sumit"],
+                cost_allocations={"Alice": 8.0, "Sumit": 4.0},
+            )],
+            tax=1.0, tip=2.0,
+            paid_by={"Alice": 1800.0, "Sumit": 1200.0},
+        )],
+    )
+    summary = state.state_summary()
+    assert "paid_by={Alice: $1800.00, Sumit: $1200.00}" in summary
+    assert "Alice: $8.00" in summary
+    assert "Sumit: $4.00" in summary
+
+
+def test_state_summary_shows_not_set_for_empty_paid_by():
+    state = SessionState(
+        participants=["Alice"],
+        bills=[ParsedBill(bill_id="bill_1", raw_text="", description="Drinks")],
+    )
+    assert "paid_by=not set" in state.state_summary()
+
+
+def test_validate_contribution_map():
+    assert validate_contribution_map({"Alice": 1800.0, "Sumit": 1200.0}, 3000.0) is True
+    assert validate_contribution_map({"Alice": 10.0}, 10.0005) is True
+    assert validate_contribution_map({"Alice": 10.0}, 11.0) is False
+    assert validate_contribution_map({}, 0.0) is True
+
+
+def test_validate_contribution_map_accepts_unavoidable_n_way_rounding_remainder():
+    """A basic equal 3-way split of $100.00 is {33.33, 33.33, 33.33}, which
+    sums to $99.99 — a $0.01 discrepancy that's an unavoidable artifact of
+    dividing to the cent, not a real mistake, and must not be rejected. The
+    tolerance must still catch a genuinely wrong contribution map, though.
+    """
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 33.33}, 100.0) is True
+    assert validate_contribution_map({"Alice": 33.33, "Bob": 33.33, "Carol": 20.0}, 100.0) is False
+
+
+def test_validate_contribution_map_accepts_legitimate_large_group_half_up_rounding():
+    """A flat tolerance cap was tried (and reverted) here: it sat exactly at
+    the true worst-case rounding remainder for a 100-person split, so a
+    completely legitimate split — 100 people each owing $1.005, rounded
+    half-up to $1.01 — produced a ~$0.50 discrepancy that was *just* over a
+    flat $0.50 cap and got wrongly rejected. The per-person (uncapped)
+    tolerance must accept this: 100 * epsilon (0.01) = $1.00 of allowance,
+    comfortably covering the ~$0.50 remainder.
+    """
+    amounts = {f"person_{i}": 1.01 for i in range(100)}  # each rounded up from 1.005
+    total = 100.50
+    assert validate_contribution_map(amounts, total) is True
