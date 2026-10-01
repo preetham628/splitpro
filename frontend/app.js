@@ -41,6 +41,30 @@ let proposalsLoadSeq = 0;
 // calls that can supersede one another, and no others.
 let decideProposalSeq = 0;
 
+// ── Live updates (WebSocket) ────────────────────────────────────────────────
+// The currently-open live-update socket, and which session it belongs to.
+// Kept as a pair (rather than inferring "whose socket is this" from
+// `sessionId` alone) because closing the *old* socket when switching
+// sessions needs to happen even after `sessionId` has already been
+// reassigned to the new one.
+let socket          = null;
+let socketSessionId = null;
+let socketReconnectTimer    = null;
+let socketReconnectAttempts = 0;
+// Session ids with a sendToAgent()/sendImageToAgent() REST call currently in
+// flight *for this tab*. The server broadcasts a turn's new messages to
+// every open socket on the session, including the one belonging to the tab
+// that sent it — but that tab already renders the user's message
+// (optimistically, in handleSend()) and the agent's reply (from the POST
+// response itself) via the existing REST flow, so appending them *again*
+// from the socket would duplicate every bubble this tab sends. Scoped by
+// session (a Set, not a single boolean) rather than gated solely by the
+// global `isLoading` flag, since loadSession() can switch the active
+// session while a turn for the *previous* one is still in flight (isLoading
+// doesn't block navigation) — a global flag would then also suppress the
+// new session's unrelated incoming messages until that stale turn resolved.
+let awaitingOwnTurnSessions = new Set();
+
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById('messages');
 const inputEl       = document.getElementById('message-input');
@@ -223,6 +247,7 @@ async function createNewSession() {
   sessionId = data.session_id;
   providerBadge.textContent = data.provider || '–';
   localStorage.setItem('lastSessionId', sessionId);
+  connectSessionSocket(sessionId);
 
   await loadSessionList();
   if (mySeq !== navSeq) return;
@@ -243,6 +268,11 @@ async function loadSession(id) {
   sessionId = id;
   localStorage.setItem('lastSessionId', id);
   setActiveSession(id);
+  // Opened alongside (not awaited against) the REST catch-up fetches below —
+  // this only needs to cover "stay live while already looking at it"; the
+  // fetches below still do the "catch up on what happened while this tab
+  // was closed/elsewhere" job they always have.
+  connectSessionSocket(id);
 
   messagesEl.innerHTML = '';
   stateContent.innerHTML = '<p class="muted">Loading…</p>';
@@ -292,6 +322,95 @@ async function loadSession(id) {
     }
   } catch {
     if (id === sessionId) stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+  }
+}
+
+// ── Live updates (WebSocket) ────────────────────────────────────────────────
+// Opens a fresh live-update connection for `id`, first tearing down whatever
+// connection (and pending reconnect) belonged to the previously active
+// session — a tab only ever needs one of these open at a time, for whichever
+// session it's currently looking at.
+function connectSessionSocket(id) {
+  disconnectSessionSocket();
+  socketSessionId = id;
+  socketReconnectAttempts = 0;
+  openSessionSocket(id);
+}
+
+function openSessionSocket(id) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws/sessions/${id}`);
+
+  ws.onmessage = ev => {
+    // Guards the same staleness the REST catch-up fetches in loadSession()
+    // guard against — the user may have switched away from (or reloaded
+    // past) the session this particular socket was opened for.
+    if (id !== socketSessionId || id !== sessionId) return;
+    let payload;
+    try {
+      payload = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    handleSocketPayload(id, payload);
+  };
+
+  // Both a clean close (e.g. the server restarting) and a transport error
+  // surface here — WebSocket always fires 'close' after 'error', so a single
+  // reconnect path off onclose covers both without double-scheduling.
+  ws.onclose = () => scheduleSocketReconnect(id);
+
+  socket = ws;
+}
+
+function disconnectSessionSocket() {
+  if (socketReconnectTimer) {
+    clearTimeout(socketReconnectTimer);
+    socketReconnectTimer = null;
+  }
+  socketSessionId = null;
+  if (socket) {
+    const s = socket;
+    socket = null;
+    // Detach first — this is an intentional close (switching sessions, or
+    // superseded by a newer connectSessionSocket call), not a drop that
+    // should trigger scheduleSocketReconnect.
+    s.onmessage = null;
+    s.onclose = null;
+    s.close();
+  }
+}
+
+function scheduleSocketReconnect(id) {
+  // Only reconnect for the session the user is still actually looking at —
+  // a close belonging to a session they've since navigated away from (or
+  // one disconnectSessionSocket already detached) should just be dropped.
+  if (id !== socketSessionId || id !== sessionId) return;
+  socketReconnectAttempts++;
+  // Capped exponential backoff (1s, 2s, 4s, ... up to 15s) rather than
+  // hammering the server through an outage, but never gives up outright —
+  // per task14's acceptance bar, silently going stale forever isn't an
+  // option, so this keeps trying indefinitely at a bounded rate. A page
+  // reload (which re-runs init()/loadSession() from scratch) remains the
+  // immediate fallback if this is somehow still reconnecting.
+  const delay = Math.min(1000 * 2 ** (socketReconnectAttempts - 1), 15000);
+  socketReconnectTimer = setTimeout(() => {
+    if (id === socketSessionId && id === sessionId) openSessionSocket(id);
+  }, delay);
+}
+
+// Applies one pushed update to the chat log / state panel in place — no
+// full page reload, no re-running loadSession()'s fetch sequence.
+function handleSocketPayload(id, payload) {
+  if (payload.state) renderState(payload.state);
+
+  if (payload.messages && !awaitingOwnTurnSessions.has(id)) {
+    payload.messages.forEach(m => {
+      const imageDataUrl = m.image_base64
+        ? `data:${m.image_media_type};base64,${m.image_base64}`
+        : null;
+      appendBubble(m.role, m.content, imageDataUrl, m.user_id);
+    });
   }
 }
 
@@ -797,6 +916,11 @@ async function deleteSession(id) {
     localStorage.removeItem('lastSessionId');
     messagesEl.innerHTML = '';
     stateContent.innerHTML = '<p class="muted">No data yet.</p>';
+    // The server already drops its side of any sockets on this session (see
+    // server.py's delete_session), but this tab's own socket would
+    // otherwise sit around pointed at a session that no longer exists until
+    // createNewSession()/loadSession() replaces it below.
+    disconnectSessionSocket();
   }
   await loadSessionList();
   if (!sessionId) await createNewSession();
@@ -868,6 +992,14 @@ async function sendToAgent(text) {
   // different session's) DOM.
   const requestSessionId = sessionId;
   setLoading(true);
+  // The server broadcasts this turn's messages to every open socket on
+  // requestSessionId, including this tab's own — but this tab is about to
+  // render the agent's reply itself from the POST response below (the
+  // user's own message is already in the log, appended optimistically by
+  // handleSend()), so the socket's echo of this same turn must be ignored
+  // rather than appended a second time. See awaitingOwnTurnSessions' own
+  // comment for why this is scoped per-session rather than a single flag.
+  awaitingOwnTurnSessions.add(requestSessionId);
   const typing = appendTyping();
   try {
     const res  = await fetch(`${API}/sessions/${requestSessionId}/chat`, {
@@ -889,6 +1021,7 @@ async function sendToAgent(text) {
     if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
+    awaitingOwnTurnSessions.delete(requestSessionId);
   }
 }
 
@@ -899,6 +1032,9 @@ async function sendImageToAgent(file) {
   // below re-checks it's still acting on the session this upload started in.
   const requestSessionId = sessionId;
   setLoading(true);
+  // See the matching comment in sendToAgent() — suppresses this tab's own
+  // socket echo of the turn this call is about to produce.
+  awaitingOwnTurnSessions.add(requestSessionId);
 
   const reader = new FileReader();
   reader.onload = e => {
@@ -927,6 +1063,7 @@ async function sendImageToAgent(file) {
     if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
+    awaitingOwnTurnSessions.delete(requestSessionId);
   }
 }
 
