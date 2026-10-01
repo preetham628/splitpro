@@ -814,6 +814,14 @@ function formatPaidBy(paidBy) {
 // settlement actually charges each person. Returns null when the item has
 // no cost_allocations to show (plain equal split, nothing to break down).
 function computeItemShares(item) {
+  // compute_balances checks `unassigned` before `cost_allocations` — an
+  // explicit "split this evenly" marker always wins over a stale allocation
+  // map left behind by whatever previously split this item (see
+  // mark_items_unassigned, which sets unassigned=True precisely to force
+  // this). Mirror that ordering here, or a stale map renders a wrong
+  // breakdown right next to the "unassigned" badge.
+  if (item.unassigned) return null;
+
   const assigned = item.assigned_to || [];
   const allocations = item.cost_allocations || {};
   if (!assigned.length || !Object.keys(allocations).length) return null;
@@ -831,6 +839,21 @@ function computeItemShares(item) {
     const share = remaining / remainderPeople.length;
     remainderPeople.forEach(p => { shares[p] = (shares[p] || 0) + share; });
   }
+
+  // Defensive fallback for a narrow edge case this per-item function can't
+  // fully replicate: compute_balances' remainder distribution falls back to
+  // *all session participants* (not just this item's assigned_to) when
+  // cost_allocations already names everyone in assigned_to but sums
+  // slightly short of item.price under N-way validation tolerance — context
+  // this function doesn't have without threading the full participant list
+  // through. Rather than do that, just suppress the breakdown if the shares
+  // computed here don't actually add back up to item.price within a sane
+  // (per-person cent-rounding) tolerance, rather than risk showing numbers
+  // that silently disagree with the real settlement.
+  const sum = Object.values(shares).reduce((a, b) => a + b, 0);
+  const sumTolerance = 0.01 * Math.max(assigned.length, 1);
+  if (Math.abs(sum - item.price) > sumTolerance) return null;
+
   return shares;
 }
 
@@ -845,10 +868,16 @@ function formatItemSplit(item) {
 
   const assigned = item.assigned_to || [];
   const n = assigned.length;
-  if (!n) return null;
 
+  // Per-person tolerance scaled by group size, same idea as
+  // validate_contribution_map (core/session_state.py): splitting a total
+  // evenly to the cent is frequently impossible (e.g. $100 / 3 =
+  // {33.33, 33.33, 33.34}, ~$0.0067 off the exact 33.333... share), and a
+  // flat threshold tight enough to catch a real uneven split is too tight
+  // for that unavoidable rounding remainder once there are 3+ people.
   const equalShare = item.price / n;
-  const isEqual = assigned.every(p => Math.abs((shares[p] || 0) - equalShare) < 0.005);
+  const tolerance = 0.005 * Math.max(n, 1);
+  const isEqual = assigned.every(p => Math.abs((shares[p] || 0) - equalShare) < tolerance);
   if (isEqual) return null;
 
   return assigned.map(p => `${p}: $${(shares[p] || 0).toFixed(2)}`).join(', ');
