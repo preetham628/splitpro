@@ -98,7 +98,14 @@ async function init() {
   // Populate user info in header
   userAvatar.src = currentUser.avatar_url || '';
   userAvatar.alt = currentUser.name || '';
-  userName.textContent = currentUser.name || currentUser.email;
+  const displayName = currentUser.name || currentUser.email;
+  userName.textContent = displayName;
+  // Note: unlike the item-name spans (set via innerHTML template strings,
+  // where title="${escapeHtml(...)}" is required so quotes/angle-brackets
+  // in the name don't break out of the attribute), this is a direct DOM
+  // property assignment — the string is used verbatim, so escaping it
+  // would corrupt the tooltip for names containing &, <, >, ' or ".
+  userName.title = displayName;
 
   await loadSessionList();
 

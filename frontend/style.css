@@ -118,6 +118,12 @@ h1 {
   font-size: 12px; font-weight: 500; color: var(--muted);
   background: none; border: 1px solid var(--border);
   border-radius: 6px; padding: 3px 9px; cursor: pointer;
+  /* As a flex item of .user-info, this would otherwise be shrunk below its
+     content width before .user-name (which already has overflow:hidden,
+     so its auto min-width is 0 and it can absorb the squeeze via its
+     ellipsis truncation) gives up any space — wrapping "Sign out" onto two
+     lines at narrow widths instead of just truncating the name further. */
+  white-space: nowrap; flex-shrink: 0;
   transition: color .15s, border-color .15s;
 }
 .logout-btn:hover { color: var(--danger); border-color: var(--danger); }
@@ -577,8 +583,19 @@ h1 {
    truncation above, this keeps both toggle buttons on-screen (and the
    header itself non-scrolling, since body has overflow: hidden) down to
    a real stock phone width with the app's actual default header content —
-   not just a contrived short name. */
-@media (max-width: 480px) {
+   not just a contrived short name.
+
+   560px (not 480px) is deliberate: below 560px there isn't room for the
+   badge *and* a fully-readable h1 title at the same time — a worst-case
+   (120px-capped, i.e. ellipsis-truncating) user-name plus "anthropic" (the
+   longest provider id) plus a single-line Sign-out button only leaves the
+   h1 its full, non-truncated width starting at ~551px. Picking anything
+   below that (480px was too low) means the instant the badge reappears
+   just above the breakpoint, the h1 gets squeezed harder than it was with
+   the badge hidden — a visible regression right at the boundary. 560px
+   gives a few pixels of margin beyond that ~551px crossover so the
+   transition is seamless in both directions. */
+@media (max-width: 560px) {
   .provider-badge { display: none; }
 }
 
