@@ -562,7 +562,7 @@ function renderProposals(proposals) {
       const splitText = formatItemSplit(item);
       html += `<div class="item-block">
         <div class="item-row">
-          <span class="item-name">${escapeHtml(item.name)}</span>
+          <span class="item-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
           <span class="item-price">$${item.price.toFixed(2)}</span>
           <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
         </div>${splitText ? `<div class="item-split">${escapeHtml(splitText)}</div>` : ''}
@@ -1031,7 +1031,7 @@ function renderState(state) {
         const splitText = formatItemSplit(item);
         html += `<div class="item-block">
           <div class="item-row">
-            <span class="item-name">${escapeHtml(item.name)}</span>
+            <span class="item-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
             <span class="item-price">$${item.price.toFixed(2)}</span>
             <span class="item-assign ${isUnassigned ? 'unassigned' : ''}">${escapeHtml(assignText)}</span>
           </div>${splitText ? `<div class="item-split">${escapeHtml(splitText)}</div>` : ''}

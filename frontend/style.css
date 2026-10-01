@@ -491,7 +491,10 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   display: flex; align-items: baseline; gap: 6px;
   font-size: 12px;
 }
-.item-name  { flex: 1; color: var(--text); }
+.item-name  {
+  flex: 1; min-width: 0; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .item-price { color: var(--muted); flex-shrink: 0; }
 .item-assign {
   font-size: 11px; color: var(--accent); flex-shrink: 0;
