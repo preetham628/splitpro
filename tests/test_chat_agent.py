@@ -1307,6 +1307,9 @@ def test_remove_bill_approval_deletes_bills_and_bill_items_rows(fresh_db):
 
 
 def test_remove_bill_pending_proposal_is_rejected_directly_no_second_approval(fresh_db):
+    """An admin removing a bill that's only a still-pending proposal (never
+    approved) discards it directly via decide_proposal(..., "rejected") —
+    no correction/removal proposal cycle, since there's nothing real yet."""
     admin = make_user("admin@example.com", "g-rb3-admin")
     alice = make_user("alice@example.com", "g-rb3-alice")
     session_id = "sess-rmbill-3"
@@ -1316,7 +1319,7 @@ def test_remove_bill_pending_proposal_is_rejected_directly_no_second_approval(fr
     _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
         state, session_id
     )
-    msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(alice["id"]))
+    msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(admin["id"]))
     assert "discarded" in msg.lower() or "rejected" in msg.lower() or "never approved" in msg.lower()
 
     # Rejected directly, no new proposal created, nothing pending left.
@@ -1328,6 +1331,97 @@ def test_remove_bill_pending_proposal_is_rejected_directly_no_second_approval(fr
     # Never appeared in bills, ever.
     final_state = SessionState.from_dict(db.load_session_state(session_id))
     assert final_state.bills == []
+
+
+def test_remove_bill_pending_proposal_requires_admin(fresh_db):
+    """Security regression: a non-admin member must not be able to discard
+    another member's (or even their own) still-pending proposal via
+    remove_bill — that's exactly what db.decide_proposal(..., "rejected")
+    does, and every other path to it (server.py's reject endpoint) is
+    admin-gated via _require_admin. Before the fix, remove_bill called
+    decide_proposal directly with no such check."""
+    admin = make_user("admin@example.com", "g-rbperm-admin")
+    alice = make_user("alice@example.com", "g-rbperm-alice")
+    bob = make_user("bob@example.com", "g-rbperm-bob")
+    session_id = "sess-rmbill-perm"
+    make_session_with_members(session_id, admin["id"], alice["id"], bob["id"])
+
+    state, bill_id, proposal_id = _pending_bill(session_id, alice["id"])
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        state, session_id
+    )
+    # Bob (a non-admin member) tries to kill Alice's still-pending proposal.
+    msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(bob["id"]))
+    assert "admin" in msg.lower()
+
+    # The proposal must still be pending — untouched by the rejected attempt.
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["id"] == proposal_id
+    assert pending[0]["status"] == "pending"
+
+
+def test_remove_bill_dual_existence_rejects_stale_correction_and_proposes_removal(fresh_db):
+    """Regression test for a resurrection bug: an already-approved bill with
+    a *separate* pending correction proposal already targeting it (e.g. from
+    set_payer) is a dual-existence case. remove_bill used to check the
+    approved bill first and propose its own independent removal proposal
+    while leaving that stale correction proposal pending — if an admin later
+    approved the stale correction after the removal had already been
+    approved and the bill deleted, decide_proposal's insert-path would fire
+    (no existing bill row to find) and silently resurrect the bill.
+
+    remove_bill must instead handle both at once: reject the stale pending
+    proposal (admin-gated) AND propose the approved bill's removal, so no
+    pending proposal survives that could later resurrect it."""
+    admin = make_user("admin@example.com", "g-dual-admin")
+    alice = make_user("alice@example.com", "g-dual-alice")
+    bob = make_user("bob@example.com", "g-dual-bob")
+    session_id = "sess-dual-1"
+    make_session_with_members(session_id, admin["id"], alice["id"], bob["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    # Bob proposes a correction (set_payer) on the already-approved bill —
+    # this is the stale pending proposal that must not survive removal.
+    _add, _set_p, _assign, set_payer, _mark, _rename, _add_item, _rm_item, _rm_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    set_payer.invoke({"bill_id": bill_id, "payers": [{"name": "Alice"}]}, config=as_speaker(bob["id"]))
+    correction = db.list_pending_proposals(session_id)[0]
+    assert correction["payload"]["bill_id"] == bill_id
+    assert correction["payload"].get("action") != "remove_bill"
+
+    # Admin removes the bill — both the stale correction and the bill's own
+    # removal must be handled in this one call.
+    _add2, _set_p2, _assign2, _payer2, _mark2, _rename2, _add_item2, _rm_item2, remove_bill, _calc2 = (
+        _build_tools(approved_state, session_id)
+    )
+    msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(admin["id"]))
+    assert "discarded" in msg.lower()
+    assert "already approved" in msg.lower()
+
+    # The stale correction is gone; only the new removal proposal remains.
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    removal_proposal = pending[0]
+    assert removal_proposal["id"] != correction["id"]
+    assert removal_proposal["payload"].get("action") == "remove_bill"
+    assert removal_proposal["payload"]["bill_id"] == bill_id
+
+    # The stale correction can never be approved (and resurrect the bill)
+    # later — it's already been decided (rejected), not pending.
+    with pytest.raises(ValueError):
+        db.decide_proposal(correction["id"], admin["id"], "approved")
+
+    # Approving the removal proposal deletes the bill as expected.
+    db.decide_proposal(removal_proposal["id"], admin["id"], "approved")
+    final_state = SessionState.from_dict(db.load_session_state(session_id))
+    assert final_state.bills == []
+
+    # No pending proposal survives that could resurrect it — the bill stays
+    # gone, and there's nothing left to decide.
+    assert db.list_pending_proposals(session_id) == []
 
 
 def test_remove_bill_not_found_error(fresh_db):

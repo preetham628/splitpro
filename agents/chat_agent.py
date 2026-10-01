@@ -323,6 +323,17 @@ def _resolve_contribution_entries(
     return resolved, None
 
 
+def _find_item_fuzzy(bill: ParsedBill, item_name: str) -> Optional[LineItem]:
+    """Fuzzy-match item_name against bill.items: exact match (case-insensitive)
+    first, then substring match. Shared by _apply_assign_items (assign_items'
+    mutation logic) and the remove_item_from_bill tool, so both tools agree
+    on what a given item_name actually refers to."""
+    item = next((i for i in bill.items if i.name.lower() == item_name.lower()), None)
+    if item is None:
+        item = next((i for i in bill.items if item_name.lower() in i.name.lower()), None)
+    return item
+
+
 def _apply_assign_items(
     bill: ParsedBill, assignments: list[dict], participants: list[str]
 ) -> tuple[bool, str]:
@@ -354,10 +365,7 @@ def _apply_assign_items(
             )
             continue
 
-        # Exact match first, then partial
-        item = next((i for i in bill.items if i.name.lower() == item_name.lower()), None)
-        if item is None:
-            item = next((i for i in bill.items if item_name.lower() in i.name.lower()), None)
+        item = _find_item_fuzzy(bill, item_name)
         if item is None:
             all_names = [i.name for i in bill.items]
             results.append(f"'{item_name}' not found. Available: {all_names}")
@@ -899,10 +907,7 @@ def _build_tools(state: SessionState, session_id: str) -> list:
             known = _known_bill_ids(state, session_id, user_id)
             return f"Error: bill '{bill_id}' not found. Known bills: {known}"
 
-        # Same exact-match-then-substring-match logic as assign_items/_apply_assign_items.
-        item = next((i for i in bill.items if i.name.lower() == item_name.lower()), None)
-        if item is None:
-            item = next((i for i in bill.items if item_name.lower() in i.name.lower()), None)
+        item = _find_item_fuzzy(bill, item_name)
         if item is None:
             all_names = [i.name for i in bill.items]
             return f"Error: '{item_name}' not found on {bill_id}. Available: {all_names}"
@@ -920,7 +925,8 @@ def _build_tools(state: SessionState, session_id: str) -> list:
 
         If the bill was already approved, removing it needs admin approval like any other
         correction. If it's only a pending proposal that was never approved, it's discarded
-        immediately — there's nothing real to undo yet, so no second approval cycle.
+        immediately — there's nothing real to undo yet, so no second approval cycle. Discarding
+        a pending proposal requires admin access, same as rejecting any other proposal.
 
         Args:
             bill_id: The bill identifier to remove.
@@ -933,27 +939,58 @@ def _build_tools(state: SessionState, session_id: str) -> list:
             state.bills.remove(bill)
             return f"Removed {bill_id} ('{bill.description}')."
 
+        # Mirror _load_bill_for_edit's resolution order — check for a pending
+        # proposal before an approved bill — rather than the reverse. The two
+        # can legitimately target the same bill_id at once (an approved bill
+        # with a separate pending correction already proposed against it), and
+        # both must be handled together here: leaving that pending proposal
+        # untouched while only proposing the bill's removal would let it be
+        # approved later, after the bill itself is gone, silently resurrecting
+        # it via decide_proposal's insert-path (there'd be no existing bill row
+        # left for it to find, so it would INSERT a new one instead of no-op).
+        proposal = _find_pending_proposal(session_id, bill_id)
         approved = state.get_bill(bill_id)
+
+        if proposal is None and approved is None:
+            known = _known_bill_ids(state, session_id, user_id)
+            return f"Error: bill '{bill_id}' not found. Known bills: {known}"
+
+        messages = []
+
+        if proposal is not None:
+            # Discarding someone else's pending proposal is an admin-gated
+            # action, mirroring server.py's /proposals/{id}/reject endpoint
+            # (_require_admin there, db.is_session_admin here) — without this
+            # check, any member could kill another member's still-pending
+            # proposal via chat. Checked (and the whole call aborted, before
+            # any proposal is created below) rather than only gating the
+            # decide_proposal call itself, so a non-admin can't end up in the
+            # half-done state this bug report's resurrection scenario depends
+            # on: an approved bill's removal proposed while its stale
+            # competing proposal is left pending.
+            if not db.is_session_admin(session_id, user_id):
+                return (
+                    "Error: removing this bill requires admin access, since it also has a "
+                    "pending proposal that must be discarded as part of the removal. Ask an "
+                    "admin to remove it instead."
+                )
+            db.decide_proposal(proposal["id"], decided_by=user_id, decision="rejected")
+            description = proposal["payload"].get("description", "")
+            messages.append(
+                f"Discarded the pending proposal for {bill_id} ('{description}') — it was "
+                f"never approved."
+            )
+
         if approved is not None:
             row_id = db.get_bill_row_id(session_id, bill_id)
             payload = {"action": "remove_bill", "bill_id": bill_id}
             db.create_proposal(session_id, proposed_by=user_id, payload=payload, supersedes_bill_id=row_id)
-            return (
+            messages.append(
                 f"Proposed removing {bill_id} ('{approved.description}') — this bill was "
                 f"already approved, so the removal needs admin approval before it takes effect."
             )
 
-        proposal = _find_pending_proposal(session_id, bill_id)
-        if proposal is not None:
-            db.decide_proposal(proposal["id"], decided_by=user_id, decision="rejected")
-            description = proposal["payload"].get("description", "")
-            return (
-                f"Discarded the pending proposal for {bill_id} ('{description}') — it was "
-                f"never approved, so there's nothing else to remove."
-            )
-
-        known = _known_bill_ids(state, session_id, user_id)
-        return f"Error: bill '{bill_id}' not found. Known bills: {known}"
+        return " ".join(messages)
 
     @tool
     def calculate_split() -> str:
