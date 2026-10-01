@@ -453,6 +453,39 @@ function renderProposals(proposals) {
   approvalsContent.innerHTML = '';
   proposals.forEach(p => {
     const payload = p.payload || {};
+
+    // A remove_bill proposal (see agents/chat_agent.py's remove_bill tool)
+    // has no items/tax/tip/paid_by — it's just {action, bill_id}. Render it
+    // as its own simple card instead of falling through to the normal
+    // items/total rendering below, which would otherwise show a misleading
+    // "Untitled expense · Payer unknown · $0.00" card with no items.
+    if (payload.action === 'remove_bill') {
+      const card = document.createElement('div');
+      card.className = 'bill-card proposal-card';
+      card.innerHTML = `<div class="bill-title">Remove bill ${escapeHtml(payload.bill_id || '')}</div>
+        <div class="bill-meta">This will delete the bill and all its items.</div>`;
+
+      const actions = document.createElement('div');
+      actions.className = 'proposal-actions';
+
+      const approveBtn = document.createElement('button');
+      approveBtn.className = 'proposal-btn approve';
+      approveBtn.textContent = 'Approve';
+      approveBtn.addEventListener('click', () => decideProposal(p.id, 'approve'));
+
+      const rejectBtn = document.createElement('button');
+      rejectBtn.className = 'proposal-btn reject';
+      rejectBtn.textContent = 'Reject';
+      rejectBtn.addEventListener('click', () => decideProposal(p.id, 'reject'));
+
+      actions.appendChild(approveBtn);
+      actions.appendChild(rejectBtn);
+      card.appendChild(actions);
+
+      approvalsContent.appendChild(card);
+      return;
+    }
+
     const items = payload.items || [];
     const tax = payload.tax || 0;
     const tip = payload.tip || 0;
