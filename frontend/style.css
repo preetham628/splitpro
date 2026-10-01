@@ -441,18 +441,24 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
 .bill-meta {
   font-size: 11px; color: var(--muted); margin-bottom: 8px;
 }
-.item-row {
-  display: flex; align-items: baseline; gap: 6px;
-  font-size: 12px; padding: 3px 0;
+.item-block {
+  padding: 3px 0;
   border-bottom: 1px solid var(--border);
 }
-.item-row:last-child { border-bottom: none; }
+.item-block:last-child { border-bottom: none; }
+.item-row {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 12px;
+}
 .item-name  { flex: 1; color: var(--text); }
 .item-price { color: var(--muted); flex-shrink: 0; }
 .item-assign {
   font-size: 11px; color: var(--accent); flex-shrink: 0;
 }
 .item-assign.unassigned { color: var(--danger); }
+.item-split {
+  font-size: 10.5px; color: var(--muted); padding-left: 2px; margin-top: 1px;
+}
 
 /* Settlement */
 .settlement-card {
@@ -461,7 +467,10 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
 }
 .settlement-card h3 {
   font-size: 12px; font-weight: 700; color: #15803d;
-  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px;
+  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px;
+}
+.settlement-subtitle {
+  font-size: 10.5px; color: #4d7c0f; margin-bottom: 8px;
 }
 .txn-row {
   font-size: 12px; padding: 3px 0; color: #166534;
