@@ -20,6 +20,7 @@ Each test gets its own fresh scratch SQLite file (tmp_path), same pattern as
 tests/test_database.py.
 """
 
+import sqlite3
 import threading
 import uuid
 
@@ -119,7 +120,7 @@ def test_assign_items_updates_pending_proposal_in_place(fresh_db):
 
     state = SessionState()
     state.participants = ["Alice", "Bob"]
-    add_bill, _set_p, assign_items, set_payer, _mark, _calc = _build_tools(state, session_id)
+    add_bill, _set_p, assign_items, set_payer, _mark, _rename, _add_item, _rm_item, _rm_bill, _calc = _build_tools(state, session_id)
 
     add_bill.invoke(one_item_bill(), config=as_speaker(alice["id"]))
     bill_id = db.list_pending_proposals(session_id)[0]["payload"]["bill_id"]
@@ -151,7 +152,7 @@ def test_assign_items_unknown_bill_id_error_lists_pending_proposals(fresh_db):
     make_session_with_members(session_id, admin["id"])
 
     state = SessionState()
-    add_bill, _set_p, assign_items, _payer, _mark, _calc = _build_tools(state, session_id)
+    add_bill, _set_p, assign_items, _payer, _mark, _rename, _add_item, _rm_item, _rm_bill, _calc = _build_tools(state, session_id)
     add_bill.invoke(one_item_bill(), config=as_speaker(admin["id"]))
     real_bill_id = db.list_pending_proposals(session_id)[0]["payload"]["bill_id"]
 
@@ -167,7 +168,7 @@ def test_assign_items_unknown_bill_id_error_lists_pending_proposals(fresh_db):
 
 def test_assign_items_unknown_bill_id_legacy_path(fresh_db):
     state = SessionState()
-    _add, _set_p, assign_items, _payer, _mark, _calc = _build_tools(state, "unused-session-id")
+    _add, _set_p, assign_items, _payer, _mark, _rename, _add_item, _rm_item, _rm_bill, _calc = _build_tools(state, "unused-session-id")
 
     msg = assign_items.invoke({
         "bill_id": "bill_does_not_exist",
@@ -201,7 +202,7 @@ def test_correction_to_approved_bill_creates_superseding_proposal(fresh_db):
     approved_state = SessionState.from_dict(db.load_session_state(session_id))
     assert approved_state.bills[0].paid_by == {}
 
-    _add2, _set_p2, _assign2, set_payer2, _mark2, _calc2 = _build_tools(approved_state, session_id)
+    _add2, _set_p2, _assign2, set_payer2, _mark2, _rename2, _add_item2, _rm_item2, _rm_bill2, _calc2 = _build_tools(approved_state, session_id)
     msg = set_payer2.invoke(
         {"bill_id": bill_id, "payers": [{"name": "Alice"}]}, config=as_speaker(bob["id"])
     )
@@ -250,7 +251,7 @@ def test_known_bill_ids_dedupes_a_correction_sharing_its_approved_bills_id(fresh
     db.decide_proposal(proposal["id"], admin["id"], "approved")
 
     approved_state = SessionState.from_dict(db.load_session_state(session_id))
-    _add2, _set_p2, assign_items2, set_payer2, _mark2, _calc2 = _build_tools(approved_state, session_id)
+    _add2, _set_p2, assign_items2, set_payer2, _mark2, _rename2, _add_item2, _rm_item2, _rm_bill2, _calc2 = _build_tools(approved_state, session_id)
 
     # Propose a correction (same bill_id) so it now exists in BOTH
     # approved_state.bills and the pending-proposals list simultaneously.
@@ -276,7 +277,7 @@ def test_mark_items_unassigned_reports_bill_not_found_before_participants_check(
     make_session_with_members(session_id, admin["id"])
 
     state = SessionState()  # no participants set
-    _add, _set_p, _assign, _payer, mark_items_unassigned, _calc = _build_tools(state, session_id)
+    _add, _set_p, _assign, _payer, mark_items_unassigned, _rename, _add_item, _rm_item, _rm_bill, _calc = _build_tools(state, session_id)
 
     msg = mark_items_unassigned.invoke(
         {"bill_id": "bill_does_not_exist", "item_names": ["Pizza"]},
@@ -291,7 +292,7 @@ def test_mark_items_unassigned_requires_participants_once_bill_exists(fresh_db):
     make_session_with_members(session_id, admin["id"])
 
     state = SessionState()  # no participants set
-    add_bill, _set_p, _assign, _payer, mark_items_unassigned, _calc = _build_tools(state, session_id)
+    add_bill, _set_p, _assign, _payer, mark_items_unassigned, _rename, _add_item, _rm_item, _rm_bill, _calc = _build_tools(state, session_id)
     add_bill.invoke(one_item_bill(), config=as_speaker(admin["id"]))
     bill_id = db.list_pending_proposals(session_id)[0]["payload"]["bill_id"]
 
@@ -443,7 +444,10 @@ def _legacy_tools(participants, bill_kwargs=None):
     plus its tools built on the legacy (no DB speaker) path."""
     state = SessionState()
     state.participants = participants
-    add_bill, set_participants, assign_items, set_payer, mark_items_unassigned, calculate_split = _build_tools(
+    (
+        add_bill, set_participants, assign_items, set_payer, mark_items_unassigned,
+        _rename, _add_item, _rm_item, _rm_bill, calculate_split,
+    ) = _build_tools(
         state, "unused-session-id"
     )
     add_bill.invoke(bill_kwargs or one_item_bill())
@@ -816,7 +820,10 @@ def test_mark_items_unassigned_clears_stale_cost_allocations():
     equal split, with no warning to the caller."""
     state = SessionState()
     state.participants = ["Alice", "Bob", "Carol"]
-    add_bill, _set_p, assign_items, set_payer, mark_items_unassigned, _calc = _build_tools(
+    (
+        add_bill, _set_p, assign_items, set_payer, mark_items_unassigned,
+        _rename, _add_item, _rm_item, _rm_bill, _calc,
+    ) = _build_tools(
         state, "unused-session-id"
     )
     add_bill.invoke({
@@ -964,3 +971,391 @@ def test_calculate_split_end_to_end_across_all_three_allocation_modes():
 
     report = calculate_split.invoke({})
     assert "SETTLEMENT REPORT" in report
+
+
+# ---------- rename_bill / add_item_to_bill / remove_item_from_bill / remove_bill (task9) ----------
+
+def _approved_bill(session_id, admin_id, proposer_id, bill_kwargs=None):
+    """Stage a bill via add_bill and approve it as admin — the shared setup
+    for testing edits to an already-approved bill. Returns
+    (approved_state, bill_id, approved_row_id)."""
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    db.save_session_state(session_id, state, [])  # persist participants, like server.py every turn
+
+    add_bill, *_rest = _build_tools(state, session_id)
+    add_bill.invoke(bill_kwargs or one_item_bill(), config=as_speaker(proposer_id))
+
+    proposal = db.list_pending_proposals(session_id)[0]
+    bill_id = proposal["payload"]["bill_id"]
+    db.decide_proposal(proposal["id"], admin_id, "approved")
+    row_id = db.get_bill_row_id(session_id, bill_id)
+
+    approved_state = SessionState.from_dict(db.load_session_state(session_id))
+    return approved_state, bill_id, row_id
+
+
+def _pending_bill(session_id, proposer_id, bill_kwargs=None):
+    """Stage a bill via add_bill but never approve it. Returns
+    (state, bill_id, proposal_id)."""
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    db.save_session_state(session_id, state, [])
+
+    add_bill, *_rest = _build_tools(state, session_id)
+    add_bill.invoke(bill_kwargs or one_item_bill(), config=as_speaker(proposer_id))
+
+    proposal = db.list_pending_proposals(session_id)[0]
+    return state, proposal["payload"]["bill_id"], proposal["id"]
+
+
+def two_item_bill():
+    return {
+        "raw_text": "Pizza $30, Soda $5",
+        "description": "Pizza night",
+        "items": [
+            {"name": "Pizza", "price": 30.0, "qty": 1},
+            {"name": "Soda", "price": 5.0, "qty": 1},
+        ],
+        "tax": 0.0,
+        "tip": 0.0,
+    }
+
+
+# ---------- rename_bill ----------
+
+def test_rename_bill_on_approved_bill_proposes_correction(fresh_db):
+    admin = make_user("admin@example.com", "g-rn-admin")
+    alice = make_user("alice@example.com", "g-rn-alice")
+    bob = make_user("bob@example.com", "g-rn-bob")
+    session_id = "sess-rename-1"
+    make_session_with_members(session_id, admin["id"], alice["id"], bob["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    _add, _set_p, _assign, _payer, _mark, rename_bill, _add_item, _rm_item, _rm_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    msg = rename_bill.invoke(
+        {"bill_id": bill_id, "new_description": "Pizza Night Redux"}, config=as_speaker(bob["id"])
+    )
+    assert "already approved" in msg
+    assert "admin approval" in msg
+
+    # Not applied yet — the approved bill must stay untouched before approval.
+    still_old = SessionState.from_dict(db.load_session_state(session_id))
+    assert still_old.bills[0].description == "Pizza night"
+
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["supersedes_bill_id"] == row_id
+    assert pending[0]["payload"]["description"] == "Pizza Night Redux"
+    # Items/payer carried through unchanged in the proposal payload.
+    assert pending[0]["payload"]["items"][0]["name"] == "Pizza"
+    assert pending[0]["payload"]["items"][0]["price"] == 30.0
+
+    db.decide_proposal(pending[0]["id"], admin["id"], "approved")
+    final_state = SessionState.from_dict(db.load_session_state(session_id))
+    assert len(final_state.bills) == 1
+    final_bill = final_state.bills[0]
+    assert final_bill.bill_id == bill_id
+    assert final_bill.description == "Pizza Night Redux"
+    assert [i.name for i in final_bill.items] == ["Pizza"]
+    assert final_bill.items[0].price == 30.0
+    assert final_bill.paid_by == {}
+
+
+def test_rename_bill_no_op_when_description_unchanged(fresh_db):
+    admin = make_user("admin@example.com", "g-rn2-admin")
+    alice = make_user("alice@example.com", "g-rn2-alice")
+    session_id = "sess-rename-2"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, _row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    _add, _set_p, _assign, _payer, _mark, rename_bill, _add_item, _rm_item, _rm_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    msg = rename_bill.invoke(
+        {"bill_id": bill_id, "new_description": "Pizza night"}, config=as_speaker(alice["id"])
+    )
+    assert "no change" in msg
+    assert db.list_pending_proposals(session_id) == []  # nothing proposed
+
+
+def test_rename_bill_updates_pending_proposal_in_place(fresh_db):
+    admin = make_user("admin@example.com", "g-rn3-admin")
+    alice = make_user("alice@example.com", "g-rn3-alice")
+    session_id = "sess-rename-3"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    state, bill_id, proposal_id = _pending_bill(session_id, alice["id"])
+    _add, _set_p, _assign, _payer, _mark, rename_bill, _add_item, _rm_item, _rm_bill, _calc = _build_tools(
+        state, session_id
+    )
+    msg = rename_bill.invoke(
+        {"bill_id": bill_id, "new_description": "Renamed Before Approval"}, config=as_speaker(alice["id"])
+    )
+    assert "still awaiting admin approval" in msg
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["id"] == proposal_id
+    assert pending[0]["payload"]["description"] == "Renamed Before Approval"
+
+
+def test_rename_bill_legacy_path_mutates_state_directly(fresh_db):
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    add_bill, _set_p, _assign, _payer, _mark, rename_bill, _add_item, _rm_item, _rm_bill, _calc = _build_tools(
+        state, "unused-session-id"
+    )
+    add_bill.invoke(one_item_bill())
+    bill_id = state.bills[0].bill_id
+
+    msg = rename_bill.invoke({"bill_id": bill_id, "new_description": "New Name"})
+    assert state.bills[0].description == "New Name"
+    assert "Renamed" in msg
+    assert "admin approval" not in msg
+
+
+# ---------- add_item_to_bill ----------
+
+def test_add_item_to_bill_on_approved_bill_shows_up_unassigned_after_approval(fresh_db):
+    admin = make_user("admin@example.com", "g-ai-admin")
+    alice = make_user("alice@example.com", "g-ai-alice")
+    session_id = "sess-additem-1"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    _add, _set_p, _assign, _payer, _mark, _rename, add_item_to_bill, _rm_item, _rm_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    msg = add_item_to_bill.invoke(
+        {"bill_id": bill_id, "name": "Garlic Bread", "price": 6.0, "qty": 1},
+        config=as_speaker(alice["id"]),
+    )
+    assert "already approved" in msg
+
+    # Not applied yet.
+    still_old = SessionState.from_dict(db.load_session_state(session_id))
+    assert [i.name for i in still_old.bills[0].items] == ["Pizza"]
+
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["supersedes_bill_id"] == row_id
+    item_names = [i["name"] for i in pending[0]["payload"]["items"]]
+    assert item_names == ["Pizza", "Garlic Bread"]
+
+    db.decide_proposal(pending[0]["id"], admin["id"], "approved")
+    final_state = SessionState.from_dict(db.load_session_state(session_id))
+    final_bill = final_state.bills[0]
+    assert [i.name for i in final_bill.items] == ["Pizza", "Garlic Bread"]
+    new_item = next(i for i in final_bill.items if i.name == "Garlic Bread")
+    assert new_item.price == 6.0
+    assert new_item.qty == 1
+    assert new_item.assigned_to == []
+    assert new_item.shared is False
+    assert new_item.unassigned is False
+    assert new_item.cost_allocations == {}
+    # Original item untouched.
+    original = next(i for i in final_bill.items if i.name == "Pizza")
+    assert original.price == 30.0
+
+
+def test_add_item_to_bill_legacy_path_mutates_state_directly(fresh_db):
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    add_bill, _set_p, _assign, _payer, _mark, _rename, add_item_to_bill, _rm_item, _rm_bill, _calc = _build_tools(
+        state, "unused-session-id"
+    )
+    add_bill.invoke(one_item_bill())
+    bill_id = state.bills[0].bill_id
+
+    msg = add_item_to_bill.invoke({"bill_id": bill_id, "name": "Soda", "price": 5.0, "qty": 2})
+    assert "admin approval" not in msg
+    assert len(state.bills[0].items) == 2
+    new_item = state.bills[0].items[1]
+    assert new_item.name == "Soda"
+    assert new_item.price == 5.0
+    assert new_item.qty == 2
+    assert new_item.unassigned is False
+    assert new_item.assigned_to == []
+
+
+# ---------- remove_item_from_bill ----------
+
+def test_remove_item_from_bill_fuzzy_match_on_approved_bill(fresh_db):
+    admin = make_user("admin@example.com", "g-ri-admin")
+    alice = make_user("alice@example.com", "g-ri-alice")
+    session_id = "sess-rmitem-1"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"], two_item_bill())
+
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, remove_item_from_bill, _rm_bill, _calc = (
+        _build_tools(approved_state, session_id)
+    )
+    # Fuzzy substring match: "sod" -> "Soda"
+    msg = remove_item_from_bill.invoke(
+        {"bill_id": bill_id, "item_name": "sod"}, config=as_speaker(alice["id"])
+    )
+    assert "already approved" in msg
+
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["supersedes_bill_id"] == row_id
+    item_names = [i["name"] for i in pending[0]["payload"]["items"]]
+    assert item_names == ["Pizza"]  # Soda gone, Pizza untouched
+
+    db.decide_proposal(pending[0]["id"], admin["id"], "approved")
+    final_state = SessionState.from_dict(db.load_session_state(session_id))
+    final_bill = final_state.bills[0]
+    assert [i.name for i in final_bill.items] == ["Pizza"]
+    assert final_bill.items[0].price == 30.0
+
+
+def test_remove_item_from_bill_not_found_lists_available_items(fresh_db):
+    admin = make_user("admin@example.com", "g-ri2-admin")
+    alice = make_user("alice@example.com", "g-ri2-alice")
+    session_id = "sess-rmitem-2"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, _row_id = _approved_bill(session_id, admin["id"], alice["id"], two_item_bill())
+
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, remove_item_from_bill, _rm_bill, _calc = (
+        _build_tools(approved_state, session_id)
+    )
+    msg = remove_item_from_bill.invoke(
+        {"bill_id": bill_id, "item_name": "Nachos"}, config=as_speaker(alice["id"])
+    )
+    assert "not found" in msg
+    assert "Pizza" in msg and "Soda" in msg
+    assert db.list_pending_proposals(session_id) == []  # no phantom proposal
+
+
+def test_remove_item_from_bill_legacy_path_mutates_state_directly(fresh_db):
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    add_bill, _set_p, _assign, _payer, _mark, _rename, _add_item, remove_item_from_bill, _rm_bill, _calc = (
+        _build_tools(state, "unused-session-id")
+    )
+    add_bill.invoke(two_item_bill())
+    bill_id = state.bills[0].bill_id
+
+    msg = remove_item_from_bill.invoke({"bill_id": bill_id, "item_name": "soda"})
+    assert "admin approval" not in msg
+    assert [i.name for i in state.bills[0].items] == ["Pizza"]
+
+
+# ---------- remove_bill ----------
+
+def test_remove_bill_on_approved_bill_requires_approval_before_deletion(fresh_db):
+    admin = make_user("admin@example.com", "g-rb-admin")
+    alice = make_user("alice@example.com", "g-rb-alice")
+    session_id = "sess-rmbill-1"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(alice["id"]))
+    assert "already approved" in msg
+    assert "admin approval" in msg
+
+    # Still present before approval.
+    still_there = SessionState.from_dict(db.load_session_state(session_id))
+    assert len(still_there.bills) == 1
+
+    pending = db.list_pending_proposals(session_id)
+    assert len(pending) == 1
+    assert pending[0]["supersedes_bill_id"] == row_id
+    assert pending[0]["payload"]["action"] == "remove_bill"
+    assert pending[0]["payload"]["bill_id"] == bill_id
+
+    db.decide_proposal(pending[0]["id"], admin["id"], "approved")
+    final_state = SessionState.from_dict(db.load_session_state(session_id))
+    assert final_state.bills == []
+
+
+def test_remove_bill_approval_deletes_bills_and_bill_items_rows(fresh_db):
+    admin = make_user("admin@example.com", "g-rb2-admin")
+    alice = make_user("alice@example.com", "g-rb2-alice")
+    session_id = "sess-rmbill-2"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    approved_state, bill_id, row_id = _approved_bill(session_id, admin["id"], alice["id"])
+
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        approved_state, session_id
+    )
+    remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(alice["id"]))
+    pending = db.list_pending_proposals(session_id)
+    db.decide_proposal(pending[0]["id"], admin["id"], "approved")
+
+    conn = sqlite3.connect(fresh_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        bill_row = conn.execute("SELECT * FROM bills WHERE id = ?", (row_id,)).fetchone()
+        item_rows = conn.execute("SELECT * FROM bill_items WHERE bill_id = ?", (row_id,)).fetchall()
+    finally:
+        conn.close()
+    assert bill_row is None
+    assert item_rows == []
+
+
+def test_remove_bill_pending_proposal_is_rejected_directly_no_second_approval(fresh_db):
+    admin = make_user("admin@example.com", "g-rb3-admin")
+    alice = make_user("alice@example.com", "g-rb3-alice")
+    session_id = "sess-rmbill-3"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    state, bill_id, proposal_id = _pending_bill(session_id, alice["id"])
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        state, session_id
+    )
+    msg = remove_bill.invoke({"bill_id": bill_id}, config=as_speaker(alice["id"]))
+    assert "discarded" in msg.lower() or "rejected" in msg.lower() or "never approved" in msg.lower()
+
+    # Rejected directly, no new proposal created, nothing pending left.
+    assert db.list_pending_proposals(session_id) == []
+    # Sanity: the proposal row itself is now 'rejected', not re-decidable.
+    with pytest.raises(ValueError):
+        db.decide_proposal(proposal_id, admin["id"], "approved")
+
+    # Never appeared in bills, ever.
+    final_state = SessionState.from_dict(db.load_session_state(session_id))
+    assert final_state.bills == []
+
+
+def test_remove_bill_not_found_error(fresh_db):
+    admin = make_user("admin@example.com", "g-rb4-admin")
+    alice = make_user("alice@example.com", "g-rb4-alice")
+    session_id = "sess-rmbill-4"
+    make_session_with_members(session_id, admin["id"], alice["id"])
+
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    db.save_session_state(session_id, state, [])
+
+    _add, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        state, session_id
+    )
+    msg = remove_bill.invoke({"bill_id": "bill_does_not_exist"}, config=as_speaker(alice["id"]))
+    assert "not found" in msg
+
+
+def test_remove_bill_legacy_path_mutates_state_directly(fresh_db):
+    state = SessionState()
+    state.participants = ["Alice", "Bob"]
+    add_bill, _set_p, _assign, _payer, _mark, _rename, _add_item, _rm_item, remove_bill, _calc = _build_tools(
+        state, "unused-session-id"
+    )
+    add_bill.invoke(one_item_bill())
+    bill_id = state.bills[0].bill_id
+
+    msg = remove_bill.invoke({"bill_id": bill_id})
+    assert "admin approval" not in msg
+    assert state.bills == []
