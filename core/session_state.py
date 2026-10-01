@@ -13,10 +13,16 @@ class LineItem:
     assigned_to: List[str] = field(default_factory=list)
     shared: bool = False      # True = split equally among assigned_to
     unassigned: bool = False  # True = intentionally split among all participants
-    qty_allocations: Dict[str, float] = field(default_factory=dict)  # person -> fractional units
+    # person -> dollar amount of this item's price they're responsible for.
+    # Percentage/equal-split/"N of M units" are input conveniences that
+    # resolve to these dollar amounts at the tool-call layer — this is
+    # always the canonical, already-resolved shape.
+    cost_allocations: Dict[str, float] = field(default_factory=dict)
 
     @property
     def unit_price(self) -> float:
+        """Price per unit — for display only; allocation math uses
+        cost_allocations (dollar amounts) directly, not unit counts."""
         return self.price / self.qty if self.qty > 0 else self.price
 
 
@@ -29,7 +35,10 @@ class ParsedBill:
     items: List[LineItem] = field(default_factory=list)
     tax: float = 0.0
     tip: float = 0.0
-    paid_by: Optional[str] = None
+    # person -> dollar amount they paid toward this bill. Supports multiple
+    # payers on one bill (e.g. {"Alice": 1800.0, "Sumit": 1200.0}). Empty
+    # dict means no payer recorded yet.
+    paid_by: Dict[str, float] = field(default_factory=dict)
 
     def subtotal(self) -> float:
         """Sum of all item prices (before tax/tip)."""
@@ -72,7 +81,7 @@ class SessionState:
         if not self.bills:
             return False
         return all(
-            b.paid_by is not None and len(b.unassigned_items()) == 0
+            bool(b.paid_by) and len(b.unassigned_items()) == 0
             for b in self.bills
         )
 
@@ -88,7 +97,7 @@ class SessionState:
                     assigned_to=i.get("assigned_to", []),
                     shared=i.get("shared", False),
                     unassigned=i.get("unassigned", False),
-                    qty_allocations=i.get("qty_allocations", {}),
+                    cost_allocations=i.get("cost_allocations", {}),
                 )
                 for i in b.get("items", [])
             ]
@@ -99,7 +108,7 @@ class SessionState:
                 items=items,
                 tax=b.get("tax", 0.0),
                 tip=b.get("tip", 0.0),
-                paid_by=b.get("paid_by"),
+                paid_by=b.get("paid_by") or {},
             ))
         return cls(
             participants=d.get("participants", []),
@@ -118,9 +127,15 @@ class SessionState:
             lines.append("  (none yet)")
         else:
             for b in self.bills:
+                if b.paid_by:
+                    paid_by_str = "{" + ", ".join(
+                        f"{person}: ${amount:.2f}" for person, amount in b.paid_by.items()
+                    ) + "}"
+                else:
+                    paid_by_str = "not set"
                 lines.append(
                     f"  [{b.bill_id}] {b.description} | "
-                    f"paid_by={b.paid_by or 'not set'} | "
+                    f"paid_by={paid_by_str} | "
                     f"subtotal=${b.subtotal():.2f} | tax=${b.tax:.2f} | tip=${b.tip:.2f}"
                 )
                 for item in b.items:
@@ -132,12 +147,24 @@ class SessionState:
                         assignment = "UNASSIGNED"
                         tag = ""
                     lines.append(f"    - {item.name}{qty_str}: ${item.price:.2f} -> {assignment}{tag}")
-                    if item.qty_allocations:
-                        for person, pqty in item.qty_allocations.items():
-                            lines.append(f"      {person}: {pqty} unit(s) = ${item.unit_price * pqty:.2f}")
+                    if item.cost_allocations:
+                        for person, amount in item.cost_allocations.items():
+                            lines.append(f"      {person}: ${amount:.2f}")
 
                 pending = b.unassigned_items()
                 if pending:
                     lines.append(f"    NEEDS ASSIGNMENT: {', '.join(i.name for i in pending)}")
 
         return "\n".join(lines)
+
+
+def validate_contribution_map(amounts: Dict[str, float], total: float, epsilon: float = 0.001) -> bool:
+    """True if a person -> dollar-amount contribution map (paid_by or a
+    LineItem's cost_allocations) sums to `total` within `epsilon`.
+
+    A reusable building block for the tool-call layer's input validation
+    (e.g. rejecting a set_payer/assign_item call whose percentages or
+    absolute amounts don't actually add up to the bill/item total) — not
+    called from anywhere in this module itself yet.
+    """
+    return abs(sum(amounts.values()) - total) <= epsilon
