@@ -33,6 +33,15 @@
 -- see _migrate_split_model() in core/database.py, which follows the same
 -- drop-and-reshape pattern as _migrate_chat_sessions().
 --
+-- Same story again for chat_sessions.context_summary: a running natural-
+-- language summary of conversation rounds the sliding-window context manager
+-- has trimmed out of LangGraph's checkpoint (see agents/chat_agent.py's
+-- summarize_rounds/plan_context_summarization/apply_context_summarization
+-- and core/checkpointer.py) — added via ALTER TABLE in
+-- _migrate_context_summary() rather than retrofitted into the CREATE TABLE
+-- below, same as every other column added after this table already existed
+-- in deployed databases.
+--
 -- Usage (local, requires the sqlite3 CLI — ships with macOS/most Linux):
 --   sqlite3 splitpro.db < schema.sql
 --
@@ -61,6 +70,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     user_id          INTEGER NOT NULL REFERENCES users(id),
     name             TEXT NOT NULL DEFAULT 'New Session',
     finalized        INTEGER NOT NULL DEFAULT 0,
+    context_summary  TEXT NOT NULL DEFAULT '',
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

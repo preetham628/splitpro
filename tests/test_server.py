@@ -23,7 +23,7 @@ import time
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import BackgroundTasks, HTTPException, UploadFile
 
 import server
 from agents.chat_agent import ChatAgent
@@ -35,8 +35,8 @@ from core.session_state import ParsedBill
 @pytest.fixture
 def fresh_server(tmp_path, monkeypatch):
     """Fresh DB + checkpointer per test, and a clean server-side cache —
-    server.sessions / server._session_locks are module-level globals shared
-    across the whole test session otherwise."""
+    server.sessions / server._session_locks / server._summarizing_sessions
+    are module-level globals shared across the whole test session otherwise."""
     path = str(tmp_path / "test.db")
     db.create_db(path)
     db.init_db(path)
@@ -44,6 +44,7 @@ def fresh_server(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server, "sessions", {})
     monkeypatch.setattr(server, "_session_locks", {})
+    monkeypatch.setattr(server, "_summarizing_sessions", set())
 
     return path
 
@@ -102,6 +103,9 @@ def test_concurrent_first_touch_does_not_lose_writes(fresh_server, monkeypatch):
     results = {}
 
     def run_turn(user, message):
+        # _run_chat_turn itself takes no background_tasks (that's wired in
+        # at the chat()/upload_image() endpoint layer, around it) — called
+        # directly here same as the rest of this file's tests.
         response, state = server._run_chat_turn(
             session_id, user, message, user["name"],
             persist_user_message=lambda: db.add_chat_message(
@@ -158,7 +162,10 @@ def test_delete_session_waits_for_inflight_turn(fresh_server, monkeypatch):
 
     def run_turn():
         try:
-            server.chat(session_id, server.ChatRequest(message="hello"), member)
+            server.chat(
+                session_id, server.ChatRequest(message="hello"),
+                background_tasks=BackgroundTasks(), user=member,
+            )
         except Exception as e:  # noqa: BLE001 - captured for the assertion below
             turn_error.append(e)
 
@@ -190,7 +197,10 @@ def test_turn_after_delete_gets_clean_404(fresh_server):
     assert result == {"ok": True}
 
     with pytest.raises(HTTPException) as exc_info:
-        server.chat(session_id, server.ChatRequest(message="hello"), admin)
+        server.chat(
+            session_id, server.ChatRequest(message="hello"),
+            background_tasks=BackgroundTasks(), user=admin,
+        )
     assert exc_info.value.status_code == 404
 
 
@@ -222,7 +232,8 @@ def test_chat_does_not_crash_on_get_current_user_shaped_dict(fresh_server, monke
     session_id = make_session_with_members(alice_row)
 
     result = server.chat(
-        session_id, server.ChatRequest(message="hi"), _real_shaped_user(alice_row)
+        session_id, server.ChatRequest(message="hi"),
+        background_tasks=BackgroundTasks(), user=_real_shaped_user(alice_row),
     )
 
     assert result.response == "echo: hi"
@@ -241,7 +252,10 @@ def test_chat_falls_back_to_email_when_name_blank(fresh_server, monkeypatch):
     row = db.upsert_user(google_id="g-noname", email="noname@example.com", name="", avatar_url="")
     session_id = make_session_with_members(row)
 
-    server.chat(session_id, server.ChatRequest(message="hi"), _real_shaped_user(row))
+    server.chat(
+        session_id, server.ChatRequest(message="hi"),
+        background_tasks=BackgroundTasks(), user=_real_shaped_user(row),
+    )
 
     assert captured["speaker_name"] == "noname@example.com"
 
@@ -270,7 +284,10 @@ def test_upload_image_does_not_crash_on_get_current_user_shaped_dict(fresh_serve
     upload = UploadFile(filename="photo.jpg", file=io.BytesIO(b"fake-bytes"))
 
     result = asyncio.run(
-        server.upload_image(session_id, upload, _real_shaped_user(alice_row))
+        server.upload_image(
+            session_id, background_tasks=BackgroundTasks(),
+            file=upload, user=_real_shaped_user(alice_row),
+        )
     )
 
     assert result.response == "ok"
@@ -309,7 +326,10 @@ def test_approve_proposal_evicts_cache_so_next_turn_keeps_the_bill(fresh_server,
     assert [b["description"] for b in state["bills"]] == ["Dinner"]
 
     # One more normal chat turn must not wipe it back out.
-    server.chat(session_id, server.ChatRequest(message="thanks"), admin)
+    server.chat(
+        session_id, server.ChatRequest(message="thanks"),
+        background_tasks=BackgroundTasks(), user=admin,
+    )
 
     persisted = db.load_session_state(session_id)
     assert [b["description"] for b in persisted["bills"]] == ["Dinner"]
@@ -390,7 +410,8 @@ def test_approve_proposal_race_with_concurrent_chat_turn_keeps_bill(fresh_server
 
     chat_thread = threading.Thread(
         target=server.chat,
-        args=(session_id, server.ChatRequest(message="hi"), admin),
+        args=(session_id, server.ChatRequest(message="hi")),
+        kwargs={"background_tasks": BackgroundTasks(), "user": admin},
     )
     chat_thread.start()
     assert chat_turn_started.wait(timeout=2), "chat turn never started"
@@ -422,5 +443,8 @@ def test_chat_raises_401_when_user_row_is_missing(fresh_server):
     session_id = make_session_with_members(admin)
 
     with pytest.raises(HTTPException) as exc_info:
-        server.chat(session_id, server.ChatRequest(message="hi"), {"id": 999999})
+        server.chat(
+            session_id, server.ChatRequest(message="hi"),
+            background_tasks=BackgroundTasks(), user={"id": 999999},
+        )
     assert exc_info.value.status_code == 401

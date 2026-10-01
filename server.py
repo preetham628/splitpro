@@ -13,13 +13,13 @@ from uuid import uuid4
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agents.chat_agent import ChatAgent
+from agents.chat_agent import ChatAgent, summarize_rounds
 from agents.image_analyzer import ImageAnalyzer
 from config import ChatAgentConfig, load_config
 from core import auth as auth_module
@@ -95,6 +95,27 @@ def _drop_session_lock(session_id: str) -> None:
     build a fresh Lock, and session_ids are never reused."""
     with _session_locks_guard:
         _session_locks.pop(session_id, None)
+
+
+# Session ids with a context-summarization background task currently
+# scheduled or in flight (see _schedule_context_summarization_if_needed /
+# _maybe_summarize_context below). Without this, two concurrent turns for
+# the same session could each independently see "needs summarization" and
+# each schedule their own task, both firing a real (paid) LLM summarization
+# call before either reaches the lock — wasted cost, even though the second
+# apply would safely no-op via apply_context_summarization's subset-id
+# guard.
+#
+# Guarded by its own dedicated lock, _summarizing_sessions_guard, rather
+# than reusing a session's per-session lock (_get_session_lock) — that lock
+# is dropped (_drop_session_lock) once a session is deleted, and a pending
+# summarization task for that now-deleted session would otherwise silently
+# recreate (leak) a lock dict entry for a session_id that will never be
+# used again just to clear this trivial O(1) set-membership bookkeeping in
+# its finally block. This guard's own lifecycle is fully decoupled from
+# that, so it never resurrects a dead session's lock entry.
+_summarizing_sessions: set[str] = set()
+_summarizing_sessions_guard = threading.Lock()
 
 
 # ---------- Request / Response models ----------
@@ -270,6 +291,93 @@ def _run_chat_turn(
         state = _serialize_state(agent.state, session_id)
 
     return response, state
+
+
+def _schedule_context_summarization_if_needed(session_id: str, background_tasks: BackgroundTasks) -> None:
+    """Called right after a turn's response has already been built (see
+    chat()/upload_image() below) — a cheap, synchronous check (a checkpoint
+    read via ChatAgent.needs_context_summarization(), no LLM call) for
+    whether this session's history has grown past the sliding window or the
+    raw-message safety net. Only schedules the (potentially slow, real-LLM-
+    call) background task when that's actually true — most turns, most
+    sessions, this is a no-op.
+
+    Also closes the race where two concurrent turns for the same session
+    could each independently see "needs summarization" and each schedule
+    their own task: the needs-check itself runs unlocked (cheap, and
+    tolerating staleness is fine for a heuristic trigger), but the
+    check-and-set against _summarizing_sessions is done under its own
+    dedicated _summarizing_sessions_guard (see that global's comment for
+    why this is deliberately NOT the per-session lock), so only the first
+    of any such pair actually schedules a task — the loser sees its own
+    session_id already marked in-flight and skips, saving a wasted (paid)
+    LLM call for something apply_context_summarization would've no-op'd
+    anyway.
+    """
+    agent = sessions.get(session_id)
+    if agent is None:
+        return
+    if not agent.needs_context_summarization():
+        return
+
+    with _summarizing_sessions_guard:
+        if session_id in _summarizing_sessions:
+            return  # already scheduled/in flight -- don't duplicate the LLM call
+        _summarizing_sessions.add(session_id)
+
+    background_tasks.add_task(_maybe_summarize_context, session_id)
+
+
+def _maybe_summarize_context(session_id: str) -> None:
+    """Background task body — see _schedule_context_summarization_if_needed
+    for the (now conditional) scheduling decision this is only ever
+    reached from.
+
+    Scheduled via BackgroundTasks.add_task, which FastAPI only runs *after*
+    the triggering request's response has already been sent — so however
+    long this takes adds zero latency to that request.
+
+    Two phases, matching ChatAgent.plan_context_summarization /
+    summarize_rounds / apply_context_summarization:
+      1. The slow LLM call (summarize_rounds) runs with no lock held at
+         all, so it never blocks a concurrent chat turn for this session.
+      2. Only the final checkpoint-surgery + context_summary persist step
+         (apply_context_summarization) takes this session's existing
+         per-session lock — the same one _run_chat_turn uses for a whole
+         turn — and only for that brief step.
+
+    _summarizing_sessions is cleared in a finally, under its own dedicated
+    _summarizing_sessions_guard (NOT _get_session_lock) — deliberately
+    decoupled from the per-session lock's lifecycle. A session can be
+    deleted (dropping its _get_session_lock entry via _drop_session_lock)
+    while a summarization task scheduled for it is still pending; calling
+    _get_session_lock(session_id) here in that case would silently
+    recreate a lock dict entry for a session_id that will never be reused,
+    leaking forever in a long-running process. The dedicated guard has no
+    such lifecycle to collide with, so this is always safe to call
+    regardless of what happened to the session in the meantime.
+    """
+    try:
+        agent = sessions.get(session_id)
+        if agent is None:
+            # Session was deleted (or its cache entry otherwise evicted)
+            # between the triggering turn finishing and this task running —
+            # nothing left to summarize.
+            return
+
+        plan = agent.plan_context_summarization()
+        if plan is None:
+            return
+        messages_to_summarize, ids_to_remove = plan
+
+        existing_summary = db.get_context_summary(session_id)
+        new_summary = summarize_rounds(agent.config, existing_summary, messages_to_summarize)
+
+        with _get_session_lock(session_id):
+            agent.apply_context_summarization(ids_to_remove, new_summary)
+    finally:
+        with _summarizing_sessions_guard:
+            _summarizing_sessions.discard(session_id)
 
 
 def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
@@ -600,6 +708,7 @@ def reject_proposal(
 def chat(
     session_id: str,
     req: ChatRequest,
+    background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
 ):
     speaker_name = _speaker_name(user)
@@ -612,6 +721,13 @@ def chat(
             session_id, "user", req.message, user_id=user["id"]
         ),
     )
+    # Checked (cheap) and scheduled (only if actually needed) after the
+    # response above is already built — BackgroundTasks only runs the task
+    # once the response has been sent, so a long-running summarization here
+    # adds no latency to this request. See _schedule_context_summarization_
+    # if_needed's docstring for the needs-check + in-flight guard, and
+    # _maybe_summarize_context's for the two-phase lock design.
+    _schedule_context_summarization_if_needed(session_id, background_tasks)
     return ChatResponse(response=response, state=state)
 
 
@@ -642,6 +758,7 @@ def end_session(session_id: str, user: dict = Depends(get_current_user)):
 @app.post("/sessions/{session_id}/image", response_model=ChatResponse)
 async def upload_image(
     session_id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
 ):
@@ -695,6 +812,10 @@ async def upload_image(
             user_id=user["id"],
         ),
     )
+    # See the matching comment in chat() — checked and scheduled only after
+    # the response above is already built, so it adds no latency to this
+    # request, and only when actually needed.
+    _schedule_context_summarization_if_needed(session_id, background_tasks)
     return ChatResponse(response=response, state=state)
 
 
