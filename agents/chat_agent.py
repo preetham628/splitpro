@@ -29,13 +29,17 @@ brackets, e.g. "[Alice] we had pizza" — use that tag to track who said what, a
 questions like "what did Bob say" or "did Alice already pay" accurately.
 
 ## Approvals
-Every new or changed expense — a new bill, or an edit to its items, split, or payer — is
-staged as a proposal and needs an admin to approve it before it affects anyone's balance.
-Whenever add_bill, assign_items, set_payer, or mark_items_unassigned creates or updates a
-proposal, say so explicitly (e.g. "proposed, awaiting admin approval") — never say an
-expense was simply "added" or "updated" as if it were already final. If someone disputes
-something that was already approved, just call the same tools as usual; corrections are
-routed to a new proposal automatically and need no different handling from you.
+Every new or changed expense — a new bill, or an edit to its items, split, payer,
+description, or whether the bill exists at all — is staged as a proposal and needs an
+admin to approve it before it affects anyone's balance. Whenever add_bill, assign_items,
+set_payer, mark_items_unassigned, rename_bill, add_item_to_bill, remove_item_from_bill, or
+remove_bill creates or updates a proposal, say so explicitly (e.g. "proposed, awaiting
+admin approval") — never say an expense was simply "added", "updated", "renamed", or
+"removed" as if it were already final. If someone disputes something that was already
+approved, just call the same tools as usual; corrections are routed to a new proposal
+automatically and need no different handling from you. The one exception is removing a
+bill that's still just a pending proposal (never approved) — remove_bill discards that
+outright with no second approval cycle, since there's nothing real to undo yet.
 
 ## Your Job
 Guide the user through these steps in order:
@@ -58,9 +62,13 @@ The user can add more bills at any point. Always be ready to call add_bill again
 - When a bill item has qty > 1 and the user specifies how many units each person had (e.g., "Alice had 1 out of 4 burgers"), use qty_per_person={{"Alice": 1}} in the assignment. Unspecified units are split equally among the remaining assigned_to.
 - Fractional units are allowed (e.g., "Alice had 25% of one burger" with item qty=4 → qty_per_person={{"Alice": 0.25}}).
 - set_payer supports multiple payers on one bill, each by exact amount, percentage (0-100) of the bill total, or equal share of the rest — see the set_payer tool description for worked examples.
-- Fuzzy-match item names: if the user says "the chicken thing", match to the closest item name.
+- Fuzzy-match item names: if the user says "the chicken thing", match to the closest item name (rename_bill/add_item_to_bill/remove_item_from_bill/remove_bill all accept a bill_id the same way the other tools do).
 - Tax and tip are NOT assigned via assign_items — they are handled proportionally by calculate_split automatically.
 - For lump-sum bills with no line items, add one item called "Total" with the full amount and mark it as shared.
+- If the user wants to retitle a bill (e.g. "call that one 'Brunch' instead"), call rename_bill.
+- If the user forgot an item and wants it added to a bill that already exists, call add_item_to_bill — it lands unassigned, so follow up by asking who had it (assign_items).
+- If the user says an item shouldn't be on the bill at all (not just "nobody had it" — actually remove it), call remove_item_from_bill, not mark_items_unassigned.
+- If the user wants to delete an entire bill (e.g. "forget the pizza bill", "remove bill_2"), call remove_bill.
 - Keep replies concise. Confirm tool actions briefly and move the conversation forward.
 - After calling add_bill, immediately ask for participants if not set, or move to item assignment if participants are known.
 
@@ -811,6 +819,143 @@ def _build_tools(state: SessionState, session_id: str) -> list:
         return message + _persist_edit(session_id, user_id, mode, bill, ref, changed)
 
     @tool
+    def rename_bill(bill_id: str, new_description: str, config: RunnableConfig) -> str:
+        """
+        Rename a bill's description, leaving its items, assignments, and payer untouched.
+        Call this when the user wants to retitle a bill (e.g. "call bill_2 'Brunch' instead").
+        Works whether the bill is still awaiting approval or was already approved.
+
+        Args:
+            bill_id: The bill identifier to rename.
+            new_description: The new description/title for the bill.
+        """
+        user_id = _speaker_user_id(config)
+        mode, bill, ref = _load_bill_for_edit(state, session_id, bill_id, user_id)
+        if bill is None:
+            known = _known_bill_ids(state, session_id, user_id)
+            return f"Error: bill '{bill_id}' not found. Known bills: {known}"
+
+        new_description = new_description.strip()
+        if new_description == bill.description:
+            changed = False
+            message = f"'{bill_id}' is already named '{bill.description}' — no change made."
+        else:
+            bill.description = new_description
+            changed = True
+            message = f"Renamed {bill_id} to '{new_description}'."
+
+        return message + _persist_edit(session_id, user_id, mode, bill, ref, changed)
+
+    @tool
+    def add_item_to_bill(bill_id: str, name: str, price: float, qty: int, config: RunnableConfig) -> str:
+        """
+        Add a brand-new line item to an existing bill. Call this when the user says they
+        forgot an item, or wants to add something to a bill that's already there (whether
+        still awaiting approval or already approved). The new item lands unassigned, same
+        as any item on a freshly parsed bill — follow up with assign_items once the user
+        says who had it.
+
+        Args:
+            bill_id: The bill identifier to add the item to.
+            name: The item's name.
+            price: Total price for all qty units of this item.
+            qty: Number of units ordered (default 1).
+        """
+        user_id = _speaker_user_id(config)
+        mode, bill, ref = _load_bill_for_edit(state, session_id, bill_id, user_id)
+        if bill is None:
+            known = _known_bill_ids(state, session_id, user_id)
+            return f"Error: bill '{bill_id}' not found. Known bills: {known}"
+
+        item = LineItem(
+            name=name,
+            price=float(price),
+            qty=int(qty),
+            assigned_to=[],
+            shared=False,
+            unassigned=False,
+            cost_allocations={},
+        )
+        bill.items.append(item)
+        message = f"Added item '{item.name}' (${item.price:.2f}, qty={item.qty}) to {bill_id}, unassigned."
+        return message + _persist_edit(session_id, user_id, mode, bill, ref, True)
+
+    @tool
+    def remove_item_from_bill(bill_id: str, item_name: str, config: RunnableConfig) -> str:
+        """
+        Remove a single line item from a bill entirely — not just unassign it. Call this
+        when the user says an item shouldn't have been on the bill at all (e.g. "take the
+        fries off the bill"), as opposed to "nobody had the fries" (use
+        mark_items_unassigned for that). Fuzzy-matches item_name the same way assign_items
+        does: exact match first, then substring match.
+
+        Args:
+            bill_id: The bill identifier.
+            item_name: Name of the item to remove, as it appears on the bill (fuzzy match ok).
+        """
+        user_id = _speaker_user_id(config)
+        mode, bill, ref = _load_bill_for_edit(state, session_id, bill_id, user_id)
+        if bill is None:
+            known = _known_bill_ids(state, session_id, user_id)
+            return f"Error: bill '{bill_id}' not found. Known bills: {known}"
+
+        # Same exact-match-then-substring-match logic as assign_items/_apply_assign_items.
+        item = next((i for i in bill.items if i.name.lower() == item_name.lower()), None)
+        if item is None:
+            item = next((i for i in bill.items if item_name.lower() in i.name.lower()), None)
+        if item is None:
+            all_names = [i.name for i in bill.items]
+            return f"Error: '{item_name}' not found on {bill_id}. Available: {all_names}"
+
+        bill.items.remove(item)
+        message = f"Removed item '{item.name}' from {bill_id}."
+        return message + _persist_edit(session_id, user_id, mode, bill, ref, True)
+
+    @tool
+    def remove_bill(bill_id: str, config: RunnableConfig) -> str:
+        """
+        Remove an entire bill from the session — not just an item, assignment, or payer,
+        but the whole bill. Call this when the user says to delete/forget/cancel a whole
+        bill (e.g. "forget the pizza bill", "remove bill_3").
+
+        If the bill was already approved, removing it needs admin approval like any other
+        correction. If it's only a pending proposal that was never approved, it's discarded
+        immediately — there's nothing real to undo yet, so no second approval cycle.
+
+        Args:
+            bill_id: The bill identifier to remove.
+        """
+        user_id = _speaker_user_id(config)
+        if user_id is None:
+            bill = state.get_bill(bill_id)
+            if bill is None:
+                return f"Error: bill '{bill_id}' not found. Known bills: {[b.bill_id for b in state.bills]}"
+            state.bills.remove(bill)
+            return f"Removed {bill_id} ('{bill.description}')."
+
+        approved = state.get_bill(bill_id)
+        if approved is not None:
+            row_id = db.get_bill_row_id(session_id, bill_id)
+            payload = {"action": "remove_bill", "bill_id": bill_id}
+            db.create_proposal(session_id, proposed_by=user_id, payload=payload, supersedes_bill_id=row_id)
+            return (
+                f"Proposed removing {bill_id} ('{approved.description}') — this bill was "
+                f"already approved, so the removal needs admin approval before it takes effect."
+            )
+
+        proposal = _find_pending_proposal(session_id, bill_id)
+        if proposal is not None:
+            db.decide_proposal(proposal["id"], decided_by=user_id, decision="rejected")
+            description = proposal["payload"].get("description", "")
+            return (
+                f"Discarded the pending proposal for {bill_id} ('{description}') — it was "
+                f"never approved, so there's nothing else to remove."
+            )
+
+        known = _known_bill_ids(state, session_id, user_id)
+        return f"Error: bill '{bill_id}' not found. Known bills: {known}"
+
+    @tool
     def calculate_split() -> str:
         """
         Show the group the current settlement — who owes whom, based on all approved
@@ -842,7 +987,18 @@ def _build_tools(state: SessionState, session_id: str) -> list:
 
         return report
 
-    return [add_bill, set_participants, assign_items, set_payer, mark_items_unassigned, calculate_split]
+    return [
+        add_bill,
+        set_participants,
+        assign_items,
+        set_payer,
+        mark_items_unassigned,
+        rename_bill,
+        add_item_to_bill,
+        remove_item_from_bill,
+        remove_bill,
+        calculate_split,
+    ]
 
 
 class GraphState(TypedDict):
