@@ -132,6 +132,12 @@ async function loadSessionList() {
 // is the single source for both), including right after a manual rename
 // (startRename) or an auto-rename (sendToAgent/sendImageToAgent).
 function updateChatTitleBar() {
+  // Don't clobber an in-progress inline edit (startRename() flips this to
+  // 'true' while the user is actively typing a new name) — a sidebar
+  // refresh landing mid-edit would otherwise wipe out whatever they've
+  // typed so far out from under them.
+  if (chatTitleName.contentEditable === 'true') return;
+
   const current = sessionsCache.find(s => s.id === sessionId);
   if (!current) {
     chatTitleName.textContent = '';

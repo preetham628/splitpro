@@ -554,12 +554,24 @@ def rename_session(
     manual edit should "win" over the next bill/proposal auto-rename, same
     as the normal expectation that a manual edit sticks until the user
     explicitly opts back into auto-naming via PATCH .../title-auto.
+
+    Takes the same per-session lock _run_chat_turn holds for its *entire*
+    duration — without it, a rename landing while a turn is mid-flight
+    would correctly persist name + title_auto=False to the DB, but that
+    turn's own end-of-turn save (already in flight, using the title_auto
+    value it read before this rename happened) would run afterward and
+    silently overwrite the manual name with an auto-generated one. Taking
+    the lock here serializes the two instead: whichever of the turn's save
+    or this rename finishes last is what the DB ends up reflecting, and a
+    rename that lands *before* a turn even starts is seen by that turn's own
+    title_auto read (also taken under the lock), so it skips auto-renaming
+    entirely. No change needed to where _run_chat_turn reads title_auto.
     """
     _require_member(session_id, user)
-    updated = db.rename_session_by_id(session_id, req.name)
+    with _get_session_lock(session_id):
+        updated = db.rename_session_by_id(session_id, req.name, title_auto=False)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
-    db.set_title_auto(session_id, False)
     return {"name": req.name, "title_auto": False}
 
 
@@ -572,9 +584,15 @@ def set_session_title_auto(
     """Toggle a session's auto-naming flag — mainly used to turn it back on
     after a manual rename turned it off (see rename_session), though it also
     accepts turning it off directly. Any member may toggle it, same as
-    rename_session."""
+    rename_session.
+
+    Takes the per-session lock for the same reason rename_session does — an
+    in-flight chat turn's title_auto read and this write must be serialized,
+    or a turn already past its title_auto check could save over this toggle.
+    """
     _require_member(session_id, user)
-    db.set_title_auto(session_id, req.auto)
+    with _get_session_lock(session_id):
+        db.set_title_auto(session_id, req.auto)
     return {"title_auto": req.auto}
 
 

@@ -601,3 +601,76 @@ def test_auto_rename_prefers_approved_bill_over_pending_proposal(fresh_server, m
 
     row = _session_row(session_id, admin["id"])
     assert row["name"] == "Approved Lunch"
+
+
+def test_manual_rename_mid_turn_is_not_overwritten_by_that_turns_own_save(fresh_server, monkeypatch):
+    """Regression test for a real race: title_auto is read once near the top
+    of _run_chat_turn, before the slow agent.chat() call. Without
+    rename_session() also taking the per-session lock, a manual rename
+    landing while a turn is already mid-flight would correctly persist
+    name + title_auto=False to the DB, but that turn's own (already in
+    flight, using the stale title_auto=True it read earlier) end-of-turn
+    save would then run *after* it and silently clobber the manual name
+    with an auto-generated one.
+
+    rename_session() now takes the same per-session lock _run_chat_turn
+    holds for its whole duration, so the two can't interleave — whichever
+    finishes last wins, and here that must be the rename (started second,
+    but blocks until the turn's lock is released, so its write always lands
+    strictly after the turn's).
+    """
+    turn_started = threading.Event()
+    release_chat_turn = threading.Event()
+
+    def slow_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        turn_started.set()
+        release_chat_turn.wait(timeout=5)
+        # This turn read title_auto=True before this call started (the
+        # session hadn't been renamed yet) — it still proposes a bill, which
+        # would auto-rename the session if the lock didn't serialize this
+        # against the concurrent rename below.
+        db.create_proposal(
+            self.session_id, proposed_by=speaker_user_id,
+            payload=sample_payload(description="Auto Name From Turn"),
+        )
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", slow_chat)
+
+    admin = make_user("race-rename@example.com", "g-race-rename", "RaceRename")
+    session_id = make_session_with_members(admin)
+
+    chat_thread = threading.Thread(
+        target=server.chat,
+        args=(session_id, server.ChatRequest(message="here's a receipt")),
+        kwargs={"background_tasks": BackgroundTasks(), "user": admin},
+    )
+    chat_thread.start()
+    assert turn_started.wait(timeout=2), "turn never started"
+
+    # The turn is now mid-flight, blocked inside agent.chat() but still
+    # holding the per-session lock. This rename must block until the turn
+    # releases it, then win.
+    rename_thread_result = {}
+
+    def do_rename():
+        rename_thread_result["result"] = server.rename_session(
+            session_id, server.RenameRequest(name="Manual Mid-Turn Name"), user=admin,
+        )
+
+    rename_thread = threading.Thread(target=do_rename)
+    rename_thread.start()
+    time.sleep(0.1)  # give a buggy unlocked rename_session a chance to run first
+    release_chat_turn.set()
+
+    chat_thread.join(timeout=5)
+    rename_thread.join(timeout=5)
+    assert not chat_thread.is_alive() and not rename_thread.is_alive()
+
+    assert rename_thread_result["result"] == {"name": "Manual Mid-Turn Name", "title_auto": False}
+
+    row = _session_row(session_id, admin["id"])
+    assert row["name"] == "Manual Mid-Turn Name", (
+        f"manual rename was overwritten by the in-flight turn's own save: {row}"
+    )
+    assert row["title_auto"] is False

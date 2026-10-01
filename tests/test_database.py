@@ -1237,6 +1237,32 @@ def test_get_set_title_auto_defaults_true(fresh_db):
     assert db.get_title_auto("sess-title-1") is True
 
 
+def test_rename_session_by_id_sets_name_and_title_auto_in_one_statement(fresh_db):
+    """rename_session_by_id's title_auto param must land in the same UPDATE
+    as the name change — not as a separate db.set_title_auto() call
+    afterward, which would let a concurrent reader observe the name already
+    changed but title_auto not yet (or vice versa). A single UPDATE
+    statement can't produce that intermediate, mismatched state."""
+    admin = make_user("rename-one-txn@example.com", "g-rename-one-txn")
+    make_session("sess-rename-txn", admin["id"], name="Original")
+    assert db.get_title_auto("sess-rename-txn") is True
+
+    updated = db.rename_session_by_id("sess-rename-txn", "Renamed", title_auto=False)
+    assert updated is True
+
+    # list_sessions requires membership; add it just for this read.
+    db.add_session_member("sess-rename-txn", admin["id"], "admin")
+    row = [s for s in db.list_sessions(admin["id"]) if s["id"] == "sess-rename-txn"][0]
+    assert row["name"] == "Renamed"
+    assert row["title_auto"] is False
+
+    # Omitting title_auto (the plain-rename call shape used elsewhere)
+    # leaves the flag untouched.
+    db.set_title_auto("sess-rename-txn", True)
+    db.rename_session_by_id("sess-rename-txn", "Renamed Again")
+    assert db.get_title_auto("sess-rename-txn") is True
+
+
 def test_get_title_auto_missing_session_defaults_true(fresh_db):
     """No row at all (e.g. a stale/bogus session_id) falls back to True,
     matching the column's own schema default rather than raising."""

@@ -565,16 +565,29 @@ def set_context_summary(session_id: str, summary: str) -> None:
         )
 
 
-def rename_session_by_id(session_id: str, name: str) -> bool:
+def rename_session_by_id(session_id: str, name: str, title_auto: Optional[bool] = None) -> bool:
     """Rename a session with no ownership filter. Returns True if a row was
     updated. Callers must authorize access themselves first (e.g. via
     session membership) — access is a membership question now, not
     "is the original creator."
+
+    When title_auto is given (the manual-rename endpoint always passes
+    False), it's set in the *same* UPDATE statement/transaction as the name
+    change rather than via a separate set_title_auto() call afterward — two
+    independent writes would let a concurrent reader briefly observe the
+    name already changed but title_auto still True (or vice versa on
+    rollback), a mismatched state this single-statement write can't produce.
     """
     with _connect() as conn:
-        cursor = conn.execute("""
-            UPDATE chat_sessions SET name = ? WHERE id = ?
-        """, (name, session_id))
+        if title_auto is None:
+            cursor = conn.execute(
+                "UPDATE chat_sessions SET name = ? WHERE id = ?", (name, session_id)
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE chat_sessions SET name = ?, title_auto = ? WHERE id = ?",
+                (name, int(title_auto), session_id),
+            )
         return cursor.rowcount > 0
 
 
