@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Task Briefs — SplitPro Docs</title>
+<link rel="stylesheet" href="assets/docs.css" />
+<style>
+  .status-row { display: flex; align-items: center; gap: 10px; margin: 0 0 6px; }
+  .status { font-size: 0.72rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+  .status.ready { background: color-mix(in srgb, var(--accent-2) 20%, transparent); color: var(--accent-2); }
+  .status.blocked { background: color-mix(in srgb, var(--accent-3) 20%, transparent); color: var(--accent-3); }
+  .item-num { font-size: 0.82rem; color: var(--text-faint); font-weight: 700; }
+  .item-block { border: 1px solid var(--border); border-radius: var(--radius); padding: 22px 24px; margin: 18px 0; background: var(--bg-raised); }
+  .item-block h3 { margin: 4px 0 6px; }
+  .item-block .sub { color: var(--text-dim); font-size: 0.92rem; margin: 0 0 16px; }
+  .label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); font-weight: 600; margin: 18px 0 6px; }
+  .label:first-of-type { margin-top: 4px; }
+  .workflow { border-left: 3px solid var(--accent); background: var(--bg-sunken); border-radius: 0 8px 8px 0; padding: 10px 14px; margin: 12px 0 16px; font-size: 0.88rem; }
+  .workflow strong { color: var(--text); }
+  .deps-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 4px; }
+</style>
+</head>
+<body>
+
+<div class="topnav">
+  <a class="brand" href="index.html"><span class="mark">🧾</span> SplitPro Docs</a>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="api.html">API Reference</a>
+    <a href="roadmap.html">Roadmap</a>
+    <a href="feedback.html">Testing Feedback</a>
+    <a href="tasks.html" class="active">Task Briefs</a>
+  </nav>
+  <span class="tag">v0.1.0</span>
+</div>
+
+<main class="page">
+
+  <div class="hero">
+    <h1>Task briefs — post-multi-user improvement batch</h1>
+    <p class="lede">
+      Implementation briefs for the decided items from <a href="feedback.html">Testing Feedback</a>.
+      Each is written to be handed to a fresh coding agent with zero prior context — background,
+      exact files, exact changes, acceptance criteria. <strong>#5</strong> (agent chattiness) from the
+      feedback doc is deferred to a future release and has no brief here.
+    </p>
+    <div class="pill-row">
+      <span class="status ready">Ready now</span>
+      <span class="status blocked">Blocked on an earlier task</span>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Every task follows this workflow</strong>
+    Branch off <code>multi-user</code> (not <code>main</code>) — e.g.
+    <code>git checkout -b task-&lt;slug&gt; multi-user</code>. Commit as you go with meaningful,
+    descriptive messages, not one giant commit at the end. When done, push and open a PR
+    <strong>against <code>multi-user</code></strong> (not <code>main</code>). This is restated in
+    every task below so each brief stays self-contained.
+  </div>
+
+  <hr class="section" />
+
+  <h2>Sequencing</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Task</th><th>Addresses</th><th>Status</th><th>Files</th></tr>
+    <tr><td><a href="#task6">Task 6</a> — multi-payer + flexible split data model</td><td>#2, #3</td><td><span class="status ready">Ready now</span></td><td>schema.sql, core/database.py, core/session_state.py</td></tr>
+    <tr><td><a href="#task9">Task 9</a> — remove/rename bill, add/remove item tools</td><td>#11</td><td><span class="status ready">Ready now</span></td><td>agents/chat_agent.py, core/database.py</td></tr>
+    <tr><td><a href="#task10">Task 10</a> — sliding window + background summarization</td><td>#10</td><td><span class="status ready">Ready now</span></td><td>agents/chat_agent.py, core/database.py, server.py</td></tr>
+    <tr><td><a href="#task11">Task 11</a> — session title fix + title bar UI</td><td>#9</td><td><span class="status ready">Ready now</span></td><td>server.py, frontend/*</td></tr>
+    <tr><td><a href="#task12">Task 12</a> — prompt fix for item categorization</td><td>#4</td><td><span class="status ready">Ready now</span></td><td>agents/chat_agent.py</td></tr>
+    <tr><td><a href="#task13">Task 13</a> — frontend panel toggle + responsive + overflow</td><td>#8</td><td><span class="status ready">Ready now</span></td><td>frontend/*</td></tr>
+    <tr><td><a href="#task14">Task 14</a> — WebSocket real-time sync</td><td>#1</td><td><span class="status ready">Ready now</span></td><td>server.py, frontend/*</td></tr>
+    <tr><td><a href="#task7">Task 7</a> — agent tools for split model + settlement-as-live-view</td><td>#2, #3, #6</td><td><span class="status blocked">Needs Task 6</span></td><td>agents/chat_agent.py, core/settlement.py, server.py</td></tr>
+    <tr><td><a href="#task8">Task 8</a> — frontend display of multi-payer/split data</td><td>#2, #3, #6</td><td><span class="status blocked">Needs Task 7</span></td><td>frontend/*</td></tr>
+  </table>
+  </div>
+  <p class="dim">File overlap worth knowing about even among "ready now" tasks: Task 9/10/12 all touch
+    <code>agents/chat_agent.py</code>; Task 11/13/14 all touch <code>frontend/*</code>. These can still be
+    developed in parallel on separate branches, but whoever merges second on an overlapping file will need
+    to rebase — not a blocker, just expect it.</p>
+
+  <hr class="section" />
+
+  <!-- TASK 6 -->
+  <div class="item-block" id="task6">
+    <div class="status-row"><span class="item-num">TASK 6</span><span class="status ready">Ready now</span></div>
+    <h3>Data layer: multi-payer + flexible split model</h3>
+    <p class="sub">Addresses feedback items #2 and #3. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task6-split-model-data-layer multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Context</div>
+    <p>Today, <code>bills.paid_by</code> is a single TEXT name — can't represent two people splitting
+      payment. <code>bill_items.qty_allocations</code> is a JSON dict of person → fractional units, only
+      meaningful when an item's <code>qty &gt; 1</code>. Neither supports percentage-of-total or a direct
+      absolute-amount entry.</p>
+
+    <div class="label">Decided design</div>
+    <p>Unify both sides to a single canonical shape: a <strong>dollar-amount-per-person contribution
+      map</strong>, used identically for who paid and who owes for an item. Percentage, equal-split, and
+      "N of M units" are input <em>conveniences</em> that resolve to amounts at the tool-call layer
+      (Task 7) — this task only needs to store and persist the resulting map, not convert between modes.</p>
+
+    <div class="label">Changes — schema.sql</div>
+    <ul>
+      <li><code>bills.paid_by</code> keeps its column but changes meaning: now stores JSON like
+        <code>{"Alice": 1800.0, "Sumit": 1200.0}</code> instead of a plain name string.</li>
+      <li><code>bill_items.qty_allocations</code> → add a new column
+        <code>cost_allocations TEXT NOT NULL DEFAULT '{}'</code> storing dollar amounts per person
+        (<code>{"Alice": 8.00, "Bob": 4.00}</code>), not fractional units. Migrate existing
+        <code>qty_allocations</code> data into it (<code>amount = units × item.price / item.qty</code>),
+        then drop the old column — this project already has precedent for a clean column drop
+        (<code>_migrate_chat_sessions</code> drops <code>session_state</code>/<code>message_history</code>
+        the same way), reuse that pattern.</li>
+    </ul>
+
+    <div class="label">Changes — core/database.py</div>
+    <ul>
+      <li>New migration function (follow the exact idempotent, check-columns-first pattern already used by
+        <code>_migrate_chat_sessions</code>/<code>_migrate_membership</code>/<code>_migrate_expense_proposals_fk</code>):
+        convert any existing plain-string <code>bills.paid_by</code> value into
+        <code>{"&lt;name&gt;": &lt;bill total&gt;}</code> (preserves old single-payer behavior for bills
+        that already exist); convert <code>qty_allocations</code> → <code>cost_allocations</code> as
+        described above; leave NULL/empty untouched.</li>
+      <li><code>save_session_state</code> / <code>load_session_state</code>: update to
+        <code>json.dumps</code>/<code>json.loads</code> the new map shapes for both fields.</li>
+      <li><code>decide_proposal</code>'s materialization path (<code>_insert_bill_items</code>, the
+        bills INSERT/UPDATE): same JSON handling — proposal payloads carry the identical shape.</li>
+      <li>Add <code>validate_contribution_map(amounts: dict, total: float, epsilon: float = 0.001) -&gt; bool</code>
+        — checks <code>sum(amounts.values())</code> is within epsilon of <code>total</code>. Belongs here
+        as a data-integrity concern; Task 7 will call it from the tool layer.</li>
+    </ul>
+
+    <div class="label">Changes — core/session_state.py</div>
+    <ul>
+      <li><code>ParsedBill.paid_by: Optional[str]</code> → <code>paid_by: Dict[str, float] = field(default_factory=dict)</code>.
+        Empty dict replaces <code>None</code> as "not set yet."</li>
+      <li><code>LineItem.qty_allocations</code> → rename to <code>cost_allocations: Dict[str, float]</code>
+        (dollar amounts). Keep the <code>unit_price</code> property for display purposes even though
+        allocation math no longer uses it directly.</li>
+      <li><code>from_dict</code> and <code>state_summary()</code>: update to the new shapes.
+        <code>state_summary()</code> specifically needs to render these clearly for the LLM — e.g.
+        <code>paid_by={Alice: $1800.00, Sumit: $1200.00}</code> instead of <code>paid_by=Alice</code>.</li>
+      <li><code>SessionState.all_bills_ready()</code>: change <code>b.paid_by is not None</code> to
+        <code>bool(b.paid_by)</code>.</li>
+    </ul>
+
+    <div class="label">Acceptance / manual test</div>
+    <ul>
+      <li>Fresh DB: create a bill with a multi-payer <code>paid_by</code> map, save, reload, confirm it
+        round-trips correctly.</li>
+      <li>Hand-construct an old-shape DB (string <code>paid_by</code>, populated
+        <code>qty_allocations</code>), run the migration, confirm correct conversion of both fields.</li>
+      <li>Run <code>pytest tests/test_database.py tests/test_session_state.py</code> specifically — these
+        two files test exactly this layer and should pass cleanly.</li>
+      <li><strong>Expected, not a problem:</strong> <code>tests/test_chat_agent.py</code> and
+        <code>tests/test_server.py</code> will fail after this change, since they reference the old
+        field names/shapes. That's exactly what Task 7 fixes — don't try to fix those tests in this task.</li>
+    </ul>
+
+    <div class="label">Non-goals</div>
+    <p>No agent tool changes, no settlement math changes (both Task 7). No frontend changes (Task 8).
+      Don't touch <code>agents/chat_agent.py</code> or <code>core/settlement.py</code>.</p>
+  </div>
+
+  <!-- TASK 9 -->
+  <div class="item-block" id="task9">
+    <div class="status-row"><span class="item-num">TASK 9</span><span class="status ready">Ready now</span></div>
+    <h3>New tools: remove bill, rename bill, add/remove item</h3>
+    <p class="sub">Addresses feedback item #11. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task9-bill-edit-tools multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Context</div>
+    <p>Editing items on an already-approved bill already works via the correction-proposal flow
+      (<code>assign_items</code>/<code>set_payer</code> detect the target is approved and route a
+      correction through <code>create_proposal(..., supersedes_bill_id=...)</code>). What's missing:
+      removing a whole bill, renaming one, and adding/removing a single item. Decided: all four go
+      through the <em>same</em> approval cycle as every other edit — no separate mechanism.</p>
+
+    <div class="label">Key design insight — most of this needs no new backend semantics</div>
+    <p><code>rename_bill</code>, <code>add_item_to_bill</code>, and <code>remove_item_from_bill</code> are
+      all just "build a modified full-bill snapshot, submit it as a correction" — exactly what
+      <code>set_payer</code> already does today. They reuse the existing mechanism completely unchanged.
+      Only <strong>removing an entire bill</strong> needs new materialization logic, since
+      <code>decide_proposal</code> today only knows how to insert-or-update a bill, never delete one.</p>
+
+    <div class="label">Changes — core/database.py</div>
+    <ul>
+      <li><code>decide_proposal</code>: support a deletion-flavored proposal. Convention: the payload
+        carries <code>{"action": "remove_bill", "bill_id": "..."}</code> as its entire shape when it
+        represents a removal (no <code>items</code>/<code>tax</code>/<code>tip</code>/<code>paid_by</code>
+        needed). Default all existing/other proposals to an implicit <code>payload.get("action", "upsert")</code>
+        for backward compatibility — every proposal created before this task has no <code>action</code> key.</li>
+      <li>On approval of a <code>remove_bill</code> proposal: resolve the target bill by
+        <code>(session_id, payload["bill_id"])</code> — the same natural-key resolution already used for
+        every other correction, <strong>not</strong> by trusting <code>supersedes_bill_id</code>'s FK value,
+        for the same staleness reasons already documented on <code>decide_proposal</code>. Then
+        <code>DELETE FROM bill_items WHERE bill_id = ?</code> followed by
+        <code>DELETE FROM bills WHERE id = ?</code>. If no matching bill exists, raise
+        <code>ValueError</code> — same as the existing "not found" handling elsewhere in this function.</li>
+      <li><code>create_proposal</code> needs no change — it already accepts an arbitrary payload dict.</li>
+    </ul>
+
+    <div class="label">Changes — agents/chat_agent.py</div>
+    <p>Four new tools, registered in <code>_build_tools</code>'s returned list, documented in
+      <code>SYSTEM_PROMPT_TEMPLATE</code>:</p>
+    <ul>
+      <li><code>remove_bill(bill_id: str) -&gt; str</code> — resolve <code>bill_id</code> against pending
+        proposals first (reuse <code>_find_pending_proposal</code>), then approved bills
+        (<code>state.get_bill</code>). <strong>If the target is only a still-pending proposal</strong>
+        (never approved), just reject it directly via <code>db.decide_proposal(..., "rejected")</code> —
+        there's nothing real to "remove" yet, creating a removal-proposal for something not yet
+        materialized would be nonsensical. <strong>If the target is an already-approved bill</strong>,
+        build the <code>{"action": "remove_bill", ...}</code> payload and submit it as a correction
+        proposal, same pattern as every other correction.</li>
+      <li><code>rename_bill(bill_id: str, new_description: str) -&gt; str</code> — build a full snapshot
+        of the target bill with only <code>description</code> changed, route through the existing
+        correction mechanism exactly like <code>set_payer</code> does.</li>
+      <li><code>add_item_to_bill(bill_id: str, item: dict) -&gt; str</code> — build a modified snapshot
+        with the new item appended to <code>items[]</code>, route through the existing mechanism.</li>
+      <li><code>remove_item_from_bill(bill_id: str, item_name: str) -&gt; str</code> — fuzzy-match
+        <code>item_name</code> using the same matching logic <code>assign_items</code> already uses, build
+        a modified snapshot with that item removed from <code>items[]</code>, route through the existing
+        mechanism.</li>
+    </ul>
+
+    <div class="label">Acceptance / manual test</div>
+    <ul>
+      <li>Remove an approved bill → confirm it disappears from <code>bills</code> only after an admin
+        approves the removal proposal.</li>
+      <li>Remove a still-pending (unapproved) proposal → confirm it's rejected directly, with no second
+        approval cycle needed.</li>
+      <li>Rename an approved bill → confirm only <code>description</code> changes, everything else
+        (items, assignments, payer) survives untouched.</li>
+      <li>Add an item to, and remove an item from, an approved bill → confirm the bill's other items/
+        assignments are unaffected.</li>
+    </ul>
+
+    <div class="label">Non-goals</div>
+    <p>No other brainstormed future tools (list/summarize, merge bills, partial-payment tracking,
+      undo-proposal, categorization) — deferred per the feedback doc. No required frontend changes, though
+      note as a possible follow-up: a removal proposal's payload has no <code>items</code> key, so
+      <code>renderProposals()</code> in <code>frontend/app.js</code> should defensively guard against that
+      shape rather than crash — worth a quick check, not a blocking requirement for this task.</p>
+  </div>
+
+  <!-- TASK 10 -->
+  <div class="item-block" id="task10">
+    <div class="status-row"><span class="item-num">TASK 10</span><span class="status ready">Ready now</span></div>
+    <h3>Sliding window + background conversation summarization</h3>
+    <p class="sub">Addresses feedback item #10. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task10-context-window multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Context</div>
+    <p>Every turn currently sends the <em>entire</em> accumulated LangGraph message history to the LLM,
+      unwindowed, forever — confirmed by reading <code>ChatAgent._agent_node</code> in
+      <code>agents/chat_agent.py</code>. Fine for a short session, a real cost/latency/context-limit
+      problem for a long-running group chat.</p>
+
+    <div class="label">Decided design</div>
+    <p>Important framing that shaped these numbers: the actual financial data (bills, items, assignments)
+      is never derived from chat history — it's rebuilt fresh from the database into the system prompt on
+      <em>every</em> turn via <code>state.state_summary()</code>. So conversation history is only
+      load-bearing for short-term dialogue coherence, never for financial correctness. The window can be
+      small and summarization reasonably aggressive without real risk.</p>
+    <ul>
+      <li><strong>Unit of counting: "rounds," not raw messages.</strong> A round = one
+        <code>HumanMessage</code> plus everything the agent did in response (however many tool calls that
+        took — <code>AIMessage</code>/<code>ToolMessage</code> pairs). Counting raw messages was
+        considered and rejected: tool-call-heavy activity in a busy multi-user session would inflate the
+        raw count fast and trigger summarization constantly, compounding lossy summaries on top of each
+        other.</li>
+      <li><strong>Window: 8 rounds</strong> kept verbatim. Once exceeded: <strong>summarize the oldest 4
+        rounds, keep the newest 4</strong>, folding the oldest into a running summary rather than
+        discarding it.</li>
+      <li><strong>Safety net:</strong> an independent raw-message ceiling (~40 messages) that can trigger
+        summarization early regardless of round count, for the edge case where a single round is enormous
+        (e.g. a giant pasted bill generating dozens of tool calls in one exchange).</li>
+      <li>Cut points must be round-aligned — this also guarantees a tool-call and its matching
+        tool-response are never split across the summarized/kept boundary, which would otherwise produce
+        a malformed conversation the LLM API would reject.</li>
+    </ul>
+
+    <div class="label">Changes — core/database.py</div>
+    <ul>
+      <li>New migration: add <code>chat_sessions.context_summary TEXT NOT NULL DEFAULT ''</code>, same
+        idempotent pattern as the other migrations in this file.</li>
+      <li>New functions: <code>get_context_summary(session_id) -&gt; str</code>,
+        <code>set_context_summary(session_id, summary: str) -&gt; None</code>.</li>
+    </ul>
+
+    <div class="label">Changes — agents/chat_agent.py</div>
+    <ul>
+      <li><code>_agent_node</code>: if <code>context_summary</code> is non-empty, inject it into the
+        system prompt as an "EARLIER CONVERSATION (summarized)" section — parallel to how
+        <code>_pending_proposals_summary()</code> is already appended.</li>
+      <li>New function (name it something like <code>_maybe_summarize_and_trim</code>): after a turn
+        completes, count rounds in the current checkpoint's message list for this
+        <code>thread_id</code>/<code>session_id</code>. If over threshold (per the numbers above), this is
+        what gets scheduled as the background job — see server.py changes below for how it's invoked
+        without blocking the response.</li>
+      <li>The actual summarization work (no lock held): take a snapshot of the oldest ~4 rounds' messages,
+        call the session's already-configured chat model (no new provider config needed) to merge them
+        into the existing <code>context_summary</code>, producing an updated summary string.</li>
+      <li>The trim/persist step (lock held briefly): re-fetch current checkpoint state under the
+        per-session lock, confirm those specific message IDs still exist (defensive check against a race),
+        remove them from the checkpoint, and call <code>set_context_summary</code> with the new summary.
+        <strong>Verify the exact current LangGraph API for removing specific messages from a
+        checkpointed state against whatever version is pinned in <code>requirements.txt</code></strong> —
+        LangGraph has a mechanism for this (a special message type that, when added via the graph's
+        message reducer, deletes the referenced message by id) but don't assume exact syntax without
+        checking the installed version's actual interface first.</li>
+    </ul>
+
+    <div class="label">Changes — server.py</div>
+    <ul>
+      <li>In the <code>chat</code> and <code>upload_image</code> endpoints: after preparing the response
+        (and releasing the per-session lock for the main turn), schedule the summarization check via
+        FastAPI's <code>BackgroundTasks</code> (add it as a parameter to the endpoint, call
+        <code>background_tasks.add_task(...)</code>) — this runs only <em>after</em> the HTTP response has
+        already been sent, so the triggering user's reply has zero added latency.</li>
+      <li>The background task must acquire the per-session lock only for its final, fast persist step —
+        never for the LLM summarization call itself — so a concurrent request from another user in the
+        same session is never meaningfully blocked by a summarization run in progress.</li>
+    </ul>
+
+    <div class="label">Acceptance / manual test</div>
+    <ul>
+      <li>Drive a session past 8 rounds, confirm summarization fires in the background (check
+        <code>context_summary</code> gets populated, check the checkpoint's message count actually drops).</li>
+      <li>Confirm the triggering request's response time is unaffected (measure before/after).</li>
+      <li>Simulate a concurrent request arriving while summarization is mid-flight (e.g. a test that holds
+        the LLM call artificially) and confirm it doesn't block waiting for the background job.</li>
+      <li>Confirm a single oversized round (many tool calls in one exchange) triggers the safety-net
+        ceiling correctly even with round count still under 8.</li>
+      <li>Run the full test suite — no regressions expected elsewhere.</li>
+    </ul>
+
+    <div class="label">Non-goals</div>
+    <p>No UI surfacing of the summary — this is purely internal context management, invisible to users.
+      No changes related to feedback #5 (agent chattiness) — that's a separate, deferred item.</p>
+  </div>
+
+  <!-- TASK 11 -->
+  <div class="item-block" id="task11">
+    <div class="status-row"><span class="item-num">TASK 11</span><span class="status ready">Ready now</span></div>
+    <h3>Session title bug fix + WhatsApp-style title bar</h3>
+    <p class="sub">Addresses feedback item #9. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task11-session-title multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Confirmed root cause</div>
+    <p>In <code>server.py</code>'s <code>chat</code>/<code>upload_image</code> endpoints, the auto-rename
+      trigger is <code>if len(agent.state.bills) &gt; prev_bill_count</code>. This was correct before the
+      proposal system existed; now <code>add_bill</code> only creates a pending proposal and doesn't touch
+      <code>state.bills</code> until an admin approves it. In any session with an unapproved bill sitting
+      pending, the rename condition never fires.</p>
+
+    <div class="label">Backend fix</div>
+    <ul>
+      <li>Change the trigger to also account for pending proposals:
+        <code>prev_count = len(agent.state.bills) + db.count_pending_proposals(session_id)</code>,
+        computed before the turn; compare the same combined count after. If it increased, trigger the
+        rename check.</li>
+      <li><code>_session_name_from_agent</code> currently only looks at <code>agent.state.bills[0]</code>.
+        If <code>state.bills</code> is empty but a proposal now exists, fall back to the first pending
+        proposal's description (<code>db.list_pending_proposals(session_id)[0]["payload"]["description"]</code>).</li>
+      <li>New column: <code>chat_sessions.title_auto INTEGER NOT NULL DEFAULT 1</code> (migration, same
+        pattern as the rest of <code>core/database.py</code>). The auto-rename logic above must check this
+        flag first and skip renaming entirely if the user has switched to manual naming (see frontend
+        below).</li>
+    </ul>
+
+    <div class="label">Frontend: title bar</div>
+    <p>Add a small header bar above the chat panel (currently blank) showing the current session's name —
+      matching the WhatsApp pattern of a persistent title bar above the message list, not just in the
+      sidebar.</p>
+    <ul>
+      <li>Click-to-rename inline edit in this new bar — can reuse the existing rename logic already wired
+        up in the sidebar (<code>startRename</code> in <code>frontend/app.js</code>), just give it a
+        second entry point here.</li>
+      <li>A toggle (e.g. a small switch or checkbox near the title) for "auto-generate title" vs. manual.
+        Manually renaming should flip <code>title_auto</code> to <code>0</code> via a small addition to
+        the existing rename endpoint/call; flipping the toggle back to "auto" sets it back to
+        <code>1</code>.</li>
+    </ul>
+
+    <div class="label">Acceptance / manual test</div>
+    <ul>
+      <li>Start a fresh session, have two users converse and propose a bill without it being approved yet
+        — confirm the title updates away from "New Session" immediately (not waiting for approval).</li>
+      <li>Manually rename a session, confirm <code>title_auto</code> flips to off and subsequent bill
+        activity no longer overwrites the manual name.</li>
+      <li>Toggle back to auto, confirm renaming resumes.</li>
+    </ul>
+  </div>
+
+  <!-- TASK 12 -->
+  <div class="item-block" id="task12">
+    <div class="status-row"><span class="item-num">TASK 12</span><span class="status ready">Ready now</span></div>
+    <h3>Prompt fix: item categorization</h3>
+    <p class="sub">Addresses feedback item #4. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task12-prompt-categorization multi-user</code>). Commit with a meaningful
+      message. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Problem</div>
+    <p>The agent sometimes merges distinct items under one umbrella name — e.g. lumping whiskey into
+      "beer" when the user said "we split beer." Reported across more than one tested scenario.</p>
+
+    <div class="label">Decided scope — deliberately small</div>
+    <p>A targeted addition to the <code>## Rules</code> section of <code>SYSTEM_PROMPT_TEMPLATE</code> in
+      <code>agents/chat_agent.py</code> — not a rewrite. Outside of this one failure mode the current
+      prompt is working well and must not be disturbed. Something like: "Treat each distinctly-named
+      item/drink/product mentioned as its own line item. Never fold a different item (e.g. whiskey) into
+      an existing item's name (e.g. beer) just because the user grouped them casually in conversation
+      (e.g. 'we split the drinks'). If it's ambiguous which specific items are included in a casual
+      grouping, ask for clarification rather than guessing." Adjust wording as needed, but keep the change
+      confined to this one addition.</p>
+
+    <div class="label">Acceptance</div>
+    <p>Manually re-test the original failure scenario (a dinner bill with both beer and whiskey, user says
+      "we split beer") and confirm the agent keeps them as separate line items or asks for clarification,
+      without regressing any other previously-working behavior. No automated test exists for prompt
+      quality — this is necessarily a manual check.</p>
+  </div>
+
+  <!-- TASK 13 -->
+  <div class="item-block" id="task13">
+    <div class="status-row"><span class="item-num">TASK 13</span><span class="status ready">Ready now</span></div>
+    <h3>Frontend: panel toggle, responsive sizing, name overflow</h3>
+    <p class="sub">Addresses feedback item #8. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task13-frontend-panels multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Changes</div>
+    <ul>
+      <li><strong>Collapsible panels</strong> — add a toggle (hamburger-style trigger) for the sessions
+        sidebar and the approvals panel, following the standard Discord/Slack/WhatsApp Web drawer pattern:
+        slides in/out, doesn't permanently occupy screen width when collapsed.</li>
+      <li><strong>Responsive breakpoint</strong> — below a phone-width threshold, panels stack instead of
+        sitting side-by-side; show one panel at a time, switched via tab/toggle rather than a permanent
+        multi-column layout.</li>
+      <li><strong>Name overflow fix</strong> — participant names overflow the bill card's boundary. Add
+        <code>min-width: 0</code> to the relevant flex child, plus
+        <code>text-overflow: ellipsis; white-space: nowrap; overflow: hidden;</code>, with a
+        <code>title</code> attribute carrying the full name for a hover tooltip.</li>
+    </ul>
+
+    <div class="label">Acceptance / manual test</div>
+    <p>Test at a phone-width viewport (use browser devtools device emulation) and confirm panels stack
+      correctly and remain usable. Confirm long participant names truncate cleanly with a working tooltip,
+      instead of breaking the card layout.</p>
+
+    <div class="label">Non-goals</div>
+    <p>No changes to what's displayed inside the panels — that's Task 8's job once it lands. This task is
+      purely layout/responsiveness/overflow.</p>
+  </div>
+
+  <!-- TASK 14 -->
+  <div class="item-block" id="task14">
+    <div class="status-row"><span class="item-num">TASK 14</span><span class="status ready">Ready now</span></div>
+    <h3>Real-time sync via WebSocket</h3>
+    <p class="sub">Addresses feedback item #1. Depends on nothing.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code>
+      (<code>git checkout -b task14-websocket-realtime multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Context &amp; research</div>
+    <p>See <a href="feedback.html">Testing Feedback #1</a> for the full research summary — WhatsApp/
+      Discord/Telegram all converge on a persistent-connection + in-process fan-out pattern at their scale;
+      the sharding/Redis-routing machinery they need solves a "which of our many servers" problem this
+      single-process app doesn't have. Only the core primitive applies here.</p>
+
+    <div class="label">Changes — server.py</div>
+    <ul>
+      <li>New WebSocket route: <code>@app.websocket("/ws/sessions/{session_id}")</code>. Authenticate
+        during the handshake by reading the same <code>access_token</code> cookie the REST endpoints use
+        (FastAPI WebSocket routes can read cookies off the handshake request) — reuse
+        <code>core.auth</code>'s existing JWT verification, no new auth mechanism. Reject the connection
+        (close with an appropriate code) if the cookie is missing/invalid, or if the user isn't a member
+        of <code>session_id</code> (reuse the same membership check <code>_require_member</code> uses).</li>
+      <li>New in-process registry: <code>_session_sockets: dict[str, list[WebSocket]]</code> — same shape
+        and lifecycle as the existing <code>sessions</code> (ChatAgent cache) and <code>_session_locks</code>
+        dicts already in this file. Add/remove the connection on connect/disconnect.</li>
+      <li>Broadcast trigger points: after <code>_run_chat_turn</code> completes (new chat message + updated
+        state) and after <code>approve_proposal</code>/<code>reject_proposal</code> succeed, push an event
+        to every open socket registered for that <code>session_id</code> — reuse whatever
+        <code>_serialize_state</code> already produces for the state payload, and the same message shape
+        <code>GET /sessions/{id}/messages</code> already returns for the new-message payload, so the
+        frontend doesn't need to understand two different shapes for the same data.</li>
+      <li>Clean up <code>_session_sockets</code> entries in <code>delete_session</code>/<code>end_session</code>,
+        same as the existing lock-cleanup pattern there.</li>
+    </ul>
+
+    <div class="label">Changes — frontend/app.js</div>
+    <ul>
+      <li>When a session is loaded (<code>loadSession</code>), open a WebSocket connection to
+        <code>/ws/sessions/{id}</code> alongside the existing REST fetches. Close the previous session's
+        socket when switching sessions.</li>
+      <li>On an incoming message/state event, update the chat log and state panel in place — do not
+        trigger a full page reload or re-run <code>loadSession</code>'s full fetch sequence.</li>
+      <li>Keep all existing REST fetches exactly as they are — they still handle "catching up" when a
+        session is first opened; the socket only needs to cover "stay live while already looking at it."</li>
+      <li>Handle reconnection reasonably (e.g. on socket close/error, attempt to reconnect, or at minimum
+        fail gracefully back to "reload to see updates" rather than silently going stale with no
+        indication).</li>
+    </ul>
+
+    <div class="label">Deliberately not doing (v1 scope)</div>
+    <p>No Redis, no offline message queue, no presence/typing indicators. These solve multi-server-instance
+      problems this app doesn't have at its current scale, and aren't needed for the core "no manual
+      reload" problem being fixed here.</p>
+
+    <div class="label">Acceptance / manual test</div>
+    <p>Two real browser sessions (two accounts) open the same session. One sends a message — confirm the
+      other sees it appear live, with no reload. One approves a proposal — confirm the other's state panel
+      updates live. Confirm closing one tab doesn't affect the other's connection, and confirm a page
+      reload cleanly re-establishes the socket.</p>
+  </div>
+
+  <hr class="section" />
+
+  <h2>Blocked tasks — contracts specified now, detail finalized once their dependency lands</h2>
+
+  <!-- TASK 7 -->
+  <div class="item-block" id="task7">
+    <div class="status-row"><span class="item-num">TASK 7</span><span class="status blocked">Needs Task 6 merged</span></div>
+    <h3>Agent tools for the split model + settlement as a live view</h3>
+    <p class="sub">Addresses feedback items #2, #3, #6.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code> <em>after Task 6 is merged into it</em>
+      (<code>git checkout -b task7-split-model-agent-tools multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Changes — agents/chat_agent.py</div>
+    <ul>
+      <li><code>set_payer(bill_id, payers: list[dict])</code> — each entry is
+        <code>{"name": str, "amount": float}</code> or <code>{"name": str, "percentage": float}</code> or
+        just <code>{"name": str}</code> for an equal share of whatever's left unallocated. Resolve to the
+        canonical <code>paid_by: Dict[str, float]</code> (percentages × <code>bill.total()</code>, equal
+        shares split the remainder), validate via Task 6's <code>validate_contribution_map</code>.</li>
+      <li><code>assign_items</code> — extend the per-assignment dict to accept
+        <code>percentage_per_person</code> and <code>amount_per_person</code> alongside today's
+        <code>qty_per_person</code>, all resolving to the canonical <code>cost_allocations</code> map for
+        that item. Equal-split (today's default) unchanged.</li>
+      <li>Rewrite the docstrings for both tools with concrete examples of all three entry modes — these
+        docstrings are the model's only guide for how to use the new capability.</li>
+      <li><code>calculate_split</code> — remove the <code>state.finalized = True</code> assignment
+        entirely. It becomes a pure report: compute and print current balances, no state mutation. Update
+        its docstring and the <code>SYSTEM_PROMPT_TEMPLATE</code>'s framing away from "once done, call
+        calculate_split to finalize" toward "call calculate_split any time to see the current settlement."</li>
+    </ul>
+
+    <div class="label">Changes — core/settlement.py</div>
+    <p><code>compute_balances</code>: credit <em>each</em> payer in a bill's <code>paid_by</code> map their
+      respective amount, instead of crediting one payer the full total. Debit side: read each item's
+      <code>cost_allocations</code> map directly. Confirm the "unassigned items split equally" fallback
+      still works against the new shape.</p>
+
+    <div class="label">Changes — server.py</div>
+    <p><code>_serialize_state</code>: remove the <code>if state.finalized</code> gate on the
+      <code>settlement</code> field — always attempt to compute it (empty if preconditions like "at least
+      one payer set" aren't met). Per the feedback doc's decision, no session closing/archiving concept
+      exists — recommend dropping <code>finalized</code> from the API response entirely rather than
+      keeping a vestigial always-irrelevant field. Stop writing to the <code>settlements</code> DB table
+      from <code>_save_agent</code> (it's purely a derived/computed view now) — but leave the table itself
+      in the schema for now rather than scope-creeping into another migration here.</p>
+
+    <div class="label">Acceptance</div>
+    <p>Multi-payer bill with a percentage item split and an amount item split in the same bill — confirm
+      balances compute correctly end to end. Confirm <code>calculate_split</code> can be called repeatedly
+      with no "already finalized" behavior, and that the settlement appears as soon as a payer is set, with
+      no separate finalize step.</p>
+  </div>
+
+  <!-- TASK 8 -->
+  <div class="item-block" id="task8">
+    <div class="status-row"><span class="item-num">TASK 8</span><span class="status blocked">Needs Task 7 merged</span></div>
+    <h3>Frontend display of multi-payer / split data</h3>
+    <p class="sub">Addresses feedback items #2, #3, #6.</p>
+    <div class="workflow">
+      <strong>Workflow:</strong> branch off <code>multi-user</code> <em>after Task 7 is merged into it</em>
+      (<code>git checkout -b task8-split-model-frontend multi-user</code>). Commit incrementally with
+      meaningful messages. Open the PR against <code>multi-user</code>, not <code>main</code>.
+    </div>
+
+    <div class="label">Changes — frontend/app.js, frontend/style.css</div>
+    <ul>
+      <li><code>renderState()</code>'s payer line (today: <code>Paid by ${bill.paid_by}</code>) — update
+        for the map shape: show each payer with their amount when there's more than one entry (e.g.
+        "Paid by Alice ($1800.00), Sumit ($1200.00)"), but don't show a redundant breakdown for a
+        single-entry map that equals the full bill total.</li>
+      <li>Item row's assignment display — extend to show a percentage/amount breakdown when
+        <code>cost_allocations</code> reflects a non-equal split, styled consistently with how the
+        existing qty-based breakdown looked.</li>
+      <li>Settlement card — remove the <code>state.finalized &amp;&amp;</code> condition gating its
+        visibility; show it whenever <code>state.settlement</code> is non-empty. Update any "finalized"
+        language/badge to reflect it's a live, always-current view.</li>
+      <li>Confirm <code>escapeHtml</code> is applied consistently to every new piece of dynamic text this
+        introduces (payer/split names) — this codebase has had escaping-consistency bugs before between
+        sibling renderers; don't repeat that pattern here.</li>
+    </ul>
+
+    <div class="label">Acceptance</div>
+    <p>Visually confirm a multi-payer bill and a percentage/amount split both render correctly and
+      legibly, and that the settlement panel is visible immediately once enough data exists, without any
+      explicit "finalize" action.</p>
+  </div>
+
+  <div class="footer">
+    <span>SplitPro — internal developer documentation</span>
+    <span>Task briefs — hand off as-is to a fresh coding agent per task</span>
+  </div>
+
+</main>
+</body>
+</html>

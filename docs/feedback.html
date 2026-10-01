@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Testing Feedback — SplitPro Docs</title>
+<link rel="stylesheet" href="assets/docs.css" />
+<style>
+  .status-row { display: flex; align-items: center; gap: 10px; margin: 0 0 6px; }
+  .status { font-size: 0.72rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+  .status.open { background: color-mix(in srgb, var(--accent-3) 20%, transparent); color: var(--accent-3); }
+  .status.decided { background: color-mix(in srgb, var(--accent-2) 20%, transparent); color: var(--accent-2); }
+  .status.bug { background: color-mix(in srgb, #e8567a 20%, transparent); color: #e8567a; }
+  .status.resolved { background: color-mix(in srgb, var(--text-faint) 20%, transparent); color: var(--text-dim); }
+  .item-num { font-size: 0.82rem; color: var(--text-faint); font-weight: 700; }
+  .item-block { border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 22px; margin: 18px 0; background: var(--bg-raised); }
+  .item-block h3 { margin: 4px 0 12px; }
+  .label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); font-weight: 600; margin: 16px 0 6px; }
+  .label:first-of-type { margin-top: 4px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0 0; }
+</style>
+</head>
+<body>
+
+<div class="topnav">
+  <a class="brand" href="index.html"><span class="mark">🧾</span> SplitPro Docs</a>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="api.html">API Reference</a>
+    <a href="roadmap.html">Roadmap</a>
+    <a href="feedback.html" class="active">Testing Feedback</a>
+    <a href="tasks.html">Task Briefs</a>
+  </nav>
+  <span class="tag">v0.1.0</span>
+</div>
+
+<main class="page">
+
+  <div class="hero">
+    <h1>Testing feedback — open items</h1>
+    <p class="lede">
+      11 issues from real multi-user testing on the <code>multi-user</code> branch, kept in the order
+      they were raised. Nothing here is scoped into a task brief yet — this is the discussion stage.
+      Two items (5 and 10) are explicitly left open pending further thought, not forgotten.
+    </p>
+    <div class="legend">
+      <span class="status bug">Confirmed bug</span>
+      <span class="status decided">Decided — scope agreed</span>
+      <span class="status open">Open — needs discussion</span>
+      <span class="status resolved">Resolved / lower priority</span>
+    </div>
+  </div>
+
+  <hr class="section" />
+
+  <!-- 1 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#1</span><span class="status decided">Decided — approach</span></div>
+    <h3>Real-time multi-user chat (no reload required)</h3>
+    <p><strong>Problem:</strong> when multiple people are in the same session, nobody sees a new message/state
+      change until they manually reload. No push mechanism exists today — the frontend only fetches on its
+      own actions (<code>loadSession</code>, <code>sendToAgent</code>, etc.).</p>
+
+    <div class="label">Research — how WhatsApp / Discord / Telegram do this</div>
+    <p>All three converge on the same core primitive at scale: a persistent connection (WebSocket, or a
+      custom protocol like MQTT) held open per client, a server-side registry mapping
+      user/session → active connections, and a fan-out dispatcher that pushes a new message to every
+      connection subscribed to that conversation. Presence ("online", "typing…") rides over the same
+      socket as a separate event type. At Discord's scale this means ~8M concurrent WebSocket connections
+      spread across 1000+ regional gateway nodes, with Redis holding the connection-location mapping so
+      any server can route a message to the right gateway.</p>
+    <p class="dim">None of the sharding/Redis-routing machinery is relevant here — that solves "which of our
+      10,000 servers is this user connected to," and SplitPro runs one process. The applicable part is just:
+      <strong>WebSocket connection + in-process fan-out, scoped per session_id</strong> — the same shape as
+      the existing <code>sessions</code> in-memory cache dict, just mapping to live sockets instead of
+      <code>ChatAgent</code> instances.</p>
+
+    <div class="label">Recommendation</div>
+    <p>A FastAPI WebSocket endpoint per session (<code>/ws/sessions/{id}</code>), authenticated the same way
+      as the REST endpoints (JWT cookie read during the WS handshake), holding a small
+      <code>dict[session_id, list[WebSocket]]</code> registry. When <code>_run_chat_turn</code> or a
+      proposal decision changes session state, broadcast the new message/state to every open socket for
+      that session. No Redis, no offline queue, no presence/typing needed for v1 — reconnection on page
+      load already gets a client caught up via the existing REST fetch, so the socket only needs to cover
+      "while you're actively looking at the screen."</p>
+
+    <p class="dim" style="font-size:0.85rem">
+      Sources:
+      <a href="https://adhdecode.com/distributed-systems/other-industry-teardowns/discord-realtime/">Discord Real-Time Infrastructure — WebSocket Gateways</a>,
+      <a href="https://ramendraparmar.substack.com/p/system-design-question-9-whatsapp">System Design: WhatsApp-like Messaging Service</a>,
+      <a href="https://wittycoder.in/blog/websockets-fastapi-real-time-chat">WebSockets with FastAPI — Build a Real-Time Chat App</a>
+    </p>
+  </div>
+
+  <!-- 2 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#2</span><span class="status decided">Decided</span></div>
+    <h3>Multiple payers on one bill</h3>
+    <p><strong>Problem:</strong> <code>bills.paid_by</code> is a single name — can't represent two or more
+      people splitting payment for the same bill.</p>
+    <div class="label">Decision</div>
+    <p><code>paid_by</code> becomes a map (person → amount), not a string. See #3 below — this should be
+      designed together with percentage/share splitting rather than as a separate mechanism, since a bill
+      may need both multiple payers <em>and</em> a non-equal split among them at once.</p>
+  </div>
+
+  <!-- 3 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#3</span><span class="status decided">Decided — scope</span></div>
+    <h3>Percentage / share / absolute-amount splitting — payer side and item side</h3>
+    <p><strong>Problem:</strong> need to support three entry modes for <em>who paid</em> and <em>who
+      consumed</em>: equal split, percentage (73% / 20% / 7%), and a direct absolute figure
+      (out of ₹3000: ₹1200 Sumit, ₹1800 me).</p>
+    <div class="label">Scope agreed</div>
+    <p>These three entry modes all resolve to the same underlying representation — an amount per person —
+      so the schema only needs one shape: a person → amount contribution map, used identically for payer
+      allocation (replacing the single <code>paid_by</code> string, per #2) and item consumption (extending
+      today's <code>qty_allocations</code> pattern for items). Percentage and equal-split are just
+      convenience <em>input</em> modes that get converted to amounts at entry time — equal = total/n,
+      percentage = total×pct — so the settlement math never needs to know which mode was used, only the
+      resulting amounts. The design work still needed: the exact tool interface (how the agent expresses
+      "percentage" vs "amount" vs "equal" when calling <code>assign_items</code>/<code>set_payer</code>) and
+      validation (contributions must sum to the bill/item total within the existing epsilon tolerance).</p>
+  </div>
+
+  <!-- 4 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#4</span><span class="status decided">Decided — light touch only</span></div>
+    <h3>Prompt quality / item categorization errors</h3>
+    <p><strong>Problem:</strong> the agent sometimes merges distinct items under one umbrella name (e.g.
+      lumping whiskey into "beer" when the user said "we split beer"). Reported as happening in more than
+      one tested scenario, not a one-off.</p>
+    <div class="label">Decided scope</div>
+    <p>The draft use-case list (restaurant/bar tabs, groceries, trips, rent/utilities, event pooling, work
+      lunches) is good enough as-is — no further brainstorming needed. Fix: a small, targeted prompt
+      tweak aimed specifically at the categorization failure (don't merge distinct named items under one
+      umbrella name), not a broad rewrite. Outside of this one failure mode the current prompt is working
+      well and shouldn't be disturbed.</p>
+  </div>
+
+  <!-- 5 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#5</span><span class="status open">Deferred — future release</span></div>
+    <h3>Agent replies too eagerly in group chat</h3>
+    <p><strong>Problem:</strong> the agent responds after every single message, even casual back-and-forth
+      between participants that isn't directed at it. Should be smarter about when to actually speak up.</p>
+    <p class="dim">This is the "when should the agent even speak" question from the original multi-user
+      design discussion — deferred then in favor of the approval system as the safety net, and still a
+      visible problem on its own regardless of the approval flow. Pushed to a future release rather than
+      this one — not forgotten, just not blocking the current batch of work.</p>
+  </div>
+
+  <!-- 6 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#6</span><span class="status decided">Decided</span></div>
+    <h3>Settlement doesn't reflect a late correction after finalization</h3>
+    <p><strong>Problem:</strong> after a session is finalized, telling the agent about an additional late
+      payment gets a conversational "here's your updated settlement…" reply in chat, but the sessions page
+      never changes, and there's no approval request raised for it.</p>
+    <div class="label">Agreed direction</div>
+    <p>Settlement isn't an action the agent performs — it's a property of whatever bill data currently
+      exists. The agent already has full write access to bills/items/payers through the proposal system;
+      settlement doesn't need its own write path on top of that. So:</p>
+    <ul>
+      <li><code>calculate_split</code> stops being a "finalize" action and becomes a pure report — compute
+        balances from whatever's currently approved, print them, done. No flag gets set, nothing gets
+        locked.</li>
+      <li>The <code>finalized</code> flag's current job — gating whether <code>/state</code> even returns a
+        settlement — goes away. Settlement always reflects current approved-bill data, live, the same way
+        the underlying balance computation already works today.</li>
+      <li>The frontend's settlement card shows whenever there's valid data to compute from, not behind a
+        "someone finalized this" condition.</li>
+    </ul>
+    <p>This closes #6 structurally rather than patching it — once there's no gated/cached settlement state
+      to fall out of sync, there's nothing left for a correction to desynchronize from. Every read is the
+      current truth, whether it comes from chat or the sessions page.</p>
+    <div class="label">Resolved</div>
+    <p>No "closing"/archiving a session for now — <code>finalized</code> is dropped entirely, sessions stay
+      perpetually live and editable. A manual "mark this session as settled/closed" action is noted as a
+      possible future feature (ties to the main roadmap's partial-settlements/session-lifecycle ideas) but
+      deliberately out of scope here.</p>
+  </div>
+
+  <!-- 7 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#7</span><span class="status resolved">Resolved in later testing</span></div>
+    <h3>Referring to a bill by natural language ("the dolphins bill")</h3>
+    <p><strong>Update from testing:</strong> confirmed working in later tests — you were able to reference
+      and update a specific bill by description. Lower priority now; the only follow-up worth keeping in
+      mind is hardening the tools with a fuzzy-description fallback (same pattern the item-name matching
+      already uses) so this doesn't rely entirely on the model getting the exact bill_id right from
+      context every time.</p>
+  </div>
+
+  <!-- 8 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#8</span><span class="status decided">Decided — scope, patterns noted below</span></div>
+    <h3>UI: panel toggle, responsive sizing, name overflow</h3>
+    <p><strong>Problem:</strong> need a way to toggle the chat-session and approval side panels, the layout
+      needs to auto-size for phones, and some participant names overflow the bill card's boundary.</p>
+    <div class="label">Patterns worth following (standard, well-established)</div>
+    <ul>
+      <li><strong>Collapsible drawer sidebar</strong> — the Discord/Slack/WhatsApp Web pattern: sidebar
+        slides in/out via a hamburger toggle, full-screen overlay on narrow viewports instead of a
+        permanent column</li>
+      <li><strong>Responsive breakpoint</strong> — below a phone-width threshold, panels stack instead of
+        sitting side-by-side; only one panel visible at a time, switched via tab/toggle</li>
+      <li><strong>Name overflow</strong> — likely a missing <code>min-width: 0</code> on a flex child plus
+        <code>text-overflow: ellipsis</code>/<code>white-space: nowrap</code>, with the full name available
+        via a <code>title</code> tooltip attribute on hover</li>
+    </ul>
+    <p>No open design questions here — straightforward frontend work once scoped.</p>
+  </div>
+
+  <!-- 9 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#9</span><span class="status bug">Confirmed bug + decided UX direction</span></div>
+    <h3>Chat title stuck at "New Session"; no title bar above the chat</h3>
+    <p><strong>Problem:</strong> the title area above the chat panel is blank — the session name only shows
+      in the left sidebar — and it stays "New Session" even after an active multi-user conversation.</p>
+    <div class="label">Confirmed root cause</div>
+    <p>The auto-rename trigger in <code>server.py</code> checks <code>len(state.bills)</code> growing — true
+      before the proposal system existed, but <code>add_bill</code> now only creates a pending proposal and
+      doesn't touch <code>state.bills</code> until an admin approves it. In any session with an unapproved
+      bill sitting pending, the rename condition never fires. Straightforward regression from the Task 3
+      refactor, not a missing feature.</p>
+    <div class="label">Decided UX direction</div>
+    <p>WhatsApp-style: a small top bar above the chat panel showing the current session's title (currently
+      blank/absent), with two user-facing options — manually rename it, or toggle auto-generated naming as
+      the conversation progresses. Worth upgrading the auto-name logic at the same time: rather than just
+      reusing the first bill's description, generate the title from actual conversation content (and
+      re-trigger it off proposal creation, not just approval, to also fix the root bug above).</p>
+  </div>
+
+  <!-- 10 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#10</span><span class="status decided">Decided</span></div>
+    <h3>Long multi-user conversations — context window handling</h3>
+    <p><strong>Problem:</strong> unclear how the system behaves once a group chat runs long.</p>
+    <div class="label">Confirmed — there was nothing here</div>
+    <p>Every turn sends the <em>entire</em> accumulated message history to the LLM, completely unwindowed,
+      forever. Fine for a short single-user session; a real cost/latency/context-limit problem for a
+      long-running group chat.</p>
+    <div class="label">Decided design — sliding window + background summarization</div>
+    <p>Key reassurance that shaped the final numbers: the actual financial data (bills, items, assignments,
+      payers) is never derived from chat history — it's rebuilt fresh from the database into the system
+      prompt on <em>every</em> turn via <code>state.state_summary()</code>. So the conversation history is
+      only load-bearing for short-term dialogue coherence (resolving "the dolphins bill", recent
+      back-and-forth), never for financial correctness. That means the window can be small and
+      summarization can be reasonably aggressive without real risk.</p>
+    <ul>
+      <li><strong>Unit of counting: "rounds," not raw messages.</strong> A round = one human message plus
+        everything the agent did in response to it (however many tool calls that took). Triggering off raw
+        message count was rejected — tool-call-heavy activity from a busy multi-user session would inflate
+        the raw count fast and trigger summarization constantly, compounding lossy summaries on top of each
+        other for no good reason. Counting rounds ties the trigger to actual conversational volume instead.</li>
+      <li><strong>Window: 8 rounds</strong> kept verbatim.</li>
+      <li><strong>Once exceeded: summarize the oldest 4 rounds, keep the newest 4</strong>, folding the
+        oldest into a running summary rather than discarding it outright.</li>
+      <li><strong>Safety net:</strong> an independent raw-message ceiling (~40 messages) that can trigger
+        summarization early regardless of round count, for the edge case where a single round is enormous
+        (e.g. a giant pasted bill generating dozens of tool calls in one exchange).</li>
+      <li><strong>Cut points are round-aligned</strong>, which also guarantees a tool-call and its matching
+        tool-response are never split across the summarized/kept boundary.</li>
+      <li><strong>Storage:</strong> a new <code>context_summary</code> column on <code>chat_sessions</code>,
+        injected into the system prompt the same way <code>_pending_proposals_summary()</code> already is —
+        invisible to users, purely internal.</li>
+      <li><strong>Model:</strong> reuse the session's already-configured chat model, no new provider config.</li>
+    </ul>
+    <div class="label">Fire-and-forget, no latency impact — confirmed design requirement</div>
+    <p>Runs via FastAPI's <code>BackgroundTasks</code>, which executes only <em>after</em> the triggering
+      request's HTTP response has already been sent — the person whose message crossed the threshold gets
+      their normal reply with zero added wait. For concurrent users in the same session while summarization
+      runs: the slow part (the LLM call that generates the summary) happens <em>without</em> holding the
+      per-session lock, working off a snapshot of the messages to compress. The lock is only acquired
+      briefly at the end, to persist the finished summary and remove the now-redundant messages from the
+      checkpoint — a fast operation, not a multi-second LLM round-trip — so a concurrent request is never
+      meaningfully blocked by a background summarization run in progress.</p>
+  </div>
+
+  <!-- 11 -->
+  <div class="item-block">
+    <div class="status-row"><span class="item-num">#11</span><span class="status decided">Decided</span></div>
+    <h3>Missing tools: remove bill, rename bill, add/remove items on an existing bill</h3>
+    <p><strong>Problem:</strong> editing items on an already-approved bill works (via the correction-proposal
+      flow), but there's no way to remove a whole bill, rename one, or add/remove a single item from one.</p>
+    <div class="label">Decided</div>
+    <p>All three (remove bill, rename bill, add/remove item) go through the same correction-proposal/approval
+      cycle as every other edit — no separate mechanism. These three tools are enough for now; the other
+      candidate tools floated earlier (list/summarize, merge bills, partial-payment tracking, undo-proposal,
+      categorization/tagging) aren't needed yet — left for a future pass if they come up again.</p>
+  </div>
+
+  <hr class="section" />
+
+  <h2>Where this leaves us</h2>
+  <p>Ready to become task briefs whenever you want: <strong>#1</strong> (WebSocket real-time sync),
+    <strong>#2/#3</strong> (payer + split model, designed together), <strong>#4</strong> (light, targeted
+    prompt fix), <strong>#6</strong> (settlement as a live read-only view, no finalize gate),
+    <strong>#8</strong> (frontend panel work), <strong>#9</strong> (bug fix + title bar),
+    <strong>#10</strong> (sliding window + background summarization, numbers and locking strategy decided),
+    and <strong>#11</strong> (remove/rename bill, add/remove item — all through the approval cycle).
+    <strong>#7</strong> is effectively closed out.</p>
+  <p><strong>Deferred to a future release:</strong> <strong>#5</strong> (agent chattiness in group chat) —
+    everything else on this list is now decided and moving into implementation.</p>
+  <p>Full implementation briefs for everything decided here are tracked in
+    <a href="tasks.html">Task Briefs</a> (Tasks 6–14, continuing the numbering from the original
+    multi-user Tasks 1–5).</p>
+
+  <div class="footer">
+    <span>SplitPro — internal developer documentation</span>
+    <span>Discussion-stage doc — nothing here is a committed task brief yet</span>
+  </div>
+
+</main>
+</body>
+</html>

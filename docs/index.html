@@ -15,6 +15,8 @@
     <a href="architecture.html">Architecture</a>
     <a href="api.html">API Reference</a>
     <a href="roadmap.html">Roadmap</a>
+    <a href="feedback.html">Testing Feedback</a>
+    <a href="tasks.html">Task Briefs</a>
   </nav>
   <span class="tag">v0.1.0</span>
 </div>
@@ -60,13 +62,15 @@
 
   <h2>What it does</h2>
   <ul>
+    <li><strong>Multi-user group chat</strong> — several people can message the same session; replies and bill updates are attributed to whoever actually sent them.</li>
+    <li><strong>Admin-approved expenses</strong> — every new or changed bill the agent proposes is staged for an admin to approve or reject before it affects anyone's balance.</li>
     <li><strong>Conversational parsing</strong> — paste bill text or describe it in chat; the agent extracts line items, tax, and tip.</li>
     <li><strong>Receipt photo upload</strong> — a vision model reads a receipt image and hands the extracted text back into the same chat flow.</li>
     <li><strong>Item-level assignment</strong> — assign items to one or more people, including fractional/quantity-based splits ("Alice had 1 of 4 burgers").</li>
     <li><strong>Multi-bill sessions</strong> — add several bills to one session; everything settles together.</li>
     <li><strong>Minimal settlements</strong> — a greedy debt-simplification algorithm reduces the group's debts to the fewest possible payments.</li>
-    <li><strong>Accounts &amp; history</strong> — Google sign-in, and every session is persisted to SQLite so chat history survives a server restart.</li>
-    <li><strong>CLI mode</strong> — the same agent runs standalone in a terminal, no server or auth required.</li>
+    <li><strong>Accounts, roles &amp; history</strong> — Google sign-in, per-session admin/member roles, and every session persisted to SQLite so chat history survives a server restart.</li>
+    <li><strong>CLI mode</strong> — the same agent runs standalone in a terminal, no server, auth, or multi-user behavior involved.</li>
   </ul>
 
   <h2>How the pieces fit</h2>
@@ -111,7 +115,7 @@
       <text x="230" y="20" class="dx-sub">Google OAuth (sign-in)</text>
       <line x1="230" y1="25" x2="280" y2="60" class="dx-arrow"/>
     </svg>
-    <div class="caption">Request flow: browser → FastAPI → per-session ChatAgent → LLM provider, with SQLite as the write-through store.</div>
+    <div class="caption">Request flow: browser → FastAPI (membership + lock-guarded) → per-session ChatAgent → LLM provider, with SQLite as the write-through store for approved data and LangGraph's own checkpoint tables for conversation memory. New/changed bills are staged as proposals before they reach SQLite — see <a href="architecture.html#approvals">Architecture</a>.</div>
   </div>
 
   <h2>Explore the docs</h2>
@@ -135,6 +139,11 @@
       <span class="card-icon">🗺️</span>
       <h3>Roadmap</h3>
       <p>Future scope: feature depth, multi-user collaboration, and production readiness — with effort and dependencies.</p>
+    </a>
+    <a class="card" href="feedback.html">
+      <span class="card-icon">🧪</span>
+      <h3>Testing Feedback</h3>
+      <p>Open items from real multi-user testing — decided designs, confirmed bugs, and what's deliberately deferred.</p>
     </a>
   </div>
 

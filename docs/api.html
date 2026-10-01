@@ -15,6 +15,8 @@
     <a href="architecture.html">Architecture</a>
     <a href="api.html" class="active">API Reference</a>
     <a href="roadmap.html">Roadmap</a>
+    <a href="feedback.html">Testing Feedback</a>
+    <a href="tasks.html">Task Briefs</a>
   </nav>
   <span class="tag">v0.1.0</span>
 </div>
@@ -40,6 +42,13 @@
     and <code>/health</code> requires a valid <code>access_token</code> cookie (set by completing the Google
     sign-in flow in a browser). Calling these with <code>curl</code> means first signing in via a real
     browser and copying the cookie, e.g. <code>curl -b "access_token=&lt;jwt&gt;" ...</code>.
+  </div>
+
+  <div class="callout">
+    <strong>Session access is a membership question</strong>
+    Most routes below are scoped to a session a given user is a <em>member</em> of, not just one they
+    created — see <a href="architecture.html#membership">Session membership &amp; roles</a>. Routes marked
+    "Admin only" additionally require <code>role = 'admin'</code> on that membership row.
   </div>
 
   <h2>Auth</h2>
@@ -83,22 +92,26 @@
   <h2>Session management</h2>
   <div class="table-wrap">
   <table>
-    <tr><th>Method &amp; Path</th><th>Description</th></tr>
+    <tr><th>Method &amp; Path</th><th>Auth</th><th>Description</th></tr>
     <tr>
       <td><span class="method get">GET</span> <code>/api/sessions</code></td>
-      <td>List the current user's sessions, newest-updated first.</td>
+      <td>member</td>
+      <td>List every session the current user is a <em>member</em> of (not just ones they created), newest-updated first.</td>
     </tr>
     <tr>
       <td><span class="method post">POST</span> <code>/api/sessions</code></td>
-      <td>Create a new session. Optional body overrides the provider/model.</td>
+      <td>cookie</td>
+      <td>Create a new session. Optional body overrides the provider/model. Creator is inserted as <code>admin</code>.</td>
     </tr>
     <tr>
       <td><span class="method patch">PATCH</span> <code>/api/sessions/{session_id}/name</code></td>
-      <td>Rename a session.</td>
+      <td>member</td>
+      <td>Rename a session. Any member may rename — no admin requirement.</td>
     </tr>
     <tr>
       <td><span class="method delete">DELETE</span> <code>/api/sessions/{session_id}</code></td>
-      <td>Delete a session (removes it from the DB and the in-memory cache).</td>
+      <td>admin</td>
+      <td>Delete a session (DB row, cascading children, checkpoint thread, in-memory cache, and lock entry).</td>
     </tr>
   </table>
   </div>
@@ -132,24 +145,133 @@
 
   <hr class="section" />
 
-  <h2>Chat &amp; images</h2>
+  <h2>Session membership</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method &amp; Path</th><th>Auth</th><th>Description</th></tr>
+    <tr>
+      <td><span class="method get">GET</span> <code>/api/sessions/{session_id}/members</code></td>
+      <td>member</td>
+      <td>List the session's roster: <code>user_id</code>, <code>name</code>, <code>email</code>, <code>avatar_url</code>, <code>role</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/api/sessions/{session_id}/members</code></td>
+      <td>admin</td>
+      <td>Add an existing user by email as a <code>member</code>. <code>404</code> if that email has never signed in. Idempotent — re-adding an existing member is <code>200</code>, not an error.</td>
+    </tr>
+    <tr>
+      <td><span class="method delete">DELETE</span> <code>/api/sessions/{session_id}/members/{user_id}</code></td>
+      <td>admin</td>
+      <td>Remove a member. <code>400</code> if this would remove the session's last admin.</td>
+    </tr>
+    <tr>
+      <td><span class="method patch">PATCH</span> <code>/api/sessions/{session_id}/members/{user_id}/role</code></td>
+      <td>admin</td>
+      <td>Change a member's role (<code>admin</code> / <code>member</code>). <code>400</code> if this would demote the session's last admin.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h4>POST /api/sessions/{session_id}/members</h4>
+  <pre><code>curl -X POST http://localhost:8000/api/sessions/abc-123/members \
+  -b "access_token=&lt;jwt&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "friend@example.com"}'</code></pre>
+  <pre><code>{ "ok": true, "already_member": false }</code></pre>
+
+  <h4>PATCH /api/sessions/{session_id}/members/{user_id}/role</h4>
+  <pre><code>curl -X PATCH http://localhost:8000/api/sessions/abc-123/members/7/role \
+  -b "access_token=&lt;jwt&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "admin"}'</code></pre>
+  <pre><code>{ "role": "admin" }</code></pre>
+
+  <hr class="section" />
+
+  <h2>Expense proposal review</h2>
+  <p class="dim">
+    New or changed expenses are staged as proposals, not applied immediately — see
+    <a href="architecture.html#approvals">Expense proposal approval workflow</a>. All three routes below
+    are admin-only.
+  </p>
   <div class="table-wrap">
   <table>
     <tr><th>Method &amp; Path</th><th>Description</th></tr>
     <tr>
+      <td><span class="method get">GET</span> <code>/api/sessions/{session_id}/proposals</code></td>
+      <td>List pending proposals for the session.</td>
+    </tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/api/sessions/{session_id}/proposals/{proposal_id}/approve</code></td>
+      <td>Approve a proposal — materializes it into <code>bills</code>/<code>bill_items</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="method post">POST</span> <code>/api/sessions/{session_id}/proposals/{proposal_id}/reject</code></td>
+      <td>Reject a proposal — no effect on <code>bills</code>/<code>bill_items</code>.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h4>GET /api/sessions/{session_id}/proposals</h4>
+  <pre><code>curl http://localhost:8000/api/sessions/abc-123/proposals -b "access_token=&lt;jwt&gt;"</code></pre>
+  <pre><code>[
+  {
+    "id": 5,
+    "session_id": "abc-123",
+    "proposed_by": 3,
+    "status": "pending",
+    "supersedes_bill_id": null,
+    "is_correction": false,
+    "payload": {
+      "bill_id": "bill_a1b2c3d4",
+      "description": "Dinner at Spice Garden",
+      "raw_text": "...",
+      "tax": 1.9, "tip": 3.0, "paid_by": "Alice",
+      "items": [ { "name": "Burger", "price": 12.0, "qty": 1, "assigned_to": [], "shared": false, "unassigned": false, "qty_allocations": {} } ]
+    },
+    "decided_by": null, "decided_at": null,
+    "created_at": "...", "updated_at": "..."
+  }
+]</code></pre>
+  <p class="dim">
+    <code>is_correction</code> is computed fresh on every read (whether <code>payload.bill_id</code>
+    currently matches an approved bill in this session) — <code>supersedes_bill_id</code> itself is not a
+    reliable signal by the time a proposal is actually reviewed, see the architecture doc for why.
+  </p>
+
+  <h4>POST .../proposals/{proposal_id}/approve</h4>
+  <pre><code>curl -X POST http://localhost:8000/api/sessions/abc-123/proposals/5/approve -b "access_token=&lt;jwt&gt;"</code></pre>
+  <p class="dim">Returns the decided proposal row (<code>status</code> now <code>"approved"</code>). <code>409</code> if it was already decided by someone else first.</p>
+
+  <hr class="section" />
+
+  <h2>Chat &amp; images</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method &amp; Path</th><th>Auth</th><th>Description</th></tr>
+    <tr>
       <td><span class="method post">POST</span> <code>/sessions/{session_id}/chat</code></td>
-      <td>Send a chat message; runs the agent's tool-calling loop and returns its reply plus the updated state.</td>
+      <td>member</td>
+      <td>Send a chat message; runs the agent's tool-calling loop (speaker-attributed) and returns its reply plus the updated state.</td>
     </tr>
     <tr>
       <td><span class="method post">POST</span> <code>/sessions/{session_id}/image</code></td>
+      <td>member</td>
       <td>Upload a receipt image (multipart). Vision model extracts it, then feeds the result into the same chat loop.</td>
     </tr>
     <tr>
       <td><span class="method get">GET</span> <code>/sessions/{session_id}/state</code></td>
+      <td>member</td>
       <td>Get the current serialized session state without sending a message.</td>
     </tr>
     <tr>
+      <td><span class="method get">GET</span> <code>/sessions/{session_id}/messages</code></td>
+      <td>member</td>
+      <td>Full chat transcript for replay when a session is reopened, oldest first. Each row includes a raw <code>user_id</code> (null for agent replies) — resolve sender name/avatar via the members endpoint above.</td>
+    </tr>
+    <tr>
       <td><span class="method delete">DELETE</span> <code>/sessions/{session_id}</code></td>
+      <td>admin</td>
       <td>Delete the session (same behavior as the <code>/api/sessions</code> delete route above).</td>
     </tr>
   </table>
@@ -161,31 +283,23 @@
   -H "Content-Type: application/json" \
   -d '{"message": "Burger $12, Fries $4, Coke $3. Tax $1.90"}'</code></pre>
   <pre><code>{
-  "response": "Got it — added that as a bill. Who's splitting this one?",
+  "response": "Got it — I've proposed that bill, awaiting admin approval. Who's splitting this one?",
   "state": {
     "participants": [],
-    "bills": [
-      {
-        "bill_id": "bill_1",
-        "description": "Burger, Fries, Coke",
-        "subtotal": 19.0,
-        "tax": 1.9,
-        "tip": 0.0,
-        "total": 20.9,
-        "paid_by": null,
-        "items": [
-          { "name": "Burger", "price": 12.0, "assigned_to": [], "shared": false },
-          { "name": "Fries",  "price": 4.0,  "assigned_to": [], "shared": false },
-          { "name": "Coke",   "price": 3.0,  "assigned_to": [], "shared": false }
-        ],
-        "unassigned_items": ["Burger", "Fries", "Coke"]
-      }
-    ],
+    "pending_proposals_count": 1,
+    "bills": [],
     "finalized": false,
     "all_bills_ready": false,
     "settlement": []
   }
 }</code></pre>
+  <p class="dim">
+    Note <code>bills: []</code> here — the parsed bill is staged as a proposal, not yet in
+    <code>state.bills</code>. It only appears once an admin approves it via the proposals endpoints above.
+    The server resolves the caller's display name for chat attribution via <code>_speaker_name()</code>
+    (re-fetches the <code>users</code> row — <code>get_current_user</code> itself only ever returns
+    <code>{"id": ...}</code>), and persists the message with <code>user_id</code> set.
+  </p>
 
   <h4>POST /sessions/{session_id}/image</h4>
   <pre><code>curl -X POST http://localhost:8000/sessions/abc-123/image \
@@ -230,8 +344,10 @@
   <table>
     <tr><th>Status</th><th>When</th></tr>
     <tr><td><code>401</code></td><td>Missing/invalid/expired <code>access_token</code> cookie.</td></tr>
-    <tr><td><code>404</code></td><td>Session doesn't exist, or exists but isn't owned by the current user (both cases return the same 404 — session existence isn't leaked across users).</td></tr>
-    <tr><td><code>400</code></td><td>Uploaded file to <code>/sessions/{id}/image</code> isn't an image.</td></tr>
+    <tr><td><code>403</code></td><td>Caller is a member of the session but not an admin, on an admin-only route.</td></tr>
+    <tr><td><code>404</code></td><td>Session doesn't exist, or exists but the caller isn't a member (both return the same 404 — session existence isn't leaked to non-members). Also used for a proposal id that doesn't exist, or exists in a different session.</td></tr>
+    <tr><td><code>409</code></td><td>A proposal was already approved/rejected by someone else between your read and your decide call.</td></tr>
+    <tr><td><code>400</code></td><td>Uploaded file to <code>/sessions/{id}/image</code> isn't an image; or a membership change would leave a session with zero admins.</td></tr>
   </table>
   </div>
 

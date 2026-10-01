@@ -15,6 +15,8 @@
     <a href="architecture.html" class="active">Architecture</a>
     <a href="api.html">API Reference</a>
     <a href="roadmap.html">Roadmap</a>
+    <a href="feedback.html">Testing Feedback</a>
+    <a href="tasks.html">Task Briefs</a>
   </nav>
   <span class="tag">v0.1.0</span>
 </div>
@@ -23,24 +25,26 @@
 
   <div class="hero">
     <h1>Architecture</h1>
-    <p class="lede">How a chat message becomes a settled bill: auth, the agent's tool-calling loop, persistence, and the settlement math.</p>
+    <p class="lede">How a chat message becomes a settled bill: auth, membership and roles, the agent's
+      tool-calling loop, the expense-approval workflow, persistence, and the settlement math.</p>
   </div>
 
   <h2>Source layout</h2>
   <div class="table-wrap">
   <table>
     <tr><th>Path</th><th>Responsibility</th></tr>
-    <tr><td><code>server.py</code></td><td>FastAPI app: OAuth routes, session CRUD, chat/image endpoints, serves <code>frontend/</code> as static files.</td></tr>
-    <tr><td><code>main.py</code></td><td>Standalone CLI — runs <code>ChatAgent</code> in a terminal loop, no server or auth involved.</td></tr>
+    <tr><td><code>server.py</code></td><td>FastAPI app: OAuth routes, session + membership + proposal CRUD, chat/image endpoints, per-session locking, serves <code>frontend/</code> as static files.</td></tr>
+    <tr><td><code>main.py</code></td><td>Standalone CLI — runs <code>ChatAgent</code> in a terminal loop, no server, auth, or multi-user behavior involved.</td></tr>
     <tr><td><code>config.py</code></td><td>Dataclass configs (<code>ChatAgentConfig</code>, <code>ImageAnalyzerConfig</code>, <code>ServerConfig</code>, <code>AuthConfig</code>) loaded from <code>config/defaults.yaml</code> and env vars.</td></tr>
-    <tr><td><code>agents/chat_agent.py</code></td><td><code>ChatAgent</code> — the system prompt, the six LangChain tools, and the tool-calling loop.</td></tr>
+    <tr><td><code>agents/chat_agent.py</code></td><td><code>ChatAgent</code> — the system prompt, the six LangChain tools (now proposal-routing, not direct state mutation), speaker attribution, and the tool-calling loop.</td></tr>
     <tr><td><code>agents/image_analyzer.py</code></td><td><code>ImageAnalyzer</code> — sends an uploaded image to a vision model, parses its JSON response.</td></tr>
     <tr><td><code>agents/llm_factory.py</code></td><td>Builds a LangChain chat model for a given provider (<code>openai</code> / <code>anthropic</code> / <code>google</code>).</td></tr>
-    <tr><td><code>core/session_state.py</code></td><td>Data model: <code>LineItem</code>, <code>ParsedBill</code>, <code>SessionState</code> — plus (de)serialization.</td></tr>
+    <tr><td><code>core/session_state.py</code></td><td>Data model: <code>LineItem</code>, <code>ParsedBill</code>, <code>SessionState</code> — plus (de)serialization. Represents only <em>approved</em> data; proposals live separately until decided.</td></tr>
     <tr><td><code>core/settlement.py</code></td><td><code>Settlement</code> — greedy debt-minimization + report formatting.</td></tr>
     <tr><td><code>core/auth.py</code></td><td>Google OAuth helpers and JWT create/verify.</td></tr>
-    <tr><td><code>core/database.py</code></td><td>SQLite persistence for users and chat sessions.</td></tr>
-    <tr><td><code>frontend/</code></td><td>Single-page vanilla JS/HTML/CSS chat UI, served by the same FastAPI process.</td></tr>
+    <tr><td><code>core/database.py</code></td><td>SQLite persistence: users, sessions, membership/roles, bills, and the expense-proposal approval workflow.</td></tr>
+    <tr><td><code>core/checkpointer.py</code></td><td>LangGraph's own checkpoint persistence for the agent's conversation state — separate connection/tables from <code>core/database.py</code>'s.</td></tr>
+    <tr><td><code>frontend/</code></td><td>Single-page vanilla JS/HTML/CSS chat UI, served by the same FastAPI process — group chat with sender attribution, member management, and an approvals tab.</td></tr>
   </table>
   </div>
 
@@ -95,8 +99,8 @@
   <ul>
     <li><strong>Redirect URI</strong> — <code>GOOGLE_REDIRECT_URI</code> must exactly match an authorized redirect URI configured in the Google Cloud OAuth client. Defaults to <code>http://localhost:8000/auth/google/callback</code>.</li>
     <li><strong>JWT cookie</strong> — name <code>access_token</code>, <code>httpOnly</code>, <code>SameSite=Lax</code>, signed with <code>JWT_SECRET</code> (HS256), payload <code>{"sub": user_id, "exp": ...}</code>. Lifetime is <code>jwt_expire_minutes</code> (default 10080 = 7 days).</li>
-    <li><strong>Every protected route</strong> depends on <code>get_current_user</code> (<code>core/auth.py</code>), which reads the cookie, verifies the signature, and returns <code>{"id": user_id}</code> — or raises <code>401</code>.</li>
-    <li><strong>Session ownership</strong> is checked separately per request via <code>db.session_belongs_to_user(session_id, user_id)</code> — a valid JWT alone doesn't grant access to another user's session.</li>
+    <li><strong>Every protected route</strong> depends on <code>get_current_user</code> (<code>core/auth.py</code>), which reads the cookie, verifies the signature, and returns <code>{"id": user_id}</code> — or raises <code>401</code>. That's deliberately all it returns; anywhere a display name/email is needed (chat attribution, <code>/auth/me</code>), the full row is re-fetched from <code>users</code> by id rather than trusting extra keys on this dict.</li>
+    <li><strong>Session access</strong> is a <em>membership</em> question now, not single ownership — see <a href="#membership">Session membership &amp; roles</a> below. <code>_require_member</code>/<code>_require_admin</code> (<code>server.py</code>) check this per request; a valid JWT alone doesn't grant access to a session you're not a member of.</li>
   </ul>
 
   <div class="callout danger">
@@ -106,12 +110,45 @@
 
   <hr class="section" />
 
+  <h2 id="membership">Session membership &amp; roles</h2>
+  <p>
+    A session is no longer single-owner. <code>chat_sessions.user_id</code> still records who originally
+    created it, but access is governed entirely by the <code>session_members</code> table — a
+    <code>(session_id, user_id, role)</code> row per participant, <code>role</code> being
+    <code>admin</code> or <code>member</code>. The creator is inserted as <code>admin</code> at session
+    creation (<code>POST /api/sessions</code>); every pre-existing session from before this model
+    existed was backfilled the same way, once, by <code>_migrate_membership()</code>.
+  </p>
+  <ul>
+    <li><strong>Any member</strong> (admin or not) can chat, view the roster, and rename the session.</li>
+    <li><strong>Admin-only</strong>: inviting/removing members, changing roles, deleting the session, and
+      deciding expense proposals (see below).</li>
+    <li><strong>Last-admin guard</strong> — <code>update_member_role</code>/<code>remove_session_member</code>
+      (<code>core/database.py</code>) refuse to demote or remove a session's last remaining admin, raising
+      <code>ValueError</code> (surfaced as HTTP <code>400</code>). The check and the write are one atomic
+      statement (the admin count is a correlated subquery in the <code>UPDATE</code>/<code>DELETE</code>'s
+      own <code>WHERE</code> clause, wrapped in <code>BEGIN IMMEDIATE</code>) rather than a separate
+      SELECT-then-write — a check-then-act split here would let two concurrent demotions both read "2
+      admins" and both proceed, leaving zero.</li>
+    <li><strong>Invite by email</strong> — <code>POST /api/sessions/{id}/members</code> looks the target up
+      by <code>get_user_by_email()</code> (case-insensitive), which only finds someone who has signed in at
+      least once; there's no invite-a-stranger flow. Re-inviting an existing member is an idempotent
+      no-op, not an error — <code>add_session_member</code> does the existence check and insert as one
+      <code>INSERT ... ON CONFLICT DO NOTHING</code> statement for the same check-then-act reason as above.</li>
+  </ul>
+
+  <hr class="section" />
+
   <h2>The agent tool-calling loop</h2>
   <p>
     Each session owns one <code>ChatAgent</code> instance. The agent doesn't parse bills or do arithmetic
-    itself — it's an LLM bound to six Python functions ("tools") that read and write one shared
-    <code>SessionState</code> object. The LLM decides which tools to call and with what arguments; the
-    tools are the only thing allowed to mutate state.
+    itself — it's an LLM bound to six Python functions ("tools"). Critically, these tools no longer mutate
+    the shared <code>SessionState</code> directly for anything new or changed: <code>SessionState</code>
+    represents only <em>approved</em> data, and every new or edited bill is staged as an
+    <code>expense_proposals</code> row instead, materialized into <code>SessionState</code>/the DB only once
+    an admin approves it (see <a href="#approvals">Expense proposal approval</a> below).
+    <code>calculate_split</code> is the one tool that still reads <code>SessionState</code> directly, since
+    it only ever needs to see approved bills.
   </p>
 
   <div class="diagram">
@@ -121,7 +158,7 @@
 
       <rect x="240" y="20" width="220" height="60" rx="8" class="dx-box-accent"/>
       <text x="350" y="45" text-anchor="middle" class="dx-label">Build prompt</text>
-      <text x="350" y="63" text-anchor="middle" class="dx-sub">system prompt + state_summary()</text>
+      <text x="350" y="63" text-anchor="middle" class="dx-sub">system prompt + state_summary() + pending proposals</text>
 
       <rect x="240" y="180" width="220" height="60" rx="8" class="dx-box-accent"/>
       <text x="350" y="205" text-anchor="middle" class="dx-label">llm_with_tools.invoke()</text>
@@ -133,7 +170,7 @@
 
       <rect x="750" y="20" width="140" height="60" rx="8" class="dx-box"/>
       <text x="820" y="45" text-anchor="middle" class="dx-label">Run tool(s)</text>
-      <text x="820" y="63" text-anchor="middle" class="dx-sub">mutate SessionState</text>
+      <text x="820" y="63" text-anchor="middle" class="dx-sub">stage/update a proposal</text>
 
       <rect x="750" y="180" width="140" height="60" rx="8" class="dx-box"/>
       <text x="820" y="205" text-anchor="middle" class="dx-label">Final reply</text>
@@ -147,26 +184,80 @@
       <text x="835" y="130" class="dx-sub" transform="rotate(90 835 130)">loop</text>
       <line x1="710" y1="145" x2="748" y2="200" class="dx-arrow"/>
     </svg>
-    <div class="caption">One <code>agent.chat()</code> call: rebuild the prompt from live state every turn, let the model call tools, feed results back, repeat.</div>
+    <div class="caption">One <code>agent.chat()</code> call: rebuild the prompt from live state + pending proposals every turn, let the model call tools, feed results back, repeat.</div>
   </div>
 
   <h3>The six tools</h3>
   <div class="table-wrap">
   <table>
     <tr><th>Tool</th><th>Purpose</th></tr>
-    <tr><td><code>add_bill</code></td><td>Parses bill text/items the user provided into a new <code>ParsedBill</code> (line items, tax, tip). Called once per bill.</td></tr>
-    <tr><td><code>set_participants</code></td><td>Sets the full list of people splitting the bill(s). Names are normalized with <code>.strip().title()</code>.</td></tr>
-    <tr><td><code>assign_items</code></td><td>Assigns items to specific people. Supports equal splits and quantity-based splits (e.g. "Alice had 1 of 4 burgers", including fractional units) via <code>qty_per_person</code>.</td></tr>
-    <tr><td><code>mark_items_unassigned</code></td><td>Marks items to be split equally across <em>all</em> participants (e.g. "just split the appetizer evenly").</td></tr>
-    <tr><td><code>set_payer</code></td><td>Records who fronted the money for a given bill.</td></tr>
-    <tr><td><code>calculate_split</code></td><td>Computes per-person balances across all bills, distributes tax/tip proportionally, and generates the minimal settlement — then marks the session <code>finalized</code>.</td></tr>
+    <tr><td><code>add_bill</code></td><td>Parses bill text/items into a draft and stages it as a <em>new</em> <code>expense_proposals</code> row — never appends directly to <code>SessionState.bills</code>.</td></tr>
+    <tr><td><code>set_participants</code></td><td>Sets the full list of people splitting the bill(s). Names are normalized with <code>.strip().title()</code>. Unchanged by the proposal system — this is session-level metadata, not a bill.</td></tr>
+    <tr><td><code>assign_items</code></td><td>Assigns items to specific people (equal or quantity-based splits, including fractional units). Routes through the pending-proposal-or-correction logic below rather than mutating a bill in place.</td></tr>
+    <tr><td><code>mark_items_unassigned</code></td><td>Marks items to be split equally across <em>all</em> participants. Same proposal-routing as <code>assign_items</code>.</td></tr>
+    <tr><td><code>set_payer</code></td><td>Records who fronted the money for a bill. Same proposal-routing as <code>assign_items</code>.</td></tr>
+    <tr><td><code>calculate_split</code></td><td>Computes per-person balances across all <em>approved</em> bills, distributes tax/tip proportionally, generates the minimal settlement, and marks the session <code>finalized</code>. Only tool that reads <code>SessionState</code> directly — nothing here goes through the proposal system.</td></tr>
   </table>
   </div>
 
+  <h4>How a bill-changing tool decides where an edit goes</h4>
   <p>
-    The tools are closures built over one live <code>SessionState</code> instance
-    (<code>_build_tools(state)</code> in <code>agents/chat_agent.py</code>) — they're rebuilt every time an
-    agent is restored from the database so they close over the freshly-deserialized state, not a stale one.
+    <code>assign_items</code>, <code>set_payer</code>, and <code>mark_items_unassigned</code> all funnel
+    through the same resolution logic (<code>_load_bill_for_edit</code> / <code>_persist_edit</code> in
+    <code>agents/chat_agent.py</code>) to decide what a given <code>bill_id</code> actually refers to:
+  </p>
+  <ul>
+    <li><strong>A still-pending proposal exists for that <code>bill_id</code></strong>
+      (<code>_find_pending_proposal</code>) — the edit mutates that proposal's payload in place via
+      <code>db.update_proposal_payload()</code>. No new approval cycle; it's still the same unreviewed
+      draft.</li>
+    <li><strong>No pending proposal, but an approved bill with that <code>bill_id</code> exists</strong> in
+      <code>SessionState</code> — this is a <em>correction</em>. A fresh snapshot of the approved bill is
+      taken, the edit applied to the snapshot, and the result staged as a <em>new</em>
+      <code>expense_proposals</code> row (<code>supersedes_bill_id</code> set to that bill's DB row id at
+      creation time). The original approved bill is untouched until this new proposal is itself approved.</li>
+    <li><strong>Neither</strong> — the tool returns a "bill not found" error, listing known bill ids from
+      both approved bills and still-pending proposals (<code>_known_bill_ids</code>), so a bill the model
+      just proposed doesn't vanish from that list before it's approved.</li>
+  </ul>
+  <p>
+    The one subtlety in the correction path: <code>supersedes_bill_id</code> is <em>not</em> trusted at
+    decision time, because its foreign key is <code>ON DELETE SET NULL</code> (needed so the bill
+    delete-and-reinsert on every normal save doesn't violate it) — it routinely goes stale before a
+    proposal is decided, sometimes within the same turn that created it.
+    <code>decide_proposal()</code> re-resolves the real target fresh, by the natural key
+    <code>(session_id, payload["bill_id"])</code>, which is stable across that churn. Whether a given
+    proposal <em>is</em> a correction, for display purposes (e.g. flagging it to an admin reviewing the
+    queue), is likewise computed fresh at read time (<code>is_correction</code>/<code>_is_correction()</code>)
+    rather than read off that same unreliable column.
+  </p>
+
+  <h3>Speaker attribution</h3>
+  <p>
+    A session can have several real people messaging it, not just one. <code>ChatAgent.chat()</code> takes
+    optional <code>speaker_name</code>/<code>speaker_user_id</code> params — when given,
+    <code>speaker_name</code> is prefixed onto the message content (e.g. <code>"[Alice] we had pizza"</code>,
+    see the system prompt's "Group chat" section) so the model can track who said what, and
+    <code>speaker_user_id</code> drives which user a staged proposal is attributed to.
+  </p>
+  <div class="callout warn">
+    <strong>Why this is threaded through <code>RunnableConfig</code>, not stored on <code>self</code></strong>
+    An earlier version stored the current turn's <code>speaker_user_id</code> as a plain attribute on the
+    <code>ChatAgent</code> instance. Since <code>server.py</code> caches one <code>ChatAgent</code> per
+    session and reuses it across requests, two real concurrent senders in the same session could race:
+    whichever request's assignment to that attribute happened last would "win" for both turns' tool
+    calls, misattributing one person's proposal to the other. The fix was to stop storing it on
+    <code>self</code> entirely — <code>speaker_user_id</code> is threaded through LangGraph's own
+    per-invocation <code>RunnableConfig</code> instead (<code>_speaker_user_id(config)</code>), which
+    LangGraph builds fresh for each <code>chat()</code> call and passes down to every tool/node
+    invocation for that call specifically. Verified with forced-interleaving concurrency tests (two real
+    threads, one deliberately stalled mid-call) before and after the fix.
+  </div>
+  <p>
+    The CLI (<code>main.py</code>) never passes either parameter — with both <code>None</code>, message
+    content is unprefixed and every tool takes its direct, non-proposal-routing branch exactly as it did
+    before the approval system existed. This is deliberate: the CLI has no sessions, no membership, and no
+    admin to approve anything.
   </p>
 
   <p>
@@ -178,6 +269,86 @@
 
   <hr class="section" />
 
+  <h2 id="approvals">Expense proposal approval workflow</h2>
+  <p>
+    <code>expense_proposals</code> is a staging table — a draft that hasn't affected anyone's balance yet.
+    Its <code>payload</code> column mirrors the shape of a bill (<code>bill_id</code>,
+    <code>description</code>, <code>raw_text</code>, <code>items[]</code>, <code>tax</code>,
+    <code>tip</code>, <code>paid_by</code>) as JSON, since it isn't materialized into
+    <code>bills</code>/<code>bill_items</code> until approved.
+  </p>
+  <div class="kv">
+    <dt>Created</dt><dd>A bill-changing tool call with no existing approved bill to correct —
+      <code>db.create_proposal()</code>, status <code>pending</code>.</dd>
+    <dt>Edited while pending</dt><dd>A further tool call against the same still-pending <code>bill_id</code>
+      — <code>db.update_proposal_payload()</code> overwrites the payload in place; no new row.</dd>
+    <dt>Approved</dt><dd><code>POST /api/sessions/{id}/proposals/{id}/approve</code> (admin only) →
+      <code>decide_proposal(..., "approved")</code> — inserts a new <code>bills</code> row, or (for a
+      correction) updates the existing one and replaces its <code>bill_items</code>, all in one
+      transaction. <code>status</code> becomes <code>approved</code> and can never be decided again.</dd>
+    <dt>Rejected</dt><dd><code>POST .../reject</code> → <code>status</code> becomes <code>rejected</code>;
+      nothing is written to <code>bills</code>/<code>bill_items</code>.</dd>
+  </div>
+  <p>
+    <code>decide_proposal()</code>'s own guard against being decided twice is folded into the UPDATE
+    itself (<code>WHERE id = ? AND status = 'pending'</code>, rowcount checked) rather than a prior SELECT
+    — the same check-then-act hazard as the membership guards above: two concurrent decisions on the same
+    proposal could otherwise both observe <code>pending</code> and both proceed, the second hitting the
+    <code>bills</code> table's <code>UNIQUE(session_id, bill_id)</code> constraint. A single
+    <code>UPDATE</code> can't be interleaved with another writer, so exactly one caller ever wins the claim
+    — the other gets a <code>ValueError</code>, surfaced by <code>server.py</code> as HTTP <code>409</code>
+    (a conflict with current state, not a missing resource).
+  </p>
+
+  <div class="callout warn">
+    <strong>Approving/rejecting must evict the cached agent in the same locked step as the DB write</strong>
+    <code>approve_proposal</code>/<code>reject_proposal</code> pop the session's entry from
+    <code>server.py</code>'s in-memory <code>sessions</code> cache immediately after
+    <code>decide_proposal()</code> succeeds, inside the same <code>with _get_session_lock(session_id):</code>
+    block. Doing the DB write first and evicting afterward (outside the lock, or in a separate locked step)
+    leaves a window where a concurrent chat turn can grab the lock, find the still-cached pre-approval
+    agent, and complete its own write-through save — silently overwriting the just-approved bill with the
+    stale in-memory state. This was a real bug, caught and fixed during testing; eviction now happens
+    atomically with the write that makes it necessary, mirroring how <code>delete_session</code> already
+    combined its DB delete and cache-pop into one locked step.
+  </div>
+
+  <hr class="section" />
+
+  <h2>Concurrency: per-session locking</h2>
+  <p>
+    A session can have multiple real concurrent senders now, so <code>server.py</code> keeps one
+    <code>threading.Lock</code> per <code>session_id</code> (<code>_session_locks</code>,
+    get-or-created via <code>_get_session_lock()</code>, dropped via <code>_drop_session_lock()</code>
+    once a session is deleted so the dict doesn't grow unboundedly over a long-running process).
+  </p>
+  <p>
+    <code>_run_chat_turn()</code> wraps the <em>entire</em> turn in this lock — agent lookup/construction,
+    <code>agent.chat()</code>, persistence, and the state snapshot returned to the caller — not just the
+    model call. This matters because <code>_get_agent()</code>'s cache-miss path (construct a new
+    <code>ChatAgent</code>, cache it) is itself an unsynchronized check-then-act: two first-touch requests
+    for the same brand-new session could otherwise each build an independent agent/state object before
+    either took the lock, and whichever saved last would silently discard the other's bill. The state
+    snapshot must likewise be read before the lock releases, or a concurrent turn could mutate
+    <code>agent.state</code> in the gap between this turn's unlock and its own serialization.
+  </p>
+  <p>
+    <code>GET /sessions/{id}/state</code> takes the same lock for the same reason (an unlocked read could
+    race a concurrent mutation, or redundantly construct a second agent on a cache miss). Session deletion
+    and proposal decisions take it too, for the reasons described above.
+  </p>
+  <div class="callout warn">
+    <strong><code>upload_image</code> needs <code>asyncio.to_thread</code>, not just the lock</strong>
+    <code>upload_image</code> is an <code>async def</code> endpoint, but both the vision-model call
+    (<code>analyzer.analyze()</code>) and <code>_run_chat_turn()</code> (which holds a plain, blocking
+    <code>threading.Lock</code>) are synchronous. Calling either directly from the coroutine would block
+    FastAPI's single event-loop thread for their full duration — stalling <em>every</em> request the
+    process is serving, not just this one. Both are run via <code>await asyncio.to_thread(...)</code> so
+    lock contention or a slow vision-model call on one session can't freeze the app for everyone else.
+  </div>
+
+  <hr class="section" />
+
   <h2>Receipt images</h2>
   <p>
     Image upload doesn't bypass the chat agent — it feeds it. <code>POST /sessions/{id}/image</code>
@@ -185,7 +356,8 @@
     classify the image and, if it's a bill, transcribe it to text. That transcription (or a
     "this isn't a receipt" description) is then wrapped as a synthetic user message and passed
     straight into the same <code>agent.chat()</code> loop described above — so the model still decides
-    whether to call <code>add_bill</code>.
+    whether to call <code>add_bill</code>, and the result is staged as a proposal exactly like a
+    pasted-text bill would be.
   </p>
   <ul>
     <li>The vision request format differs by provider: OpenAI/Google use <code>image_url</code> content blocks (base64 data URI); Anthropic uses its native <code>image</code> content block.</li>
@@ -196,18 +368,35 @@
 
   <h2>Session persistence</h2>
   <p>
-    Session state lives in three places at once, kept in sync on a write-through basis:
+    Conversation memory and bill-splitting state are deliberately kept in two separate systems, each
+    the source of truth for its own half:
   </p>
   <ol>
-    <li><strong>In the <code>ChatAgent</code> object itself</strong> — <code>message_history</code> (LangChain messages) and <code>state</code> (<code>SessionState</code>).</li>
-    <li><strong>An in-memory cache in <code>server.py</code></strong> — <code>sessions: dict[str, ChatAgent]</code>, scoped to the running process.</li>
-    <li><strong>SQLite</strong> — the <code>chat_sessions</code> table stores <code>message_history</code> and <code>session_state</code> as JSON text blobs, source of truth across restarts. File location is <code>DB_PATH</code> (env var) — <code>init_db()</code> creates any missing parent directory automatically.</li>
+    <li><strong>The chat conversation itself</strong> (every message, tool call, and tool result) lives in
+      LangGraph's own checkpoint tables, managed entirely by <code>core/checkpointer.py</code>'s
+      <code>SqliteSaver</code>, keyed by <code>thread_id = session_id</code>. <code>ChatAgent</code> never
+      serializes or restores this by hand — LangGraph's <code>graph.invoke()</code> picks it up
+      transparently on the next call for that thread.</li>
+    <li><strong>Approved bill-splitting data</strong> (<code>SessionState</code>: participants, approved
+      bills/items, <code>finalized</code>) lives in the normalized tables below, written through to SQLite
+      after every turn.</li>
+    <li><strong>An in-memory cache in <code>server.py</code></strong> — <code>sessions: dict[str, ChatAgent]</code>,
+      scoped to the running process, guarded by the per-session locks described above.</li>
   </ol>
 
   <div class="kv">
-    <dt>Cache hit</dt><dd>Request arrives → session already in the <code>sessions</code> dict → used directly.</dd>
-    <dt>Cache miss</dt><dd><code>_get_agent()</code> loads the row from SQLite, rebuilds the agent with <code>ChatAgent.from_dict()</code> (using <code>messages_from_dict</code> for history and <code>SessionState.from_dict</code> for state), and re-caches it.</dd>
-    <dt>After every turn</dt><dd><code>_save_agent()</code> serializes the agent back to JSON and writes it to the <code>chat_sessions</code> row (<code>updated_at</code> is bumped). The session is also auto-renamed to the first bill's description the moment a bill is added.</dd>
+    <dt>Cache hit</dt><dd>Request arrives → session already in the <code>sessions</code> dict → used directly (under the session's lock).</dd>
+    <dt>Cache miss</dt><dd><code>_get_agent()</code> constructs a fresh <code>ChatAgent</code> (its LangGraph graph resumes conversation automatically via the checkpointer) and loads <code>SessionState</code> from the normalized tables via <code>load_session_state()</code>/<code>SessionState.from_dict()</code>.</dd>
+    <dt>After every turn</dt><dd><code>_save_agent()</code> → <code>save_session_state()</code> deletes and reinserts participants/bills/bill_items/settlements for the session from the current (approved-only) <code>SessionState</code>. The session is auto-renamed to the first bill's description the moment <code>SessionState.bills</code> grows.</dd>
+  </div>
+
+  <div class="callout warn">
+    <strong>Known gap: auto-rename doesn't fire while a bill is only pending</strong>
+    The rename trigger above checks <code>len(state.bills)</code> growing — true before the proposal
+    system existed, when <code>add_bill</code> appended straight to <code>SessionState.bills</code>. Now a
+    new bill only reaches <code>SessionState.bills</code> once an admin approves it, so a session with an
+    unapproved bill sitting pending never gets auto-renamed. Tracked in
+    <a href="feedback.html">Testing Feedback</a> as a confirmed regression, not yet fixed.
   </div>
 
   <div class="callout danger">
@@ -234,17 +423,20 @@
     (<code>create_db()</code> in <code>core/database.py</code>) if it isn't — which is the case
     inside the Docker image, since <code>python:3.11-slim</code> doesn't ship the CLI binary. Both
     paths are idempotent: re-running against an existing file is a safe no-op, never an
-    overwrite. <code>init_db()</code> (server startup) never creates anything itself — it only
-    verifies the file exists and ensures the schema is current on it.
+    overwrite. <code>init_db()</code> (server startup) never creates the file itself — it only
+    verifies it exists, applies <code>schema.sql</code>, and runs three one-time column/table
+    migrations (<code>_migrate_chat_sessions</code>, <code>_migrate_membership</code>,
+    <code>_migrate_expense_proposals_fk</code>) that each check their own preconditions before
+    touching anything, so they're safe to run unconditionally on every startup.
   </div>
 
   <div class="callout warn">
     <strong>Known limitation</strong>
-    The in-memory <code>sessions</code> cache is per-process. It's safe under a single <code>uvicorn</code> worker
-    (the default for local dev and the provided Dockerfile). Correctness doesn't depend on it —
-    every request still re-checks ownership against SQLite and reloads on a cache miss — but two
-    processes sharing one SQLite file will each keep their own independent in-memory copy of a hot
-    session, so the fastest write wins rather than being coordinated.
+    The in-memory <code>sessions</code> cache (and its matching <code>_session_locks</code>) is
+    per-process. It's safe under a single <code>uvicorn</code> worker (the default for local dev and the
+    provided Dockerfile). Correctness doesn't depend on it — every request still re-checks membership
+    against SQLite and reloads on a cache miss — but two processes sharing one SQLite file would each keep
+    their own independent in-memory copy of a hot session, uncoordinated with each other.
   </div>
 
   <div class="callout warn">
@@ -281,6 +473,8 @@
   <hr class="section" />
 
   <h2>Data model</h2>
+  <p>The in-memory Python model below represents only <em>approved</em> session state — it has no
+    knowledge of pending proposals, which live purely as JSON payloads in the DB until decided.</p>
   <div class="diagram">
     <svg viewBox="0 0 900 220" xmlns="http://www.w3.org/2000/svg">
       <rect x="20" y="70" width="230" height="90" rx="8" class="dx-box-accent"/>
@@ -310,7 +504,7 @@
       <text x="760" y="130" text-anchor="middle" class="dx-sub">qty_allocations: {name: float}</text>
       <text x="760" y="150" text-anchor="middle" class="dx-sub">unit_price = price / qty</text>
     </svg>
-    <div class="caption">One session → many bills → many line items. All dataclasses, all JSON-serializable.</div>
+    <div class="caption">One session → many approved bills → many line items. All dataclasses, all JSON-serializable. <code>bill_id</code> is a random token (<code>bill_&lt;8 hex chars&gt;</code>), not sequential — so a deleted bill's id can never be reassigned to an unrelated one.</div>
   </div>
 
   <ul>
@@ -319,10 +513,20 @@
     <li><code>qty_allocations</code> — maps a person to the (possibly fractional) number of units of that item they consumed, at <code>unit_price = price / qty</code> each. Any unallocated remainder is split equally among the remaining people in <code>assigned_to</code> (or all participants, if none remain).</li>
   </ul>
 
+  <h3>Membership &amp; proposal tables</h3>
+  <p>These two tables exist only at the DB level — nothing in <code>SessionState</code> mirrors them.</p>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Table</th><th>Shape</th></tr>
+    <tr><td><code>session_members</code></td><td><code>(session_id, user_id, role, joined_at)</code>, unique per <code>(session_id, user_id)</code>. <code>role</code> is <code>admin</code> or <code>member</code>.</td></tr>
+    <tr><td><code>expense_proposals</code></td><td><code>(session_id, proposed_by, status, supersedes_bill_id, payload, decided_by, decided_at)</code>. <code>status</code> is <code>pending</code> / <code>approved</code> / <code>rejected</code>; <code>payload</code> is the draft bill as JSON.</td></tr>
+  </table>
+  </div>
+
   <hr class="section" />
 
   <h2>Settlement algorithm</h2>
-  <p>Run by <code>calculate_split</code> (and mirrored by <code>_compute_settlement</code> in <code>server.py</code> for the live state view). For each bill:</p>
+  <p>Run by <code>calculate_split</code> (and mirrored by <code>_compute_settlement</code> in <code>server.py</code> for the live state view) — over <em>approved</em> bills only. For each bill:</p>
   <ol>
     <li>For every item, compute each assigned person's share:
       <ul>
@@ -331,7 +535,7 @@
       </ul>
     </li>
     <li>Distribute <code>tax + tip</code> across people <em>proportionally to their subtotal share</em> of that bill (not split evenly) — <code>person_share += (person_subtotal / bill_subtotal) × (tax + tip)</code>. If the bill subtotal is zero, tax/tip splits evenly instead.</li>
-    <li>Accumulate into one global balance map across <em>all</em> bills in the session: the bill's payer is credited the full bill total; every participant (including the payer) is debited their computed share.</li>
+    <li>Accumulate into one global balance map across <em>all</em> approved bills in the session: the bill's payer is credited the full bill total; every participant (including the payer) is debited their computed share.</li>
   </ol>
 
   <h3>Debt minimization</h3>
@@ -359,9 +563,11 @@
   </p>
   <ul>
     <li><strong>Auth gate</strong> — on load, <code>app.js</code> calls <code>GET /auth/me</code>; a failure shows the Google sign-in overlay, success shows the app shell.</li>
-    <li><strong>Session sidebar</strong> — lists sessions from <code>GET /api/sessions</code>; the last-opened session id is cached in <code>localStorage</code> and restored on reload.</li>
-    <li><strong>Chat panel</strong> — posts to <code>/sessions/{id}/chat</code> or <code>/sessions/{id}/image</code>, renders the agent's reply (via the <code>marked</code> markdown library, loaded from a CDN) and the returned <code>state</code>.</li>
-    <li><strong>State panel</strong> — renders the serialized <code>SessionState</code> returned with every chat/image response: bills, items, assignments, and the settlement once <code>finalized</code> is true.</li>
+    <li><strong>Session sidebar</strong> — lists sessions from <code>GET /api/sessions</code> (now every session the user is a <em>member</em> of, not just ones they created); the last-opened session id is cached in <code>localStorage</code> and restored on reload.</li>
+    <li><strong>Chat panel</strong> — a real group chat: messages render with sender attribution (resolved against the member list from <code>GET /api/sessions/{id}/members</code>, since <code>chat_messages</code> only stores a raw <code>user_id</code>), and posts to <code>/sessions/{id}/chat</code> or <code>/sessions/{id}/image</code>.</li>
+    <li><strong>State panel</strong> — renders the serialized <code>SessionState</code>: bills, items, assignments, a pending-proposals count, and the settlement once <code>finalized</code> is true.</li>
+    <li><strong>Members tab</strong> — roster with roles; admins get invite-by-email and promote/demote/remove controls, non-admins see the same list read-only.</li>
+    <li><strong>Approvals tab</strong> (admin-only) — lists pending proposals as bill-style cards, each with Approve/Reject wired to the corresponding endpoint; a correction proposal is flagged distinctly from a brand-new bill via <code>is_correction</code>.</li>
   </ul>
 
   <div class="callout">
@@ -370,7 +576,9 @@
     simplified view — each item exposes <code>name</code>, <code>price</code>, <code>assigned_to</code>, and
     <code>shared</code>, but not <code>qty</code> or <code>qty_allocations</code>. Quantity-based splits are fully
     tracked and priced correctly server-side; the frontend just doesn't render the per-person unit
-    breakdown.
+    breakdown. <code>pending_proposals_count</code> is included so the chat UI can show a badge without a
+    second round-trip — it's a bare <code>COUNT(*)</code>, not the full proposal list/detail (that comes
+    from <code>GET /api/sessions/{id}/proposals</code>, admin-only).
   </div>
 
   <div class="footer">
