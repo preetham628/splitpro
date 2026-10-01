@@ -150,6 +150,18 @@ function updateChatTitleBar() {
 }
 
 function renderSessionList(sessions) {
+  // Same bug class as updateChatTitleBar()'s guard, just on the sidebar's
+  // own rename path: this function unconditionally wipes and rebuilds every
+  // <li>, including whichever one's nameSpan startRename() just flipped to
+  // contentEditable — a refresh landing mid-edit (e.g. from loadSessionList()
+  // racing a dblclick-to-rename) would otherwise destroy that span and
+  // recreate it fresh with the old name, silently discarding whatever the
+  // user has typed so far. Bail out of the whole rebuild while any sidebar
+  // item is being edited; the next call (e.g. right after that rename's own
+  // finish() triggers loadSessionList()) picks up the latest data once the
+  // edit is no longer in progress.
+  if (sessionList.querySelector('.session-item-name[contenteditable="true"]')) return;
+
   sessionList.innerHTML = '';
   sessions.forEach(s => {
     const li = document.createElement('li');
