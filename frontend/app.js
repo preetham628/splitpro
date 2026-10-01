@@ -54,6 +54,11 @@ const sessionList   = document.getElementById('session-list');
 const newSessionBtn = document.getElementById('new-session-btn');
 const chatTitleName  = document.getElementById('chat-title-name');
 const autoNameToggle = document.getElementById('auto-name-toggle');
+const sessionSidebarEl = document.querySelector('.session-sidebar');
+const statePanelEl     = document.getElementById('state-panel');
+const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
+const toggleStateBtn   = document.getElementById('toggle-state-btn');
+const panelBackdrop    = document.getElementById('panel-backdrop');
 const userAvatar    = document.getElementById('user-avatar');
 const userName      = document.getElementById('user-name');
 const logoutBtn     = document.getElementById('logout-btn');
@@ -87,6 +92,7 @@ async function init() {
 
   // Show app
   loginOverlay.classList.add('hidden');
+  applyResponsivePanelDefaults();
   appEl.style.display = 'flex';
 
   // Populate user info in header
@@ -660,6 +666,86 @@ function switchTab(name) {
 stateTabButtons.forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
+
+// ── Collapsible panel toggles ────────────────────────────────────────────────
+// Standard drawer pattern: on a wide screen the toggle buttons just let the
+// user reclaim screen space from a panel they don't need; below the
+// responsive breakpoints (900px for the session sidebar, 640px for the
+// state panel) each panel starts collapsed, and these same buttons are the
+// *only* way to bring it back — there is no other dead-end `display: none`
+// left in style.css. Once a panel has been toggled by hand during this page
+// load, resizing the window no longer overrides that explicit choice.
+//
+// Below its breakpoint, a reopened panel overlays the chat panel (fixed
+// position, via the media queries in style.css) instead of sharing flex
+// space with it — pushing the layout instead would squeeze the chat column
+// down to near nothing on a phone-width screen. The toggle buttons live in
+// the top header (not the chat title bar, and not the panels themselves)
+// precisely so they're never covered by that overlay and stay reachable
+// the whole time. The backdrop below is the overlay's scrim.
+const sidebarOverlayMQ = window.matchMedia('(max-width: 900px)');
+const statePanelOverlayMQ = window.matchMedia('(max-width: 640px)');
+let sidebarManuallySet = false;
+let statePanelManuallySet = false;
+
+function setSidebarCollapsed(collapsed) {
+  sessionSidebarEl.classList.toggle('collapsed', collapsed);
+  toggleSidebarBtn.classList.toggle('active', !collapsed);
+  updatePanelBackdrop();
+}
+
+function setStatePanelCollapsed(collapsed) {
+  statePanelEl.classList.toggle('collapsed', collapsed);
+  toggleStateBtn.classList.toggle('active', !collapsed);
+  updatePanelBackdrop();
+}
+
+// Shows the scrim whenever a panel is open *and* currently in overlay mode
+// (i.e. narrow enough that style.css positions it fixed over the chat
+// panel) — never while a panel is merely sharing flex space on a wide
+// screen, where there's nothing behind it that needs dimming.
+function updatePanelBackdrop() {
+  const sidebarOverlayOpen = sidebarOverlayMQ.matches && !sessionSidebarEl.classList.contains('collapsed');
+  const stateOverlayOpen   = statePanelOverlayMQ.matches && !statePanelEl.classList.contains('collapsed');
+  panelBackdrop.hidden = !(sidebarOverlayOpen || stateOverlayOpen);
+}
+
+toggleSidebarBtn.addEventListener('click', () => {
+  sidebarManuallySet = true;
+  setSidebarCollapsed(!sessionSidebarEl.classList.contains('collapsed'));
+});
+
+toggleStateBtn.addEventListener('click', () => {
+  statePanelManuallySet = true;
+  setStatePanelCollapsed(!statePanelEl.classList.contains('collapsed'));
+});
+
+// Tapping the scrim closes whichever overlay panel(s) are currently open —
+// same as tapping outside a mobile drawer in Discord/Slack/WhatsApp Web.
+panelBackdrop.addEventListener('click', () => {
+  if (sidebarOverlayMQ.matches && !sessionSidebarEl.classList.contains('collapsed')) {
+    sidebarManuallySet = true;
+    setSidebarCollapsed(true);
+  }
+  if (statePanelOverlayMQ.matches && !statePanelEl.classList.contains('collapsed')) {
+    statePanelManuallySet = true;
+    setStatePanelCollapsed(true);
+  }
+});
+
+// Applies the default collapsed/expanded state for each panel based on the
+// current viewport width — but only for whichever panel the user hasn't
+// already overridden by hand via the toggle buttons above.
+function applyResponsivePanelDefaults() {
+  if (!sidebarManuallySet) {
+    setSidebarCollapsed(sidebarOverlayMQ.matches);
+  }
+  if (!statePanelManuallySet) {
+    setStatePanelCollapsed(statePanelOverlayMQ.matches);
+  }
+}
+
+window.addEventListener('resize', applyResponsivePanelDefaults);
 
 function setActiveSession(id) {
   document.querySelectorAll('.session-item').forEach(el => {

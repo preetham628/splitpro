@@ -17,6 +17,7 @@
   --radius:      12px;
   --sidebar-w:   300px;
   --session-w:   220px;
+  --header-h:    56px;
 }
 
 body {
@@ -67,7 +68,7 @@ body {
 .header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 20px;
-  height: 56px;
+  height: var(--header-h);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
@@ -76,6 +77,22 @@ body {
 .header-right { display: flex; align-items: center; gap: 12px; }
 .logo         { font-size: 22px; }
 h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
+
+/* Panel toggle buttons — live in the header (not inside the panels
+   themselves, and not the chat title bar) so they stay reachable at any
+   screen width: a panel collapsed below its responsive breakpoint, or
+   collapsed manually on a wide screen, can always be brought back, and
+   once reopened as a mobile overlay drawer it can't cover its own
+   toggle, since the header sits above where that overlay is positioned. */
+.panel-toggle-btn {
+  flex-shrink: 0;
+  background: none; border: none; cursor: pointer;
+  color: var(--muted); padding: 6px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s, color .15s;
+}
+.panel-toggle-btn:hover { background: var(--accent-dim); color: var(--accent); }
+.panel-toggle-btn.active { color: var(--accent); background: var(--accent-dim); }
 
 .provider-badge {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
@@ -111,6 +128,17 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   display: flex; flex-direction: column;
   flex-shrink: 0;
   overflow: hidden;
+  transition: width .2s ease, border-color .2s ease;
+}
+/* Collapsed via the sidebar toggle button (frontend/app.js) — either
+   manually on a wide screen, or by default below the 900px breakpoint. A
+   real toggle (not a dead-end media query) always lets it come back.
+   border-right: none (not just a transparent color) so the collapsed
+   width is a true 0 — box-sizing: border-box would otherwise floor it at
+   the border's own width. */
+.session-sidebar.collapsed {
+  width: 0;
+  border-right: none;
 }
 .session-sidebar-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -190,6 +218,7 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
+  min-width: 0;
 }
 .chat-title-name[contenteditable="true"] {
   outline: none;
@@ -360,6 +389,16 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
   overflow-y: auto;
   flex-shrink: 0;
   padding: 16px;
+  transition: width .2s ease, padding .2s ease, border-color .2s ease;
+}
+/* Collapsed via the state-panel toggle button (frontend/app.js) — either
+   manually on a wide screen, or by default below the 640px breakpoint. A
+   real toggle (not a dead-end media query) always lets it come back. */
+.state-panel.collapsed {
+  width: 0;
+  padding: 0;
+  overflow: hidden;
+  border-left: none;
 }
 .state-panel h2 {
   font-size: 13px; font-weight: 700; text-transform: uppercase;
@@ -522,10 +561,41 @@ h1            { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
 
 .muted { color: var(--muted); font-size: 13px; }
 
-/* Responsive: hide sidebars on small screens */
+/* Responsive: below these widths the session sidebar / state panel start
+   collapsed (via the .collapsed class above, applied in frontend/app.js),
+   but the panel-toggle buttons in the header always remain available to
+   bring either one back on demand — unlike a blunt `display: none` media
+   query, this isn't a dead end at narrow widths.
+   When a panel is reopened below its breakpoint, it overlays the chat
+   panel (fixed position, like a Discord/Slack/WhatsApp Web mobile drawer)
+   instead of squeezing the chat column down to nothing — see the
+   `.panel-backdrop` rules below for the scrim behind it. */
 @media (max-width: 900px) {
-  .session-sidebar { display: none; }
+  .session-sidebar:not(.collapsed) {
+    position: fixed;
+    top: var(--header-h);
+    left: 0;
+    bottom: 0;
+    z-index: 60;
+    box-shadow: 4px 0 24px rgba(0,0,0,.18);
+  }
 }
 @media (max-width: 640px) {
-  .state-panel { display: none; }
+  .state-panel:not(.collapsed) {
+    position: fixed;
+    top: var(--header-h);
+    right: 0;
+    bottom: 0;
+    z-index: 60;
+    box-shadow: -4px 0 24px rgba(0,0,0,.18);
+  }
 }
+
+/* Scrim shown behind an overlaid (mobile-drawer) panel; tapping it closes
+   whichever panel(s) are currently open in overlay mode. */
+.panel-backdrop {
+  position: fixed; inset: var(--header-h) 0 0 0;
+  background: rgba(10,12,20,.35);
+  z-index: 50;
+}
+.panel-backdrop[hidden] { display: none; }
