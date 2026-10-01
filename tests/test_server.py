@@ -448,3 +448,156 @@ def test_chat_raises_401_when_user_row_is_missing(fresh_server):
             background_tasks=BackgroundTasks(), user={"id": 999999},
         )
     assert exc_info.value.status_code == 401
+
+
+# ---------- Task 11: auto-rename trigger + title_auto toggle ----------
+#
+# Confirmed root cause: add_bill only ever creates a pending expense
+# proposal (core/database.py's create_proposal) — agent.state.bills doesn't
+# gain an entry until an admin later approves it (decide_proposal). The old
+# trigger (`len(agent.state.bills) > prev_bill_count`) therefore never fired
+# for a session sitting on an unapproved bill, no matter how long the
+# conversation ran. These tests lock in the fix: the trigger now also counts
+# pending proposals, and respects a per-session title_auto flag that a
+# manual rename turns off.
+
+def _session_row(session_id: str, user_id: int) -> dict:
+    """Look up a single session's {name, title_auto, ...} via the same
+    list_sessions() the sidebar/title-bar actually consume."""
+    rows = [s for s in db.list_sessions(user_id) if s["id"] == session_id]
+    assert rows, f"session {session_id} not found for user {user_id}"
+    return rows[0]
+
+
+def test_auto_rename_fires_from_pending_proposal_before_approval(fresh_server, monkeypatch):
+    """A bill that exists only as a pending (unapproved) proposal must still
+    trigger the auto-rename — the exact bug this task fixes. Before the fix,
+    the session would stay 'New Session' forever in this scenario."""
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        db.create_proposal(
+            self.session_id, proposed_by=speaker_user_id,
+            payload=sample_payload(description="Pending Dinner"),
+        )
+        return "ok, proposed a bill"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+
+    admin = make_user("auto-rename@example.com", "g-auto-rename", "Renamer")
+    session_id = make_session_with_members(admin)
+    assert _session_row(session_id, admin["id"])["name"] == "Test Session"
+
+    server.chat(
+        session_id, server.ChatRequest(message="here's a receipt"),
+        background_tasks=BackgroundTasks(), user=admin,
+    )
+
+    row = _session_row(session_id, admin["id"])
+    assert row["name"] == "Pending Dinner"
+    assert row["title_auto"] is True
+    # Still nothing in agent.state.bills — the proposal was never approved —
+    # confirming the rename really came from the fallback, not a bill.
+    assert server.sessions[session_id].state.bills == []
+
+
+def test_manual_rename_disables_title_auto_and_blocks_further_auto_rename(fresh_server, monkeypatch):
+    """PATCH .../name must flip title_auto off, and _run_chat_turn must then
+    skip the entire auto-rename computation on later turns — a manual edit
+    should stick instead of getting silently overwritten by the next bill or
+    proposal."""
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        db.create_proposal(
+            self.session_id, proposed_by=speaker_user_id,
+            payload=sample_payload(description="Should Not Win"),
+        )
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+
+    admin = make_user("manual-rename@example.com", "g-manual-rename", "Manual")
+    session_id = make_session_with_members(admin)
+
+    result = server.rename_session(
+        session_id, server.RenameRequest(name="My Custom Name"), user=admin,
+    )
+    assert result == {"name": "My Custom Name", "title_auto": False}
+
+    row = _session_row(session_id, admin["id"])
+    assert row["name"] == "My Custom Name"
+    assert row["title_auto"] is False
+
+    # A bill proposal shows up on the next turn — must NOT overwrite the
+    # manual name now that title_auto is off.
+    server.chat(
+        session_id, server.ChatRequest(message="here's another receipt"),
+        background_tasks=BackgroundTasks(), user=admin,
+    )
+
+    row = _session_row(session_id, admin["id"])
+    assert row["name"] == "My Custom Name"
+    assert row["title_auto"] is False
+
+
+def test_title_auto_endpoint_reenables_auto_rename(fresh_server, monkeypatch):
+    """PATCH .../title-auto must flip title_auto back on, after which the
+    next bill/proposal activity resumes auto-renaming."""
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        db.create_proposal(
+            self.session_id, proposed_by=speaker_user_id,
+            payload=sample_payload(description="Resumed Auto Name"),
+        )
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+
+    admin = make_user("reenable@example.com", "g-reenable", "Reenable")
+    session_id = make_session_with_members(admin)
+
+    server.rename_session(session_id, server.RenameRequest(name="Manual First"), user=admin)
+    assert _session_row(session_id, admin["id"])["title_auto"] is False
+
+    result = server.set_session_title_auto(
+        session_id, server.TitleAutoRequest(auto=True), user=admin,
+    )
+    assert result == {"title_auto": True}
+    assert _session_row(session_id, admin["id"])["title_auto"] is True
+
+    server.chat(
+        session_id, server.ChatRequest(message="here's a receipt"),
+        background_tasks=BackgroundTasks(), user=admin,
+    )
+
+    row = _session_row(session_id, admin["id"])
+    assert row["name"] == "Resumed Auto Name"
+    assert row["title_auto"] is True
+
+
+def test_auto_rename_prefers_approved_bill_over_pending_proposal(fresh_server, monkeypatch):
+    """Once a bill is approved (lands in agent.state.bills), the rename must
+    use its description, not fall through to a pending proposal's."""
+
+    def fake_chat(self, user_message, speaker_name=None, speaker_user_id=None):
+        bill_id = self.state.next_bill_id()
+        self.state.bills.append(
+            ParsedBill(bill_id=bill_id, raw_text="", description="Approved Lunch")
+        )
+        db.create_proposal(
+            self.session_id, proposed_by=speaker_user_id,
+            payload=sample_payload(bill_id="bill_other", description="Other Pending"),
+        )
+        return "ok"
+
+    monkeypatch.setattr(ChatAgent, "chat", fake_chat)
+
+    admin = make_user("prefers-bill@example.com", "g-prefers-bill", "PrefersBill")
+    session_id = make_session_with_members(admin)
+
+    server.chat(
+        session_id, server.ChatRequest(message="add a bill"),
+        background_tasks=BackgroundTasks(), user=admin,
+    )
+
+    row = _session_row(session_id, admin["id"])
+    assert row["name"] == "Approved Lunch"

@@ -1220,3 +1220,96 @@ def test_concurrent_decide_proposal_only_one_wins(fresh_db):
         assert count == 1, "exactly one bill should exist, not zero or a duplicate"
     finally:
         conn.close()
+
+
+# ---------- Task 11: title_auto column, migration, get/set helpers ----------
+
+def test_get_set_title_auto_defaults_true(fresh_db):
+    admin = make_user("title-auto@example.com", "g-title-auto")
+    make_session("sess-title-1", admin["id"])
+
+    assert db.get_title_auto("sess-title-1") is True
+
+    db.set_title_auto("sess-title-1", False)
+    assert db.get_title_auto("sess-title-1") is False
+
+    db.set_title_auto("sess-title-1", True)
+    assert db.get_title_auto("sess-title-1") is True
+
+
+def test_get_title_auto_missing_session_defaults_true(fresh_db):
+    """No row at all (e.g. a stale/bogus session_id) falls back to True,
+    matching the column's own schema default rather than raising."""
+    assert db.get_title_auto("does-not-exist") is True
+
+
+def test_list_sessions_includes_title_auto(fresh_db):
+    admin = make_user("title-auto-list@example.com", "g-title-auto-list")
+    make_session("sess-title-2", admin["id"])
+    db.add_session_member("sess-title-2", admin["id"], "admin")
+
+    rows = db.list_sessions(admin["id"])
+    assert rows[0]["title_auto"] is True
+
+    db.set_title_auto("sess-title-2", False)
+    rows = db.list_sessions(admin["id"])
+    assert rows[0]["title_auto"] is False
+
+
+def test_migrate_title_auto_backfills_existing_sessions_as_true(tmp_path):
+    """Simulate a pre-existing DB (old schema shape: chat_sessions with no
+    title_auto column) and confirm init_db() adds the column, defaults
+    every existing row to auto-naming on (1/True), and is idempotent on a
+    second run.
+    """
+    path = str(tmp_path / "legacy-title-auto.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE users (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            google_id  TEXT UNIQUE NOT NULL,
+            email      TEXT UNIQUE NOT NULL,
+            name       TEXT,
+            avatar_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE chat_sessions (
+            id               TEXT PRIMARY KEY,
+            user_id          INTEGER NOT NULL REFERENCES users(id),
+            name             TEXT NOT NULL DEFAULT 'New Session',
+            finalized        INTEGER NOT NULL DEFAULT 0,
+            context_summary  TEXT NOT NULL DEFAULT '',
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO users (id, google_id, email, name, avatar_url) VALUES (1, 'g1', 'a@example.com', 'A', '');
+        INSERT INTO chat_sessions (id, user_id, name) VALUES ('legacy-title-1', 1, 'Legacy Title 1');
+    """)
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(chat_sessions)")}
+        assert "title_auto" in cols
+
+        row = conn.execute(
+            "SELECT title_auto FROM chat_sessions WHERE id = 'legacy-title-1'"
+        ).fetchone()
+        assert row["title_auto"] == 1
+    finally:
+        conn.close()
+
+    # Idempotent re-run: no error, value unchanged.
+    db.init_db(path)
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT title_auto FROM chat_sessions WHERE id = 'legacy-title-1'"
+        ).fetchone()
+        assert row[0] == 1
+    finally:
+        conn.close()

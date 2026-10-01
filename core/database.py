@@ -82,6 +82,7 @@ def init_db(db_path: str) -> None:
         _migrate_expense_proposals_fk(conn)
         _migrate_split_model(conn)
         _migrate_context_summary(conn)
+        _migrate_title_auto(conn)
 
 
 def create_db(db_path: str) -> None:
@@ -302,6 +303,28 @@ def _migrate_context_summary(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_title_auto(conn: sqlite3.Connection) -> None:
+    """One-time column migration for the auto-naming toggle (Task 11).
+
+    chat_sessions.title_auto tracks whether a session's name should keep
+    being auto-updated from bill/pending-proposal activity (see
+    server.py's _run_chat_turn and _session_name_from_agent) or whether the
+    user has taken over naming it manually. PATCH /api/sessions/{id}/name
+    flips this to 0 as a side effect of a manual rename; PATCH
+    /api/sessions/{id}/title-auto can flip it back to 1. Defaults to 1 (both
+    the column default below and get_title_auto()'s missing-row fallback) so
+    every pre-existing session keeps auto-naming until someone explicitly
+    renames it. Same add-column-if-missing pattern as every other post-hoc
+    chat_sessions column (_migrate_chat_sessions, _migrate_membership,
+    _migrate_context_summary). Safe to call on every startup.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+    if "title_auto" not in existing:
+        conn.execute(
+            "ALTER TABLE chat_sessions ADD COLUMN title_auto INTEGER NOT NULL DEFAULT 1"
+        )
+
+
 @contextmanager
 def _connect():
     conn = sqlite3.connect(_db_path)
@@ -353,16 +376,25 @@ def list_sessions(user_id: int) -> list[dict]:
     creator (see create_session's caller in server.py, and _migrate_membership
     for pre-existing rows), so this join always includes what the old
     owner-only query returned, plus sessions the user was only invited to.
+
+    Includes title_auto (coerced to a real bool) so the frontend's sidebar/
+    title-bar can render the auto-naming toggle's current state without a
+    second round trip per session.
     """
     with _connect() as conn:
         rows = conn.execute("""
-            SELECT cs.id, cs.name, cs.created_at, cs.updated_at
+            SELECT cs.id, cs.name, cs.created_at, cs.updated_at, cs.title_auto
             FROM chat_sessions cs
             JOIN session_members sm ON sm.session_id = cs.id
             WHERE sm.user_id = ?
             ORDER BY cs.updated_at DESC
         """, (user_id,)).fetchall()
-        return [dict(r) for r in rows]
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["title_auto"] = bool(d["title_auto"])
+            results.append(d)
+        return results
 
 
 def create_session(session_id: str, user_id: int, name: str = "New Session") -> None:
@@ -544,6 +576,30 @@ def rename_session_by_id(session_id: str, name: str) -> bool:
             UPDATE chat_sessions SET name = ? WHERE id = ?
         """, (name, session_id))
         return cursor.rowcount > 0
+
+
+def get_title_auto(session_id: str) -> bool:
+    """Whether session_id's name should still be auto-updated from bill/
+    pending-proposal activity (see server.py's _run_chat_turn). True for
+    every session until a manual rename (PATCH /api/sessions/{id}/name)
+    flips it off, or a later PATCH /api/sessions/{id}/title-auto call turns
+    it back on. Defaults to True if the session row is somehow missing,
+    matching the column's own schema default rather than raising."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT title_auto FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return bool(row["title_auto"]) if row else True
+
+
+def set_title_auto(session_id: str, auto: bool) -> None:
+    """Set session_id's auto-naming flag. Called with False from
+    rename_session (a manual edit should "win" until explicitly re-enabled)
+    and with either value from the dedicated title-auto endpoint."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET title_auto = ? WHERE id = ?", (int(auto), session_id)
+        )
 
 
 def delete_session_by_id(session_id: str) -> bool:

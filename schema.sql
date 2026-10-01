@@ -42,6 +42,11 @@
 -- below, same as every other column added after this table already existed
 -- in deployed databases.
 --
+-- Same story again for chat_sessions.title_auto: whether a session's name
+-- should keep being auto-updated from bill/pending-proposal activity (see
+-- server.py's _run_chat_turn) or whether the user has taken over naming it
+-- manually — added via ALTER TABLE in _migrate_title_auto().
+--
 -- Usage (local, requires the sqlite3 CLI — ships with macOS/most Linux):
 --   sqlite3 splitpro.db < schema.sql
 --
@@ -71,6 +76,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     name             TEXT NOT NULL DEFAULT 'New Session',
     finalized        INTEGER NOT NULL DEFAULT 0,
     context_summary  TEXT NOT NULL DEFAULT '',
+    title_auto       INTEGER NOT NULL DEFAULT 1,
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

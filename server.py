@@ -138,6 +138,10 @@ class RenameRequest(BaseModel):
     name: str
 
 
+class TitleAutoRequest(BaseModel):
+    auto: bool
+
+
 class AddMemberRequest(BaseModel):
     email: str
 
@@ -276,16 +280,31 @@ def _run_chat_turn(
     """
     with _get_session_lock(session_id):
         agent = _get_agent(session_id, user)
-        prev_bill_count = len(agent.state.bills)
+
+        # Auto-renaming is driven by bills *plus* pending proposals, not
+        # just bills: add_bill only creates a pending proposal and doesn't
+        # touch agent.state.bills until an admin approves it, so a trigger
+        # keyed on state.bills alone would never fire for a session sitting
+        # on an unapproved bill. Skipped entirely once the user has taken
+        # over naming this session manually (title_auto=False, set by the
+        # PATCH .../name endpoint) — title_auto is checked once up front so
+        # a manually-named session doesn't even pay for the extra
+        # count_pending_proposals() query below.
+        title_auto = db.get_title_auto(session_id)
+        prev_count = (
+            len(agent.state.bills) + db.count_pending_proposals(session_id)
+            if title_auto else None
+        )
 
         response = agent.chat(agent_message, speaker_name=speaker_name, speaker_user_id=user["id"])
         persist_user_message()
         db.add_chat_message(session_id, "agent", response)
 
-        # Auto-rename session when first bill is added
         new_name: Optional[str] = None
-        if len(agent.state.bills) > prev_bill_count:
-            new_name = _session_name_from_agent(agent)
+        if title_auto:
+            new_count = len(agent.state.bills) + db.count_pending_proposals(session_id)
+            if new_count > prev_count:
+                new_name = _session_name_from_agent(agent, session_id)
 
         _save_agent(session_id, agent, name=new_name)
         state = _serialize_state(agent.state, session_id)
@@ -380,10 +399,27 @@ def _maybe_summarize_context(session_id: str) -> None:
             _summarizing_sessions.discard(session_id)
 
 
-def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
-    """Return the first bill description if bills exist, else None."""
+def _session_name_from_agent(agent: ChatAgent, session_id: str) -> Optional[str]:
+    """Return a name to auto-rename the session to, or None if there's
+    nothing usable yet.
+
+    Prefers the first *approved* bill's description. A bill only lands in
+    agent.state.bills once an admin approves the expense proposal that
+    created it (see core/database.py's decide_proposal) — before that it
+    only exists as a pending proposal, so without this fallback a session
+    sitting on an unapproved bill would never get auto-renamed away from
+    "New Session" no matter how long the conversation runs. Falls back to
+    the first pending proposal with a non-empty description; if none of
+    them have one (e.g. a bill proposal still mid-construction), returns
+    None rather than renaming to something empty, same as the old
+    no-bills-yet behavior.
+    """
     if agent.state.bills:
         return agent.state.bills[0].description
+    for proposal in db.list_pending_proposals(session_id):
+        description = proposal["payload"].get("description")
+        if description:
+            return description
     return None
 
 
@@ -512,12 +548,34 @@ def rename_session(
     req: RenameRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Rename a session. Any member may rename — no admin requirement."""
+    """Rename a session. Any member may rename — no admin requirement.
+
+    Always turns off auto-naming (title_auto=False) as a side effect — a
+    manual edit should "win" over the next bill/proposal auto-rename, same
+    as the normal expectation that a manual edit sticks until the user
+    explicitly opts back into auto-naming via PATCH .../title-auto.
+    """
     _require_member(session_id, user)
     updated = db.rename_session_by_id(session_id, req.name)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"name": req.name}
+    db.set_title_auto(session_id, False)
+    return {"name": req.name, "title_auto": False}
+
+
+@app.patch("/api/sessions/{session_id}/title-auto")
+def set_session_title_auto(
+    session_id: str,
+    req: TitleAutoRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Toggle a session's auto-naming flag — mainly used to turn it back on
+    after a manual rename turned it off (see rename_session), though it also
+    accepts turning it off directly. Any member may toggle it, same as
+    rename_session."""
+    _require_member(session_id, user)
+    db.set_title_auto(session_id, req.auto)
+    return {"title_auto": req.auto}
 
 
 @app.delete("/api/sessions/{session_id}")
