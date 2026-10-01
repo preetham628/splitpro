@@ -877,30 +877,42 @@ def decide_proposal(proposal_id: int, decided_by: int, decision: str) -> dict:
                 (session_id, payload["bill_id"]),
             ).fetchone()
 
-            if existing_bill is None:
-                cursor = conn.execute("""
-                    INSERT INTO bills
-                        (session_id, bill_id, description, raw_text, tax, tip, paid_by,
-                         approved_by, approved_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (session_id, payload["bill_id"], payload.get("description", ""),
-                      payload.get("raw_text", ""), payload.get("tax", 0), payload.get("tip", 0),
-                      json.dumps(payload.get("paid_by") or {}), decided_by, now))
-                bill_row_id = cursor.lastrowid
+            if payload.get("action") == "remove_bill":
+                # This proposal's only intent is to delete the target bill
+                # (and its items), never to insert/update one — so it skips
+                # the insert-or-update logic below entirely. A missing
+                # existing_bill is a legitimate no-op (e.g. the bill was
+                # already removed by a different route): the proposal still
+                # gets marked approved above, it just has nothing left to do.
+                if existing_bill is not None:
+                    bill_row_id = existing_bill["id"]
+                    conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_row_id,))
+                    conn.execute("DELETE FROM bills WHERE id = ?", (bill_row_id,))
             else:
-                bill_row_id = existing_bill["id"]
-                conn.execute("""
-                    UPDATE bills
-                    SET description = ?, raw_text = ?, tax = ?, tip = ?, paid_by = ?,
-                        approved_by = ?, approved_at = ?
-                    WHERE id = ?
-                """, (payload.get("description", ""), payload.get("raw_text", ""),
-                      payload.get("tax", 0), payload.get("tip", 0),
-                      json.dumps(payload.get("paid_by") or {}),
-                      decided_by, now, bill_row_id))
-                conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_row_id,))
+                if existing_bill is None:
+                    cursor = conn.execute("""
+                        INSERT INTO bills
+                            (session_id, bill_id, description, raw_text, tax, tip, paid_by,
+                             approved_by, approved_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (session_id, payload["bill_id"], payload.get("description", ""),
+                          payload.get("raw_text", ""), payload.get("tax", 0), payload.get("tip", 0),
+                          json.dumps(payload.get("paid_by") or {}), decided_by, now))
+                    bill_row_id = cursor.lastrowid
+                else:
+                    bill_row_id = existing_bill["id"]
+                    conn.execute("""
+                        UPDATE bills
+                        SET description = ?, raw_text = ?, tax = ?, tip = ?, paid_by = ?,
+                            approved_by = ?, approved_at = ?
+                        WHERE id = ?
+                    """, (payload.get("description", ""), payload.get("raw_text", ""),
+                          payload.get("tax", 0), payload.get("tip", 0),
+                          json.dumps(payload.get("paid_by") or {}),
+                          decided_by, now, bill_row_id))
+                    conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_row_id,))
 
-            _insert_bill_items(conn, bill_row_id, payload.get("items", []))
+                _insert_bill_items(conn, bill_row_id, payload.get("items", []))
 
         result = dict(row)
         result["payload"] = json.loads(result["payload"])
