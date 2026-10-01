@@ -68,11 +68,11 @@ def sample_payload(bill_id="bill_1", description="Dinner"):
         "raw_text": "raw text",
         "items": [
             {"name": "Burger", "price": 10.0, "qty": 1, "assigned_to": ["Alice"],
-             "shared": False, "unassigned": False, "qty_allocations": {}}
+             "shared": False, "unassigned": False, "cost_allocations": {}}
         ],
         "tax": 1.0,
         "tip": 2.0,
-        "paid_by": "Alice",
+        "paid_by": {"Alice": 13.0},
     }
 
 

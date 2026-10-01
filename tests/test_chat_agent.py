@@ -90,7 +90,7 @@ def test_add_bill_stages_a_pending_proposal_not_state_bill(fresh_db):
     assert len(pending) == 1
     assert pending[0]["proposed_by"] == alice["id"]
     assert pending[0]["payload"]["description"] == "Pizza night"
-    assert pending[0]["payload"]["paid_by"] is None
+    assert pending[0]["payload"]["paid_by"] == {}
 
 
 def test_add_bill_legacy_path_when_no_current_user(fresh_db):
@@ -135,10 +135,10 @@ def test_assign_items_updates_pending_proposal_in_place(fresh_db):
     assert pending[0]["payload"]["items"][0]["assigned_to"] == ["Alice", "Bob"]
 
     msg = set_payer.invoke(
-        {"bill_id": bill_id, "paid_by": "alice"}, config=as_speaker(bob["id"])
+        {"bill_id": bill_id, "payers": [{"name": "alice"}]}, config=as_speaker(bob["id"])
     )
     assert "still awaiting admin approval" in msg
-    assert db.list_pending_proposals(session_id)[0]["payload"]["paid_by"] == "Alice"
+    assert db.list_pending_proposals(session_id)[0]["payload"]["paid_by"] == {"Alice": 30.0}
 
 
 def test_assign_items_unknown_bill_id_error_lists_pending_proposals(fresh_db):
@@ -198,11 +198,11 @@ def test_correction_to_approved_bill_creates_superseding_proposal(fresh_db):
 
     # Reload state the way server.py's _get_agent()/set_state() would after approval.
     approved_state = SessionState.from_dict(db.load_session_state(session_id))
-    assert approved_state.bills[0].paid_by is None
+    assert approved_state.bills[0].paid_by == {}
 
     _add2, _set_p2, _assign2, set_payer2, _mark2, _calc2 = _build_tools(approved_state, session_id)
     msg = set_payer2.invoke(
-        {"bill_id": bill_id, "paid_by": "Alice"}, config=as_speaker(bob["id"])
+        {"bill_id": bill_id, "payers": [{"name": "Alice"}]}, config=as_speaker(bob["id"])
     )
 
     assert "already approved" in msg
@@ -210,13 +210,13 @@ def test_correction_to_approved_bill_creates_superseding_proposal(fresh_db):
 
     # The original approved bill must stay untouched until the correction itself is approved.
     still_untouched = SessionState.from_dict(db.load_session_state(session_id))
-    assert still_untouched.bills[0].paid_by is None
+    assert still_untouched.bills[0].paid_by == {}
     assert len(still_untouched.bills) == 1
 
     pending = db.list_pending_proposals(session_id)
     assert len(pending) == 1
     assert pending[0]["supersedes_bill_id"] == approved_row_id
-    assert pending[0]["payload"]["paid_by"] == "Alice"
+    assert pending[0]["payload"]["paid_by"] == {"Alice": 30.0}
     assert pending[0]["proposed_by"] == bob["id"]
 
     # Approving the correction updates the SAME bill row, not a duplicate.
@@ -224,7 +224,7 @@ def test_correction_to_approved_bill_creates_superseding_proposal(fresh_db):
     final_state = SessionState.from_dict(db.load_session_state(session_id))
     assert len(final_state.bills) == 1
     assert final_state.bills[0].bill_id == bill_id
-    assert final_state.bills[0].paid_by == "Alice"
+    assert final_state.bills[0].paid_by == {"Alice": 30.0}
 
 
 def test_known_bill_ids_dedupes_a_correction_sharing_its_approved_bills_id(fresh_db):
@@ -253,7 +253,7 @@ def test_known_bill_ids_dedupes_a_correction_sharing_its_approved_bills_id(fresh
 
     # Propose a correction (same bill_id) so it now exists in BOTH
     # approved_state.bills and the pending-proposals list simultaneously.
-    set_payer2.invoke({"bill_id": bill_id, "paid_by": "Alice"}, config=as_speaker(bob["id"]))
+    set_payer2.invoke({"bill_id": bill_id, "payers": [{"name": "Alice"}]}, config=as_speaker(bob["id"]))
     assert len(db.list_pending_proposals(session_id)) == 1
 
     msg = assign_items2.invoke({
