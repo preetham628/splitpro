@@ -13,13 +13,13 @@ from uuid import uuid4
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agents.chat_agent import ChatAgent
+from agents.chat_agent import ChatAgent, summarize_rounds
 from agents.image_analyzer import ImageAnalyzer
 from config import ChatAgentConfig, load_config
 from core import auth as auth_module
@@ -270,6 +270,45 @@ def _run_chat_turn(
         state = _serialize_state(agent.state, session_id)
 
     return response, state
+
+
+def _maybe_summarize_context(session_id: str) -> None:
+    """Background task (see chat()/upload_image() below): check whether this
+    session's checkpointed message history has grown past the sliding
+    window (or the raw-message safety net — see agents/chat_agent.py's
+    ROUND_WINDOW/MESSAGE_SAFETY_NET), and if so, fold the oldest rounds into
+    context_summary.
+
+    Scheduled via BackgroundTasks.add_task, which FastAPI only runs *after*
+    the triggering request's response has already been sent — so however
+    long this takes adds zero latency to that request.
+
+    Two phases, matching ChatAgent.plan_context_summarization /
+    summarize_rounds / apply_context_summarization:
+      1. The slow LLM call (summarize_rounds) runs with no lock held at
+         all, so it never blocks a concurrent chat turn for this session.
+      2. Only the final checkpoint-surgery + context_summary persist step
+         (apply_context_summarization) takes this session's existing
+         per-session lock — the same one _run_chat_turn uses for a whole
+         turn — and only for that brief step.
+    """
+    agent = sessions.get(session_id)
+    if agent is None:
+        # Session was deleted (or its cache entry otherwise evicted) between
+        # the triggering turn finishing and this task running — nothing
+        # left to summarize.
+        return
+
+    plan = agent.plan_context_summarization()
+    if plan is None:
+        return
+    messages_to_summarize, ids_to_remove = plan
+
+    existing_summary = db.get_context_summary(session_id)
+    new_summary = summarize_rounds(agent.config, existing_summary, messages_to_summarize)
+
+    with _get_session_lock(session_id):
+        agent.apply_context_summarization(ids_to_remove, new_summary)
 
 
 def _session_name_from_agent(agent: ChatAgent) -> Optional[str]:
@@ -600,6 +639,7 @@ def reject_proposal(
 def chat(
     session_id: str,
     req: ChatRequest,
+    background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
 ):
     speaker_name = _speaker_name(user)
@@ -612,6 +652,11 @@ def chat(
             session_id, "user", req.message, user_id=user["id"]
         ),
     )
+    # Scheduled after the response above is already built — BackgroundTasks
+    # only runs this once the response has been sent, so a long-running
+    # summarization here adds no latency to this request. See
+    # _maybe_summarize_context's docstring for the two-phase lock design.
+    background_tasks.add_task(_maybe_summarize_context, session_id)
     return ChatResponse(response=response, state=state)
 
 
@@ -642,6 +687,7 @@ def end_session(session_id: str, user: dict = Depends(get_current_user)):
 @app.post("/sessions/{session_id}/image", response_model=ChatResponse)
 async def upload_image(
     session_id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
 ):
@@ -695,6 +741,9 @@ async def upload_image(
             user_id=user["id"],
         ),
     )
+    # See the matching comment in chat() — scheduled only after the response
+    # above is already built, so it adds no latency to this request.
+    background_tasks.add_task(_maybe_summarize_context, session_id)
     return ChatResponse(response=response, state=state)
 
 

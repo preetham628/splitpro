@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Annotated, Dict, Optional, TypedDict
+from typing import Annotated, Dict, List, Optional, Tuple, TypedDict
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
@@ -19,6 +19,120 @@ from core.session_state import LineItem, ParsedBill, SessionState, validate_cont
 from core.settlement import Settlement
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Sliding-window context management (Task 10)
+#
+# Every turn sends the *entire* checkpointed message history to the LLM —
+# fine for a short session, a real cost/latency/context-limit problem for a
+# long-running multi-user group chat. The actual financial data (bills,
+# items, assignments) is never derived from this history — it's rebuilt
+# fresh from the DB into the system prompt every turn (state_summary() /
+# _pending_proposals_summary()) — so conversation history here is only
+# load-bearing for short-term dialogue coherence, never financial
+# correctness, which is what makes a small window + aggressive
+# summarization safe.
+#
+# Unit of counting is "rounds," not raw messages: a round is one
+# HumanMessage plus everything the agent did in response to it (however
+# many tool-call/tool-result pairs that took). Raw messages were rejected as
+# the counting unit in design — tool-call-heavy activity in a busy
+# multi-user session would inflate a raw count fast and trigger
+# summarization constantly, compounding lossy summaries on top of each
+# other for no good reason. An independent raw-message safety net still
+# exists below for the edge case of one enormous round.
+# ---------------------------------------------------------------------------
+
+ROUND_WINDOW = 8        # rounds kept verbatim before a trim is triggered
+ROUNDS_TO_SUMMARIZE = 4  # oldest rounds folded into the running summary per trim
+MESSAGE_SAFETY_NET = 40  # raw checkpoint message ceiling, independent of round count —
+                         # covers a single round with a huge number of tool calls
+
+
+def _round_start_indices(messages: list) -> List[int]:
+    """Index of each round's first message within `messages`. A round always
+    starts at a HumanMessage and runs up to (not including) the next
+    HumanMessage or the end of the list — so cutting at one of these indices
+    can never split a tool-call from its matching tool-response."""
+    return [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+
+
+def _exceeds_summarization_thresholds(messages: list) -> bool:
+    """True once either trigger fires: more rounds than ROUND_WINDOW kept
+    verbatim, or the raw-message safety net — independent of round count,
+    for the edge case of a single round with a huge number of tool calls
+    (e.g. a giant pasted bill)."""
+    round_count = len(_round_start_indices(messages))
+    return round_count > ROUND_WINDOW or len(messages) > MESSAGE_SAFETY_NET
+
+
+def _render_messages_for_summary(messages: list) -> str:
+    """Plain-text rendering of a message slice for the summarization prompt
+    below — just enough structure (who said what, which tools were called)
+    for the model to fold into a running summary; not meant to be shown to
+    users."""
+    lines = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            role = "User"
+        elif isinstance(m, ToolMessage):
+            role = "Tool result"
+        else:
+            role = "Assistant"  # AIMessage, or any other message type
+
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        tool_calls = getattr(m, "tool_calls", None)
+        if tool_calls:
+            calls = "; ".join(f"{tc.get('name')}({tc.get('args')})" for tc in tool_calls)
+            content = f"{content} [called: {calls}]".strip()
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+_SUMMARIZATION_PROMPT = """You maintain a running summary of the earlier portion of a bill-splitting \
+group chat, for an AI assistant's own short-term memory — it is never shown to users. Merge the \
+EXISTING SUMMARY (if any) with the NEW MESSAGES below into one updated summary.
+
+Keep: names, who said what, tone, open questions, anything relevant to the flow of the \
+conversation itself.
+Drop: specific bill totals, item prices, or split amounts — that data is always rebuilt fresh \
+from the database every turn, so repeating it here would be redundant or go stale.
+
+Keep it brief — a short paragraph at most.
+
+EXISTING SUMMARY:
+{existing_summary}
+
+NEW MESSAGES TO FOLD IN:
+{conversation}
+
+Updated summary:"""
+
+
+def summarize_rounds(config: ChatAgentConfig, existing_summary: str, messages: list) -> str:
+    """Phase 1 of context summarization — slow, unlocked. Produces a new
+    merged context_summary string from the existing summary plus the
+    messages about to be trimmed from the checkpoint. Pure/stateless (no
+    checkpoint or lock access), so it's safe to run outside the per-session
+    lock: a slow LLM call here must never block a concurrent chat turn for
+    the same session. Reuses the session's own already-configured chat
+    model (create_llm) — no separate provider config needed."""
+    llm = create_llm(config)
+    prompt = _SUMMARIZATION_PROMPT.format(
+        existing_summary=existing_summary or "(none yet)",
+        conversation=_render_messages_for_summary(messages),
+    )
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = response.content
+    if not isinstance(content, str):
+        # A handful of providers can return content as a list of blocks
+        # rather than a plain string — flatten defensively rather than
+        # persist a stringified list as the summary.
+        content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part) for part in content
+        )
+    return content.strip()
+
 
 SYSTEM_PROMPT_TEMPLATE = """You are SplitPro, a friendly assistant that helps groups split restaurant bills fairly.
 
@@ -192,6 +306,18 @@ def _pending_proposals_summary(session_id: str) -> str:
         tag = " [correction to an approved bill]" if p.get("supersedes_bill_id") else ""
         lines.append(f"  [{payload['bill_id']}] {payload.get('description', '')}{tag}")
     return "\n".join(lines)
+
+
+def _context_summary_section(session_id: str) -> str:
+    """Render the session's running conversation summary (see
+    summarize_rounds / ChatAgent.apply_context_summarization) for inclusion
+    in the system prompt, parallel to _pending_proposals_summary above —
+    '' (the common case, most sessions never trim anything) means no
+    section is added at all."""
+    summary = db.get_context_summary(session_id)
+    if not summary:
+        return ""
+    return f"EARLIER CONVERSATION (summarized):\n{summary}"
 
 
 def _load_bill_for_edit(
@@ -1064,6 +1190,14 @@ class ChatAgent:
         self.state = SessionState()
         self._rebuild()
 
+    @property
+    def config(self) -> ChatAgentConfig:
+        """This session's chat model config — exposed so server.py's
+        background context-summarization task can pass the same
+        provider/model into summarize_rounds() without reaching into a
+        private attribute."""
+        return self._config
+
     def _rebuild(self) -> None:
         """(Re)build tools/llm/graph bound to the current self.state.
 
@@ -1086,20 +1220,108 @@ class ChatAgent:
     def _agent_node(self, graph_state: GraphState, config: RunnableConfig) -> dict:
         """Render the system prompt fresh from live state on every call —
         same dynamic-prompt behavior as the original hand-rolled loop, plus
-        still-pending proposals when this turn has a DB-backed speaker (see
-        _pending_proposals_summary) so the model doesn't lose track of a
-        bill it just proposed before an admin has approved it."""
+        still-pending proposals and an earlier-conversation summary when
+        this turn has a DB-backed speaker (see _pending_proposals_summary /
+        _context_summary_section) so the model doesn't lose track of a bill
+        it just proposed, or of dialogue context trimmed from the
+        checkpoint by the sliding-window context manager."""
         summary = self.state.state_summary()
         if _speaker_user_id(config) is not None:
             pending_summary = _pending_proposals_summary(self.session_id)
             if pending_summary:
                 summary = f"{summary}\n\n{pending_summary}"
 
+            context_summary = _context_summary_section(self.session_id)
+            if context_summary:
+                summary = f"{summary}\n\n{context_summary}"
+
         system_message = SystemMessage(
             content=SYSTEM_PROMPT_TEMPLATE.format(state_summary=summary)
         )
         response = self._llm_with_tools.invoke([system_message] + graph_state["messages"])
         return {"messages": [response]}
+
+    def checkpoint_messages(self) -> list:
+        """Current raw checkpointed message list for this session (empty if
+        none yet) — a read-only snapshot via the compiled graph's
+        get_state(). Safe to call without the session lock (server.py's
+        background summarization task does, as the "unlocked phase" of its
+        two-phase design); a caller that goes on to mutate the checkpoint
+        based on this snapshot (apply_context_summarization) re-checks
+        against a fresh read once the lock is actually held."""
+        config = {"configurable": {"thread_id": self.session_id}}
+        snapshot = self._graph.get_state(config)
+        return list(snapshot.values.get("messages", []))
+
+    def needs_context_summarization(self) -> bool:
+        """Whether this session's checkpointed history has grown past the
+        sliding window (or the raw-message safety net) and should be
+        folded into context_summary. See module-level ROUND_WINDOW /
+        MESSAGE_SAFETY_NET and _exceeds_summarization_thresholds."""
+        return _exceeds_summarization_thresholds(self.checkpoint_messages())
+
+    def plan_context_summarization(self) -> Optional[Tuple[list, List[str]]]:
+        """If summarization is currently warranted, snapshot the oldest
+        rounds to fold away and return (messages_to_summarize, their
+        message ids) — the input to summarize_rounds()'s slow, unlocked
+        LLM call. Returns None if nothing needs to happen right now.
+
+        Summarizes at most ROUNDS_TO_SUMMARIZE oldest rounds, capped to
+        always leave at least one round verbatim — there's no older round
+        left to fold away when the whole history is just one (possibly
+        enormous) in-progress-looking round, and collapsing the only round
+        would destroy the immediate context the window exists to protect.
+        Cuts always land on a round boundary (see _round_start_indices), so
+        a tool-call message can never be separated from its tool-response.
+        """
+        messages = self.checkpoint_messages()
+        if not _exceeds_summarization_thresholds(messages):
+            return None
+
+        boundaries = _round_start_indices(messages)
+        round_count = len(boundaries)
+        n = min(ROUNDS_TO_SUMMARIZE, max(round_count - 1, 0))
+        if n <= 0:
+            return None
+
+        cut = boundaries[n] if n < round_count else len(messages)
+        to_summarize = messages[:cut]
+        if not to_summarize:
+            return None
+        return to_summarize, [m.id for m in to_summarize]
+
+    def apply_context_summarization(self, message_ids_to_remove: List[str], new_summary: str) -> bool:
+        """Phase 2 of context summarization — fast, locked. Callers (the
+        background task in server.py) must already hold this session's
+        per-session lock before calling this; it is not acquired here, so
+        there is exactly one lock per session guarding this alongside every
+        other mutation of the session's checkpoint/state.
+
+        Re-fetches the current checkpoint state and defensively re-confirms
+        every id in message_ids_to_remove is still present — a guard
+        against the (unlikely, since there's only one summarization trigger
+        path today) race where the session was independently trimmed since
+        the snapshot these ids came from was taken. Returns False (a no-op)
+        if that guard fails or there's nothing to remove; True once the
+        checkpoint surgery and the context_summary persist have both
+        completed.
+        """
+        if not message_ids_to_remove:
+            return False
+
+        config = {"configurable": {"thread_id": self.session_id}}
+        snapshot = self._graph.get_state(config)
+        current_ids = {m.id for m in snapshot.values.get("messages", [])}
+        if not set(message_ids_to_remove).issubset(current_ids):
+            return False
+
+        self._graph.update_state(
+            config,
+            {"messages": [RemoveMessage(id=mid) for mid in message_ids_to_remove]},
+            as_node="agent",
+        )
+        db.set_context_summary(self.session_id, new_summary)
+        return True
 
     def set_state(self, state: SessionState) -> None:
         """Replace the bill-splitting state (e.g. when restoring a session

@@ -81,6 +81,7 @@ def init_db(db_path: str) -> None:
         _migrate_membership(conn)
         _migrate_expense_proposals_fk(conn)
         _migrate_split_model(conn)
+        _migrate_context_summary(conn)
 
 
 def create_db(db_path: str) -> None:
@@ -283,6 +284,22 @@ def _migrate_split_model(conn: sqlite3.Connection) -> None:
                     (json.dumps(cost_allocations), item["id"]),
                 )
         conn.execute("ALTER TABLE bill_items DROP COLUMN qty_allocations")
+
+
+def _migrate_context_summary(conn: sqlite3.Connection) -> None:
+    """One-time column migration for the sliding-window context manager
+    (see agents/chat_agent.py). chat_sessions.context_summary holds a
+    running natural-language summary of conversation rounds that have been
+    trimmed out of LangGraph's own checkpoint tables (core/checkpointer.py)
+    to keep each turn's prompt bounded — same add-column-if-missing pattern
+    as every other post-hoc chat_sessions column (_migrate_chat_sessions,
+    _migrate_membership). Safe to call on every startup.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+    if "context_summary" not in existing:
+        conn.execute(
+            "ALTER TABLE chat_sessions ADD COLUMN context_summary TEXT NOT NULL DEFAULT ''"
+        )
 
 
 @contextmanager
@@ -490,6 +507,30 @@ def list_chat_messages(session_id: str) -> list[dict]:
             ORDER BY id
         """, (session_id,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_context_summary(session_id: str) -> str:
+    """Return the session's running conversation summary (see
+    agents/chat_agent.py's sliding-window context manager), or '' if none
+    has been generated yet (schema default, and the common case for most
+    sessions — only long-running ones ever trim anything)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT context_summary FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return row["context_summary"] if row else ""
+
+
+def set_context_summary(session_id: str, summary: str) -> None:
+    """Persist the context manager's updated running summary. Called from
+    the locked, fast phase of context summarization (see
+    ChatAgent.apply_context_summarization) — deliberately a single-column
+    UPDATE with no read-modify-write of the rest of the row, so it can't
+    clobber a concurrent save_session_state() write to the same row."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET context_summary = ? WHERE id = ?", (summary, session_id)
+        )
 
 
 def rename_session_by_id(session_id: str, name: str) -> bool:
