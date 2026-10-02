@@ -19,6 +19,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     UploadFile,
     WebSocket,
@@ -316,6 +317,17 @@ class SessionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    # Opaque id the frontend generates fresh for every sendToAgent()/
+    # sendImageToAgent() call, round-tripped verbatim into this turn's WS
+    # broadcast (see _run_chat_turn) so the sending *tab* — not merely the
+    # sending *user* — can recognize the broadcast as its own echo. See
+    # app.js's pendingRequestTokens for the full rationale: a same-user,
+    # same-session, two-tab scenario can't be disambiguated from role+user_id
+    # alone, since both tabs' in-flight turns look identical by that measure.
+    # Optional/defaulted so older frontends (or direct API callers) that
+    # don't send it see no change in behavior — the broadcast's
+    # client_request_id is simply None, which can't match any tab's token.
+    client_request_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -449,6 +461,7 @@ def _run_chat_turn(
     agent_message: str,
     speaker_name: str,
     persist_user_message: Callable[[], dict],
+    client_request_id: Optional[str] = None,
 ) -> tuple[str, dict, list[int]]:
     """Run one full chat turn — agent lookup/creation, the model call,
     persistence, and the response's state snapshot — as a single critical
@@ -481,6 +494,12 @@ def _run_chat_turn(
     guarantee relative to this REST response reaching the same tab) has a
     chance to arrive and get appended a second time. See app.js's
     renderedMessageIds for the other half of this.
+
+    `client_request_id` is opaque here — just round-tripped into the
+    broadcast payload verbatim (including None, for callers that don't pass
+    one) so the sending *tab* can recognize its own echo even in the window
+    before this function returns and the id-based mechanism above has
+    anything to match against yet. See app.js's pendingRequestTokens.
 
     Synchronous end-to-end — callers on an async path (upload_image) must
     run this via asyncio.to_thread so the lock (a plain threading.Lock)
@@ -525,6 +544,7 @@ def _run_chat_turn(
         "type": "messages",
         "messages": [user_message_row, agent_message_row],
         "state": state,
+        "client_request_id": client_request_id,
     })
 
     return response, state, [user_message_row["id"], agent_message_row["id"]]
@@ -1052,6 +1072,7 @@ def chat(
         persist_user_message=lambda: db.add_chat_message(
             session_id, "user", req.message, user_id=user["id"]
         ),
+        client_request_id=req.client_request_id,
     )
     # Checked (cheap) and scheduled (only if actually needed) after the
     # response above is already built — BackgroundTasks only runs the task
@@ -1092,6 +1113,11 @@ async def upload_image(
     session_id: str,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    # See ChatRequest.client_request_id's docstring — same mechanism, just a
+    # multipart form field here since this endpoint takes UploadFile rather
+    # than a JSON body. Optional/defaulted for the same backward-compat
+    # reason.
+    client_request_id: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
     # Cheap, read-only membership check for early rejection — deliberately
@@ -1143,6 +1169,7 @@ async def upload_image(
             session_id, "user", "", image_base64=image_b64, image_media_type=content_type,
             user_id=user["id"],
         ),
+        client_request_id=client_request_id,
     )
     # See the matching comment in chat() — checked and scheduled only after
     # the response above is already built, so it adds no latency to this

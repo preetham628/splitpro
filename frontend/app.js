@@ -51,31 +51,56 @@ let socket          = null;
 let socketSessionId = null;
 let socketReconnectTimer    = null;
 let socketReconnectAttempts = 0;
-// Session ids with a sendToAgent()/sendImageToAgent() REST call currently in
-// flight *for this tab*. The server broadcasts a turn's new messages to
-// every open socket on the session, including the one belonging to the tab
-// that sent it — but that tab already renders the user's message
-// (optimistically, in handleSend()) and the agent's reply (from the POST
-// response itself) via the existing REST flow, so appending them *again*
-// from the socket would duplicate every bubble this tab sends. Scoped by
-// session (a Set, not a single boolean) rather than gated solely by the
-// global `isLoading` flag, since loadSession() can switch the active
-// session while a turn for the *previous* one is still in flight (isLoading
-// doesn't block navigation) — a global flag would then also suppress the
-// new session's unrelated incoming messages until that stale turn resolved.
+// Map<sessionId, requestToken> of sendToAgent()/sendImageToAgent() REST
+// calls currently in flight *for this tab*, keyed by the session the call
+// was issued for. The server broadcasts a turn's new messages to every open
+// socket on the session, including the one belonging to the tab that sent
+// it — but that tab already renders the user's message (optimistically, in
+// handleSend()) and the agent's reply (from the POST response itself) via
+// the existing REST flow, so appending them *again* from the socket would
+// duplicate every bubble this tab sends. Scoped by session (a Map, not a
+// single variable) rather than gated solely by the global `isLoading` flag,
+// since loadSession() can switch the active session while a turn for the
+// *previous* one is still in flight (isLoading doesn't block navigation) —
+// a global flag would then also suppress the new session's unrelated
+// incoming messages until that stale turn resolved.
 //
-// IMPORTANT: this only identifies *which session* has one of this tab's own
-// turns in flight — it says nothing about *who sent* a given incoming
-// broadcast for that session. handleSocketPayload below must not treat
-// membership in this set as "drop the whole payload": two different
-// members can have turns in flight on the same session at the same time
-// (e.g. Alice's own turn is pending while Bob, a different member, sends a
-// concurrent message), and Bob's broadcast arriving while Alice's own turn
-// is still in flight must still be rendered for Alice. This set only tells
-// handleSocketPayload "a payload whose user-message sender is *me* during
-// this window is my own echo"; it's never a reason to drop someone else's
-// message.
-let awaitingOwnTurnSessions = new Set();
+// `requestToken` is a fresh random id generated per call (see
+// generateRequestToken()), sent to the server as client_request_id and
+// round-tripped verbatim into that turn's WS broadcast (see server.py's
+// _run_chat_turn). This — not session id, and not role+user_id — is what
+// handleSocketPayload matches a broadcast against to decide "is this *my*
+// pending call's echo". Two earlier, coarser attempts at this both turned
+// out to cause silent, permanent message loss, which is why this is keyed
+// on the specific request rather than session or user:
+//
+//   - Keying purely on "a turn is in flight for this session" (dropping the
+//     whole payload) also swallows a genuinely different member's unrelated
+//     concurrent message on the same session — the whole point of real-time
+//     sync, and the opposite of what this suppression is for.
+//   - Keying on "a turn is in flight for this session AND the broadcast's
+//     user-message sender is *me*" fixes that, but still can't tell *which
+//     of this user's own tabs* a broadcast belongs to: if the same user has
+//     the same session open in two tabs with both tabs' turns in flight at
+//     once, each tab's broadcast looks identical to the other tab by that
+//     measure (same role, same user_id, same session) — so one tab's own
+//     turn gets wrongly eaten as the other tab's "own echo" and never
+//     appended.
+//
+// A random per-call token sidesteps both: it's unique per tab per call, so
+// it can only ever match the broadcast for *this exact* outstanding
+// request, never another tab's (even the same user's) concurrent one, and
+// never a different member's.
+let pendingRequestTokens = new Map();
+
+// Generates an id unique enough to correlate this tab's one outstanding
+// chat/image REST call with its own WS broadcast — not a security token, so
+// Math.random() plus the current time is more than sufficient; no need for
+// crypto.randomUUID() (unsupported in some older WebView/test environments).
+function generateRequestToken() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 // DB-assigned ids (ChatMessage.id, globally unique) of every chat message
 // already rendered into the current session's DOM — the primary mechanism
 // for not double-rendering a message: handleSocketPayload skips appending
@@ -95,10 +120,10 @@ let awaitingOwnTurnSessions = new Set();
 // optimistically-rendered bubble (appended immediately in handleSend(),
 // before the request is even sent) is never tagged with a DB id or
 // reconciled once the real id is known, so id-based dedup has nothing to
-// match against yet in that window. That's the gap awaitingOwnTurnSessions
+// match against yet in that window. That's the gap pendingRequestTokens
 // above covers: it's set synchronously before the REST call is even issued,
 // so it's guaranteed to still be set for the whole time the server could
-// possibly be sending this turn's broadcast, closing the window this set
+// possibly be sending this turn's broadcast, closing the window this map
 // can't.
 let renderedMessageIds = new Set();
 
@@ -502,19 +527,20 @@ function handleSocketPayload(id, payload) {
   if (payload.state) renderState(payload.state);
 
   if (payload.messages) {
-    // A turn's broadcast is "my own echo" only if *this* tab has a turn of
-    // its own in flight for this session AND the payload's user-authored
-    // message was actually sent by the current user — i.e. it's the exact
-    // turn this tab is waiting on, not merely *a* turn on a session this
-    // tab also happens to be mid-turn on. Checking awaitingOwnTurnSessions
-    // alone (without the sender check) would also swallow a different
-    // member's concurrent message on the same session, which is the whole
-    // point of this feature and must never be dropped. See
-    // awaitingOwnTurnSessions' own comment for why the sender check alone,
-    // without the awaiting-set, still isn't enough on its own.
-    const isOwnEcho = awaitingOwnTurnSessions.has(id) &&
-      !!currentUser &&
-      payload.messages.some(m => m.role === 'user' && m.user_id === currentUser.id);
+    // A turn's broadcast is "my own echo" only if *this tab* has a request
+    // of its own in flight for this session AND the broadcast carries that
+    // exact request's token back (see pendingRequestTokens' own comment for
+    // why: neither "a turn is in flight for this session" nor "...and sent
+    // by the current user" is precise enough — the former drops a different
+    // member's genuinely concurrent message, the latter still can't tell
+    // this tab's own in-flight turn apart from the *same user's* turn in
+    // another open tab on the same session). Matching the server-echoed
+    // client_request_id against the token this tab itself generated for its
+    // pending call is exact: it can only match this tab's own outstanding
+    // request, never another tab's or another member's.
+    const pendingToken = pendingRequestTokens.get(id);
+    const isOwnEcho = pendingToken !== undefined &&
+      payload.client_request_id === pendingToken;
     payload.messages.forEach(m => {
       // Primary de-dup layer: skip anything already rendered, whether by
       // this tab's own REST flow (sendToAgent/sendImageToAgent populate
@@ -523,11 +549,12 @@ function handleSocketPayload(id, payload) {
       if (renderedMessageIds.has(m.id)) return;
       renderedMessageIds.add(m.id);
       // Belt-and-suspenders for the sender's own turn only (see
-      // awaitingOwnTurnSessions' comment): this tab is about to render (or
+      // pendingRequestTokens' comment): this tab is about to render (or
       // already has rendered) these exact bubbles itself via the REST
       // response, so mark the id rendered but don't append a second time.
-      // Never applies to another member's concurrent message — isOwnEcho
-      // is false for those regardless of awaitingOwnTurnSessions.
+      // Never applies to another tab's or another member's concurrent
+      // message — isOwnEcho is false for those regardless of which
+      // sessions this tab happens to have a call pending on.
       if (isOwnEcho) return;
       const imageDataUrl = m.image_base64
         ? `data:${m.image_media_type};base64,${m.image_base64}`
@@ -1120,16 +1147,18 @@ async function sendToAgent(text) {
   // render the agent's reply itself from the POST response below (the
   // user's own message is already in the log, appended optimistically by
   // handleSend()), so the socket's echo of this same turn must be ignored
-  // rather than appended a second time. See awaitingOwnTurnSessions' own
-  // comment for why this is scoped per-session rather than a single flag.
-  awaitingOwnTurnSessions.add(requestSessionId);
+  // rather than appended a second time. See pendingRequestTokens' own
+  // comment for why a fresh per-call token (rather than just session id) is
+  // what gets tracked and sent to the server here.
+  const requestToken = generateRequestToken();
+  pendingRequestTokens.set(requestSessionId, requestToken);
   const typing = appendTyping();
   try {
     const res  = await fetch(`${API}/sessions/${requestSessionId}/chat`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body:    JSON.stringify({ message: text }),
+      body:    JSON.stringify({ message: text, client_request_id: requestToken }),
     });
     const data = await res.json();
     typing.remove();
@@ -1137,7 +1166,7 @@ async function sendToAgent(text) {
     // Mark the [user_message_id, agent_message_id] this turn just
     // persisted as already-rendered *before* appending the agent bubble
     // below — see handleSocketPayload's comment for why: the WS broadcast
-    // of these same two rows can still arrive after awaitingOwnTurnSessions
+    // of these same two rows can still arrive after pendingRequestTokens
     // is cleared in `finally`, and this is what lets that late echo get
     // skipped instead of duplicating both bubbles.
     (data.message_ids || []).forEach(id => renderedMessageIds.add(id));
@@ -1151,7 +1180,13 @@ async function sendToAgent(text) {
     if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
-    awaitingOwnTurnSessions.delete(requestSessionId);
+    // Only clear this session's entry if it's still *this* call's token —
+    // guards against clobbering a newer call's entry for the same session
+    // in the (currently unreachable, since isLoading serializes calls from
+    // this tab) event of overlapping calls.
+    if (pendingRequestTokens.get(requestSessionId) === requestToken) {
+      pendingRequestTokens.delete(requestSessionId);
+    }
   }
 }
 
@@ -1164,7 +1199,8 @@ async function sendImageToAgent(file) {
   setLoading(true);
   // See the matching comment in sendToAgent() — suppresses this tab's own
   // socket echo of the turn this call is about to produce.
-  awaitingOwnTurnSessions.add(requestSessionId);
+  const requestToken = generateRequestToken();
+  pendingRequestTokens.set(requestSessionId, requestToken);
 
   const reader = new FileReader();
   reader.onload = e => {
@@ -1176,6 +1212,7 @@ async function sendImageToAgent(file) {
   try {
     const form = new FormData();
     form.append('file', file);
+    form.append('client_request_id', requestToken);
     const res  = await fetch(`${API}/sessions/${requestSessionId}/image`, {
       method: 'POST',
       credentials: 'include',
@@ -1195,7 +1232,10 @@ async function sendImageToAgent(file) {
     if (requestSessionId === sessionId) appendBubble('agent', `⚠️ Error: ${err.message}`);
   } finally {
     setLoading(false);
-    awaitingOwnTurnSessions.delete(requestSessionId);
+    // See the matching comment in sendToAgent().
+    if (pendingRequestTokens.get(requestSessionId) === requestToken) {
+      pendingRequestTokens.delete(requestSessionId);
+    }
   }
 }
 
