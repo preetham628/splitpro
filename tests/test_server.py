@@ -106,7 +106,7 @@ def test_concurrent_first_touch_does_not_lose_writes(fresh_server, monkeypatch):
         # _run_chat_turn itself takes no background_tasks (that's wired in
         # at the chat()/upload_image() endpoint layer, around it) — called
         # directly here same as the rest of this file's tests.
-        response, state = server._run_chat_turn(
+        response, state, _message_ids = server._run_chat_turn(
             session_id, user, message, user["name"],
             persist_user_message=lambda: db.add_chat_message(
                 session_id, "user", message, user_id=user["id"]

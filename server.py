@@ -5,6 +5,7 @@ Run with: uvicorn server:app --reload
 
 import asyncio
 import base64
+import json
 import secrets
 import threading
 from typing import Callable, Literal, Optional
@@ -13,7 +14,17 @@ from uuid import uuid4
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +55,13 @@ auth_module.configure(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _event_loop
+    # REST endpoints (chat(), approve_proposal(), ...) are plain `def`s, so
+    # Starlette runs them in a worker thread pool rather than on this loop —
+    # see _broadcast_to_session's docstring for why that means WebSocket
+    # sends from them have to be scheduled back onto this loop explicitly
+    # rather than just awaited inline.
+    _event_loop = asyncio.get_running_loop()
     db.init_db(app_config.auth.db_path)
     checkpointer.init_checkpointer(app_config.auth.db_path)
     yield
@@ -97,6 +115,178 @@ def _drop_session_lock(session_id: str) -> None:
         _session_locks.pop(session_id, None)
 
 
+# In-process WebSocket registry for live session updates: session_id -> list
+# of currently-open WebSocket connections for that session. Same shape and
+# lifecycle as `sessions`/`_session_locks` above — populated on connect and
+# pruned on disconnect (see session_websocket() below), and swept clean in
+# delete_session/end_session alongside the existing lock-cleanup pattern
+# there (see _drop_session_sockets).
+#
+# A single in-process dict is all this needs: unlike WhatsApp/Discord/
+# Telegram-scale systems, this app only ever runs as one server process, so
+# there's no "which of our many servers holds this connection" problem that
+# would call for Redis pub/sub or similar cross-process routing.
+_session_sockets: dict[str, list[WebSocket]] = {}
+_session_sockets_guard = threading.Lock()
+
+# The asyncio event loop captured at lifespan startup (see lifespan() above).
+# None until then — in particular, still None for tests that call
+# _run_chat_turn/approve_proposal/etc. directly without ever starting the
+# app, same as `sessions`/`_session_locks` being plain empty dicts in that
+# context. _broadcast_to_session/_drop_session_sockets treat that as "no
+# sockets could possibly be connected yet" and no-op, same effect as a
+# session with nothing registered in _session_sockets.
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _register_session_socket(session_id: str, websocket: WebSocket) -> None:
+    with _session_sockets_guard:
+        _session_sockets.setdefault(session_id, []).append(websocket)
+
+
+def _unregister_session_socket(session_id: str, websocket: WebSocket) -> None:
+    with _session_sockets_guard:
+        sockets = _session_sockets.get(session_id)
+        if sockets and websocket in sockets:
+            sockets.remove(websocket)
+            if not sockets:
+                _session_sockets.pop(session_id, None)
+
+
+def _drop_session_sockets(session_id: str) -> None:
+    """Close and forget every open socket for a session — called from
+    delete_session/end_session, the same spot _drop_session_lock is, so a
+    deleted session doesn't leave stale connections (or a stale dict entry)
+    behind.
+
+    Closing is scheduled onto the event loop the same way
+    _broadcast_to_session's sends are (see its docstring); each socket's own
+    receive loop in session_websocket() will also notice the close and call
+    _unregister_session_socket itself, but popping the dict entry here too
+    means _session_sockets doesn't keep an entry around for a session_id
+    that's already gone, even if a socket is slow to notice its own closure.
+
+    Closes with code 1008 (not the default 1000) — these sockets were
+    already accepted and connected to a session that just got deleted out
+    from under them, so reconnecting would only ever hit session_websocket's
+    now-permanent membership rejection for this session_id. Same "give up,
+    don't retry" signal the frontend already treats 1008 as — see app.js's
+    ws.onclose.
+    """
+    with _session_sockets_guard:
+        sockets = _session_sockets.pop(session_id, [])
+    if _event_loop is None or not sockets:
+        return
+    for ws in sockets:
+        _schedule(_safe_close(ws, code=1008))
+
+
+def _register_socket_if_alive(session_id: str, user_id: int, websocket: WebSocket) -> bool:
+    """Re-validate membership and register the socket as one atomic
+    check-then-act step, under this session's existing per-session lock —
+    the fix for the TOCTOU race session_websocket's docstring describes.
+
+    session_websocket's own pre-accept membership check runs unlocked
+    (deliberately — it's just a cheap, non-authoritative early rejection
+    for the common case of a bad cookie or a non-member, saving the cost
+    of websocket.accept() for those), so it isn't synchronized with
+    delete_session at all: a session can be deleted in the gap between
+    that check and here. This re-check, plus the registration itself, is
+    what actually closes that gap — and delete_session now takes this same
+    lock around its own delete + _drop_session_sockets sweep (see its
+    docstring), so exactly one of these two outcomes is possible for any
+    given connection attempt, never the dangling-socket middle ground the
+    original bug produced:
+
+      - This runs first: the socket is registered while the session still
+        exists. If delete_session is concurrently waiting on this same
+        lock, it's guaranteed to run its _drop_session_sockets sweep
+        *after* this registration completes (lock mutual exclusion), so it
+        will find and close this socket rather than finding the registry
+        empty.
+      - delete_session runs first: by the time this acquires the lock, the
+        session row (and, via session_members' ON DELETE CASCADE, this
+        user's membership row) is already gone, so is_session_member
+        correctly returns False here and this refuses to register a
+        socket for a session that no longer exists.
+
+    Called via asyncio.to_thread from the async route, same as the
+    pre-accept check — see session_websocket's docstring for why a plain
+    threading.Lock can't be acquired directly on the event loop.
+    """
+    with _get_session_lock(session_id):
+        if not db.is_session_member(session_id, user_id):
+            return False
+        _register_session_socket(session_id, websocket)
+        return True
+
+
+async def _safe_close(websocket: WebSocket, code: int = 1000) -> None:
+    try:
+        await websocket.close(code=code)
+    except Exception:
+        # Already closed/closing — nothing to do.
+        pass
+
+
+def _broadcast_to_session(session_id: str, payload: dict) -> None:
+    """Fan out a JSON payload to every open WebSocket registered for
+    session_id. Called from _run_chat_turn (new chat message(s) + updated
+    state, after a turn completes) and approve_proposal/reject_proposal
+    (updated state, after a decision is recorded).
+
+    All of those are plain `def` REST endpoints, which — like every other
+    synchronous path function in this file — Starlette runs in a worker
+    thread pool rather than on the asyncio event loop that owns the
+    WebSocket connections in _session_sockets. asyncio.run_coroutine_
+    threadsafe bridges that: it hands the actual send off to the event loop
+    and returns immediately without blocking this thread, so a slow or
+    half-dead socket can't stall the REST request that triggered the
+    broadcast.
+
+    Serializes `payload` to JSON exactly once here rather than letting each
+    socket's own send_json() re-encode the identical dict — same output
+    (WebSocket.send_json's own encoding, replicated in _safe_send below),
+    just not redone once per connection on a session with several open
+    tabs.
+    """
+    if _event_loop is None:
+        return
+    with _session_sockets_guard:
+        sockets = list(_session_sockets.get(session_id, ()))
+    if not sockets:
+        return
+    text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    for ws in sockets:
+        _schedule(_safe_send(ws, text))
+
+
+async def _safe_send(ws: WebSocket, text: str) -> None:
+    try:
+        await ws.send_text(text)
+    except Exception:
+        # Connection is mid-close or otherwise broken — its own receive loop
+        # in session_websocket() will detect the disconnect and unregister
+        # it; nothing more to do from here.
+        pass
+
+
+def _schedule(coro) -> None:
+    """asyncio.run_coroutine_threadsafe, swallowing the one failure mode
+    that's actually reachable from a caller's perspective: the captured
+    event loop having since closed (e.g. app shutdown, or a test harness
+    that tore down its own loop after this module-level reference was set).
+    That's just a more emphatic version of "nothing is listening" — the
+    same no-op outcome as _event_loop being None in the first place — so it
+    gets the same treatment rather than raising out of a REST endpoint that
+    has nothing to do with WebSocket plumbing.
+    """
+    try:
+        asyncio.run_coroutine_threadsafe(coro, _event_loop)
+    except RuntimeError:
+        coro.close()
+
+
 # Session ids with a context-summarization background task currently
 # scheduled or in flight (see _schedule_context_summarization_if_needed /
 # _maybe_summarize_context below). Without this, two concurrent turns for
@@ -127,11 +317,29 @@ class SessionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    # Opaque id the frontend generates fresh for every sendToAgent()/
+    # sendImageToAgent() call, round-tripped verbatim into this turn's WS
+    # broadcast (see _run_chat_turn) so the sending *tab* — not merely the
+    # sending *user* — can recognize the broadcast as its own echo. See
+    # app.js's pendingRequestTokens for the full rationale: a same-user,
+    # same-session, two-tab scenario can't be disambiguated from role+user_id
+    # alone, since both tabs' in-flight turns look identical by that measure.
+    # Optional/defaulted so older frontends (or direct API callers) that
+    # don't send it see no change in behavior — the broadcast's
+    # client_request_id is simply None, which can't match any tab's token.
+    client_request_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     response: str
     state: dict
+    # [user_message_id, agent_message_id] for the turn this response is for —
+    # lets the sending tab mark these exact rows as "already rendered" (see
+    # app.js's renderedMessageIds) before the WS broadcast of the same rows
+    # has a chance to arrive and duplicate them. Defaults to [] so older
+    # frontends (or any other existing caller of this model) that don't look
+    # at this field see no change in shape otherwise.
+    message_ids: list[int] = []
 
 
 class RenameRequest(BaseModel):
@@ -252,8 +460,9 @@ def _run_chat_turn(
     user: dict,
     agent_message: str,
     speaker_name: str,
-    persist_user_message: Callable[[], None],
-) -> tuple[str, dict]:
+    persist_user_message: Callable[[], dict],
+    client_request_id: Optional[str] = None,
+) -> tuple[str, dict, list[int]]:
     """Run one full chat turn — agent lookup/creation, the model call,
     persistence, and the response's state snapshot — as a single critical
     section under this session's lock.
@@ -272,7 +481,25 @@ def _run_chat_turn(
     so callers can pass image-specific kwargs (upload_image) without this
     helper needing to know about them; it's called with the lock held, right
     after agent.chat() returns, matching the message ordering the two
-    endpoints already had.
+    endpoints already had. It now returns the inserted row (same shape
+    db.add_chat_message/list_chat_messages use) so it can be broadcast below
+    alongside the agent's own reply, in the same shape GET
+    /sessions/{id}/messages already returns rows in — the frontend's
+    WebSocket handler doesn't need to understand a second message shape.
+
+    Returns (response_text, state, [user_message_id, agent_message_id]) —
+    callers thread those ids back to the frontend in ChatResponse so the
+    sending tab can mark exactly those two rows as already-rendered before
+    the WS broadcast above (scheduled fire-and-forget, with no ordering
+    guarantee relative to this REST response reaching the same tab) has a
+    chance to arrive and get appended a second time. See app.js's
+    renderedMessageIds for the other half of this.
+
+    `client_request_id` is opaque here — just round-tripped into the
+    broadcast payload verbatim (including None, for callers that don't pass
+    one) so the sending *tab* can recognize its own echo even in the window
+    before this function returns and the id-based mechanism above has
+    anything to match against yet. See app.js's pendingRequestTokens.
 
     Synchronous end-to-end — callers on an async path (upload_image) must
     run this via asyncio.to_thread so the lock (a plain threading.Lock)
@@ -297,8 +524,8 @@ def _run_chat_turn(
         )
 
         response = agent.chat(agent_message, speaker_name=speaker_name, speaker_user_id=user["id"])
-        persist_user_message()
-        db.add_chat_message(session_id, "agent", response)
+        user_message_row = persist_user_message()
+        agent_message_row = db.add_chat_message(session_id, "agent", response)
 
         new_name: Optional[str] = None
         if title_auto:
@@ -309,7 +536,18 @@ def _run_chat_turn(
         _save_agent(session_id, agent, name=new_name)
         state = _serialize_state(agent.state, session_id)
 
-    return response, state
+    # Pushed after the lock releases — a slow/half-dead socket send
+    # shouldn't hold up the lock any longer than the turn itself needed it
+    # for. See _broadcast_to_session's docstring for why this hops onto the
+    # event loop rather than sending inline.
+    _broadcast_to_session(session_id, {
+        "type": "messages",
+        "messages": [user_message_row, agent_message_row],
+        "state": state,
+        "client_request_id": client_request_id,
+    })
+
+    return response, state, [user_message_row["id"], agent_message_row["id"]]
 
 
 def _schedule_context_summarization_if_needed(session_id: str, background_tasks: BackgroundTasks) -> None:
@@ -605,9 +843,27 @@ def delete_session(session_id: str, user: dict = Depends(get_current_user)):
     this session — without it, deleting mid-turn (cascading away the bills
     a concurrent turn is about to save against) turned that turn's later
     save into an unhandled IntegrityError instead of either finishing
-    cleanly first or failing with a clean 404. Dropping the lock entry
-    afterward (success or already-gone) means a lock is never left behind
-    for a session_id that no longer exists.
+    cleanly first or failing with a clean 404.
+
+    _drop_session_sockets runs *inside* this same locked section (not after
+    it releases, as an earlier version of this had it) — that's what closes
+    the TOCTOU race against session_websocket's handshake: that route does
+    its own authoritative membership re-check + socket registration under
+    this identical lock (see _register_socket_if_alive), so whichever of
+    the two critical sections — this delete, or a connecting socket's
+    register — acquires the lock first fully determines the outcome for the
+    other. A delete that wins the race sweeps a registration that hasn't
+    happened yet (nothing to do, same as today); a delete that loses it
+    sweeps a registration that just completed moments ago, inside the same
+    lock, rather than racing to find the registry empty and leaving that
+    socket to dangle forever. See _register_socket_if_alive's and
+    session_websocket's docstrings for the other half of this.
+
+    Dropping the lock entry itself (_drop_session_lock) only happens after
+    the lock has actually been released — see its own docstring for why
+    doing that while still *holding* the lock would undermine the mutual
+    exclusion this just established (a fresh _get_session_lock call could
+    then build a new, different Lock object and run concurrently with us).
     """
     _require_admin(session_id, user)
     with _get_session_lock(session_id):
@@ -615,6 +871,7 @@ def delete_session(session_id: str, user: dict = Depends(get_current_user)):
         if deleted:
             checkpointer.delete_thread(session_id)
             sessions.pop(session_id, None)
+        _drop_session_sockets(session_id)
     _drop_session_lock(session_id)
 
     if not deleted:
@@ -716,6 +973,23 @@ def _require_proposal_in_session(session_id: str, proposal_id: int) -> None:
         raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found")
 
 
+def _broadcast_session_state(session_id: str) -> None:
+    """Re-serialize this session's state straight from the DB and push it to
+    every open socket for it. Used by approve_proposal/reject_proposal,
+    which — unlike _run_chat_turn — have no in-memory ChatAgent handy to
+    serialize from at the point they need to broadcast (decide_proposal
+    writes straight to the DB, and the cache entry has *just* been evicted a
+    few lines above each call site, by the same stale-cache fix
+    _get_agent's docstring describes). Building a throwaway SessionState via
+    SessionState.from_dict(db.load_session_state(...)) — the same call
+    _get_agent() makes on its own cache-miss path — is enough for this; it
+    avoids constructing a full ChatAgent (and whatever LLM client setup that
+    entails) just to read state back out of it.
+    """
+    state = _serialize_state(SessionState.from_dict(db.load_session_state(session_id)), session_id)
+    _broadcast_to_session(session_id, {"type": "state", "state": state})
+
+
 @app.post("/api/sessions/{session_id}/proposals/{proposal_id}/approve")
 def approve_proposal(
     session_id: str,
@@ -748,6 +1022,7 @@ def approve_proposal(
 
         sessions.pop(session_id, None)
 
+    _broadcast_session_state(session_id)
     return result
 
 
@@ -775,6 +1050,7 @@ def reject_proposal(
 
         sessions.pop(session_id, None)
 
+    _broadcast_session_state(session_id)
     return result
 
 
@@ -788,7 +1064,7 @@ def chat(
     user: dict = Depends(get_current_user),
 ):
     speaker_name = _speaker_name(user)
-    response, state = _run_chat_turn(
+    response, state, message_ids = _run_chat_turn(
         session_id,
         user,
         req.message,
@@ -796,6 +1072,7 @@ def chat(
         persist_user_message=lambda: db.add_chat_message(
             session_id, "user", req.message, user_id=user["id"]
         ),
+        client_request_id=req.client_request_id,
     )
     # Checked (cheap) and scheduled (only if actually needed) after the
     # response above is already built — BackgroundTasks only runs the task
@@ -804,7 +1081,7 @@ def chat(
     # if_needed's docstring for the needs-check + in-flight guard, and
     # _maybe_summarize_context's for the two-phase lock design.
     _schedule_context_summarization_if_needed(session_id, background_tasks)
-    return ChatResponse(response=response, state=state)
+    return ChatResponse(response=response, state=state, message_ids=message_ids)
 
 
 @app.get("/sessions/{session_id}/state")
@@ -836,6 +1113,11 @@ async def upload_image(
     session_id: str,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    # See ChatRequest.client_request_id's docstring — same mechanism, just a
+    # multipart form field here since this endpoint takes UploadFile rather
+    # than a JSON body. Optional/defaulted for the same backward-compat
+    # reason.
+    client_request_id: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
     # Cheap, read-only membership check for early rejection — deliberately
@@ -877,7 +1159,7 @@ async def upload_image(
     # duration — run it off the event loop thread so lock contention on a
     # busy session stalls only this request, not every other request the
     # process is serving.
-    response, state = await asyncio.to_thread(
+    response, state, message_ids = await asyncio.to_thread(
         _run_chat_turn,
         session_id,
         user,
@@ -887,12 +1169,120 @@ async def upload_image(
             session_id, "user", "", image_base64=image_b64, image_media_type=content_type,
             user_id=user["id"],
         ),
+        client_request_id=client_request_id,
     )
     # See the matching comment in chat() — checked and scheduled only after
     # the response above is already built, so it adds no latency to this
     # request, and only when actually needed.
     _schedule_context_summarization_if_needed(session_id, background_tasks)
-    return ChatResponse(response=response, state=state)
+    return ChatResponse(response=response, state=state, message_ids=message_ids)
+
+
+# ---------- WebSocket: live session updates ----------
+
+@app.websocket("/ws/sessions/{session_id}")
+async def session_websocket(websocket: WebSocket, session_id: str):
+    """Live push of new chat messages + updated state for a session, so
+    every tab with it open stays in sync without polling or a manual
+    reload. See _broadcast_to_session (new messages after a chat turn) and
+    _broadcast_session_state (state after a proposal decision) for the two
+    places that push to this.
+
+    Authenticates during the handshake the same way the REST endpoints do —
+    the `access_token` cookie set by the Google OAuth callback — rather than
+    inventing a second auth mechanism: a WebSocket's handshake is itself an
+    HTTP request, and FastAPI's WebSocket exposes its cookies the same way
+    Request does, so this reuses core.auth.verify_jwt directly.
+
+    The connection is rejected — accepted, then immediately closed with
+    code 1008 (policy violation), used for all three cases below — if that
+    cookie is missing/invalid, if the caller isn't a member of session_id
+    (the same db.is_session_member check _require_member uses, inlined here
+    rather than calling _require_member itself, since that raises
+    HTTPException, which has no meaning for a handshake that was never
+    accepted as an HTTP response in the first place), or if
+    _register_socket_if_alive's atomic re-check (see below) loses the race
+    against a concurrent delete_session. The frontend treats a 1008 close
+    as a terminal rejection and gives up rather than reconnecting forever —
+    see app.js's ws.onclose.
+
+    Every rejection below accepts the connection *before* closing it with
+    that code, rather than closing pre-accept the way an HTTP 403 would —
+    this is deliberate, and not just a style choice. Verified empirically
+    against a real running uvicorn server with a real WebSocket client
+    (the `websockets` library): a close() called before accept() never
+    reaches the client as a WebSocket close frame at all — the handshake
+    simply never completes the HTTP Upgrade, so the client observes a bare
+    HTTP 403, and a real browser's WebSocket API reports *that* as a
+    generic `close` event with code 1006 (abnormal closure) and no
+    information about why, indistinguishable from a dropped connection or a
+    server restart — exactly the ambiguity the frontend's reconnect logic
+    needs to resolve to ever give up correctly. Accepting first means the
+    close that follows travels over an already-established WebSocket
+    connection, so its actual code (1008 here) really does reach the
+    client's CloseEvent.code, which is what app.js's onclose now branches
+    on. (A pre-accept close is what this route used to do, and it's
+    indistinguishable from the bug report's "surfaces as a generic abnormal
+    closure" symptom — this accept-first restructuring is the fix, not just
+    the frontend's onclose branch.)
+
+    That membership check is deliberately *not* synchronized with
+    delete_session — it's just a cheap early-out for the common case (bad
+    cookie, never-was-a-member) that saves the cost of the rest of the
+    handshake for requests that were never going to succeed. It is NOT
+    sufficient on its own to prevent registering a socket for a session
+    that's concurrently being deleted (the session could be deleted in the
+    gap between this check and registration below) — _register_socket_if_
+    alive's re-check, done atomically with registration under the
+    session's lock, is what actually closes that race. See its docstring
+    and delete_session's for the full picture.
+
+    Both DB calls below (the early membership check and the atomic
+    re-check+register) are blocking sqlite calls, so both run via
+    asyncio.to_thread — inlining either directly on this coroutine would
+    stall delivery for every other open socket on this process during the
+    query, not just this handshake.
+
+    This is a pure push channel: the only thing it ever reads from the
+    client is used to detect disconnection, not as a message of any kind —
+    a client closing the tab (or the connection otherwise dropping) surfaces
+    here as WebSocketDisconnect from receive_text(), which is exactly the
+    cue needed to unregister the socket.
+    """
+    token = websocket.cookies.get("access_token")
+    payload = auth_module.verify_jwt(token) if token else None
+    if payload is None:
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
+
+    user_id = int(payload["sub"])
+    if not await asyncio.to_thread(db.is_session_member, session_id, user_id):
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    # Authoritative re-check + registration, atomic with delete_session's
+    # cleanup sweep under the session's lock — see _register_socket_if_
+    # alive's docstring. If this loses the race (session deleted between
+    # the cheap check above and here), close (already accepted, so the
+    # real code reaches the client — see the docstring above) without ever
+    # registering, rather than leaving a dangling socket for a session
+    # that's already gone.
+    registered = await asyncio.to_thread(_register_socket_if_alive, session_id, user_id, websocket)
+    if not registered:
+        await _safe_close(websocket, code=1008)
+        return
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _unregister_session_socket(session_id, websocket)
 
 
 @app.get("/health")

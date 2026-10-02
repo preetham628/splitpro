@@ -254,6 +254,20 @@ h1 {
 }
 .auto-name-toggle input { cursor: pointer; }
 
+/* Shown when the live-update WebSocket gives up for good (a terminal
+   rejection — e.g. the 1008 close code session_websocket sends for an
+   auth/membership failure — not a transient network blip it'll keep
+   retrying through on its own). See app.js's ws.onclose. Non-blocking: the
+   chat panel otherwise works as a plain request/response UI without it. */
+.live-updates-warning {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--danger);
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: default;
+}
+
 .messages {
   flex: 1;
   overflow-y: auto;

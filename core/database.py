@@ -515,12 +515,28 @@ def add_chat_message(
     image_base64: Optional[str] = None,
     image_media_type: Optional[str] = None,
     user_id: Optional[int] = None,
-) -> None:
+) -> dict:
+    """Insert a chat message and return the row that was just inserted, in
+    the same shape list_chat_messages() returns its rows in (id, role,
+    content, image_base64, image_media_type, created_at, user_id).
+
+    The return value used to be None — callers that only persist (nearly all
+    of them) still just ignore it — but server.py's WebSocket broadcast
+    needs the just-inserted row (including the DB-assigned id and
+    server-side created_at timestamp) to push to connected clients, and
+    re-deriving that by hand rather than reading it straight back out would
+    just be duplicating this INSERT's own column list.
+    """
     with _connect() as conn:
-        conn.execute("""
+        cursor = conn.execute("""
             INSERT INTO chat_messages (session_id, role, content, image_base64, image_media_type, user_id)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (session_id, role, content, image_base64, image_media_type, user_id))
+        row = conn.execute("""
+            SELECT id, role, content, image_base64, image_media_type, created_at, user_id
+            FROM chat_messages WHERE id = ?
+        """, (cursor.lastrowid,)).fetchone()
+        return dict(row)
 
 
 def list_chat_messages(session_id: str) -> list[dict]:
@@ -530,10 +546,14 @@ def list_chat_messages(session_id: str) -> list[dict]:
     joined name/avatar — callers that need sender identity resolve it via
     GET /api/sessions/{id}/members, which the frontend already loads for the
     approval/member-management UI.
+
+    Includes the row id (added alongside server.py's WebSocket broadcast,
+    which tags each pushed message with it) — harmless for the existing
+    callers, which never looked at a dict key that wasn't already here.
     """
     with _connect() as conn:
         rows = conn.execute("""
-            SELECT role, content, image_base64, image_media_type, created_at, user_id
+            SELECT id, role, content, image_base64, image_media_type, created_at, user_id
             FROM chat_messages
             WHERE session_id = ?
             ORDER BY id
