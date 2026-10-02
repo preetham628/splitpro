@@ -63,21 +63,43 @@ let socketReconnectAttempts = 0;
 // session while a turn for the *previous* one is still in flight (isLoading
 // doesn't block navigation) — a global flag would then also suppress the
 // new session's unrelated incoming messages until that stale turn resolved.
+//
+// IMPORTANT: this only identifies *which session* has one of this tab's own
+// turns in flight — it says nothing about *who sent* a given incoming
+// broadcast for that session. handleSocketPayload below must not treat
+// membership in this set as "drop the whole payload": two different
+// members can have turns in flight on the same session at the same time
+// (e.g. Alice's own turn is pending while Bob, a different member, sends a
+// concurrent message), and Bob's broadcast arriving while Alice's own turn
+// is still in flight must still be rendered for Alice. This set only tells
+// handleSocketPayload "a payload whose user-message sender is *me* during
+// this window is my own echo"; it's never a reason to drop someone else's
+// message.
 let awaitingOwnTurnSessions = new Set();
 // DB-assigned ids (ChatMessage.id, globally unique) of every chat message
-// already rendered into the current session's DOM — the second, more
-// robust layer against the same duplicate-bubble problem
-// awaitingOwnTurnSessions guards above. That flag only covers the common
-// timing case (a WS broadcast arriving *during* this tab's own in-flight
-// turn); it does nothing once sendToAgent/sendImageToAgent's `finally`
-// clears it right as their own fetch() resolves, and the WS broadcast for
-// that exact turn is scheduled fire-and-forget with no guarantee it won't
-// land after that point (see _run_chat_turn's docstring in server.py).
-// handleSocketPayload skips appending any message id already in this set;
-// sendToAgent/sendImageToAgent populate it (via ChatResponse.message_ids)
-// for the two rows their own REST response just rendered. Reset whenever
-// loadSession() reloads a session's history from scratch, alongside
-// clearing messagesEl itself.
+// already rendered into the current session's DOM — the primary mechanism
+// for not double-rendering a message: handleSocketPayload skips appending
+// any message id already in this set, and sendToAgent/sendImageToAgent
+// populate it (via ChatResponse.message_ids) for the two rows their own
+// REST response just rendered, before appending the agent bubble
+// themselves. Reset whenever loadSession() reloads a session's history from
+// scratch, alongside clearing messagesEl itself.
+//
+// This alone cannot cover the *sender's own* turn, though: the server's WS
+// broadcast for a turn is scheduled fire-and-forget from inside the same
+// request handler that persists the messages, with no ordering guarantee
+// relative to that request's own HTTP response reaching this same tab (see
+// _run_chat_turn's docstring in server.py) — it can arrive here *before*
+// sendToAgent/sendImageToAgent have gotten their REST response back and
+// populated this set with the turn's ids. And the user's own
+// optimistically-rendered bubble (appended immediately in handleSend(),
+// before the request is even sent) is never tagged with a DB id or
+// reconciled once the real id is known, so id-based dedup has nothing to
+// match against yet in that window. That's the gap awaitingOwnTurnSessions
+// above covers: it's set synchronously before the REST call is even issued,
+// so it's guaranteed to still be set for the whole time the server could
+// possibly be sending this turn's broadcast, closing the window this set
+// can't.
 let renderedMessageIds = new Set();
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
@@ -472,25 +494,41 @@ function scheduleSocketReconnect(id) {
 }
 
 // Applies one pushed update to the chat log / state panel in place — no
-// full page reload, no re-running loadSession()'s fetch sequence.
+// full page reload, no re-running loadSession()'s fetch sequence. State
+// updates are never gated here — they aren't per-message and have no "my
+// own echo" concept, so every state broadcast for the current session
+// applies unconditionally.
 function handleSocketPayload(id, payload) {
   if (payload.state) renderState(payload.state);
 
-  if (payload.messages && !awaitingOwnTurnSessions.has(id)) {
+  if (payload.messages) {
+    // A turn's broadcast is "my own echo" only if *this* tab has a turn of
+    // its own in flight for this session AND the payload's user-authored
+    // message was actually sent by the current user — i.e. it's the exact
+    // turn this tab is waiting on, not merely *a* turn on a session this
+    // tab also happens to be mid-turn on. Checking awaitingOwnTurnSessions
+    // alone (without the sender check) would also swallow a different
+    // member's concurrent message on the same session, which is the whole
+    // point of this feature and must never be dropped. See
+    // awaitingOwnTurnSessions' own comment for why the sender check alone,
+    // without the awaiting-set, still isn't enough on its own.
+    const isOwnEcho = awaitingOwnTurnSessions.has(id) &&
+      !!currentUser &&
+      payload.messages.some(m => m.role === 'user' && m.user_id === currentUser.id);
     payload.messages.forEach(m => {
-      // Belt-and-suspenders against the duplicate-bubble bug
-      // awaitingOwnTurnSessions above only half-covers: the server's WS
-      // broadcast is fire-and-forget with no ordering guarantee relative
-      // to this same tab's own REST response for the turn that produced
-      // these exact messages (see server.py's _run_chat_turn docstring),
-      // so it can still arrive here *after* sendToAgent/sendImageToAgent's
-      // `finally` has already cleared awaitingOwnTurnSessions for this
-      // session — at which point this id is already in renderedMessageIds
-      // (sendToAgent/sendImageToAgent add it there from
-      // ChatResponse.message_ids the moment they render it themselves), so
-      // skip it instead of appending a second bubble for the same message.
+      // Primary de-dup layer: skip anything already rendered, whether by
+      // this tab's own REST flow (sendToAgent/sendImageToAgent populate
+      // this from ChatResponse.message_ids) or by an earlier pass through
+      // this same handler.
       if (renderedMessageIds.has(m.id)) return;
       renderedMessageIds.add(m.id);
+      // Belt-and-suspenders for the sender's own turn only (see
+      // awaitingOwnTurnSessions' comment): this tab is about to render (or
+      // already has rendered) these exact bubbles itself via the REST
+      // response, so mark the id rendered but don't append a second time.
+      // Never applies to another member's concurrent message — isOwnEcho
+      // is false for those regardless of awaitingOwnTurnSessions.
+      if (isOwnEcho) return;
       const imageDataUrl = m.image_base64
         ? `data:${m.image_media_type};base64,${m.image_base64}`
         : null;
